@@ -1,6 +1,4 @@
-// skip: extended inline assembly is not supported yet
-// GNU extended inline asm with operands is rejected: "error: inline assembly is not supported"
-// (only empty / barrier asm statements are accepted)
+// GNU extended inline asm with a read-write register operand
 #include <stdio.h>
 int main(void) {
     int x = 5;

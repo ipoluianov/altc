@@ -108,6 +108,10 @@ func (p *parser) libCall(name string, t *Token) *Node {
 	} else {
 		ft := funcType(libReturnType(name))
 		ft.OldStyle = true
+		if params, ok := libParams(name); ok {
+			ft.Params = params
+			ft.OldStyle = false
+		}
 		gs := p.sc
 		for gs.parent != nil {
 			gs = gs.parent
@@ -145,6 +149,55 @@ func libReturnType(name string) *Type {
 		return tyDouble
 	}
 	return tyInt
+}
+
+// libParams gives the parameter types of library functions called by
+// builtins, so that calls without a visible declaration convert the
+// arguments (floating functions must not get default promotions)
+func libParams(name string) ([]*Type, bool) {
+	ptr := pointerTo(tyVoid)
+	switch name {
+	case "memcpy", "memmove":
+		return []*Type{ptr, ptr, tyULong}, true
+	case "memset":
+		return []*Type{ptr, tyInt, tyULong}, true
+	case "memcmp":
+		return []*Type{ptr, ptr, tyULong}, true
+	case "strlen":
+		return []*Type{pointerTo(tyChar)}, true
+	case "abs":
+		return []*Type{tyInt}, true
+	case "labs":
+		return []*Type{tyLong}, true
+	case "llabs":
+		return []*Type{tyLLong}, true
+	case "frexp":
+		return []*Type{tyDouble, pointerTo(tyInt)}, true
+	case "ldexp", "scalbn":
+		return []*Type{tyDouble, tyInt}, true
+	case "modf":
+		return []*Type{tyDouble, pointerTo(tyDouble)}, true
+	}
+	rt := libReturnType(name)
+	ft := tyDouble
+	base := name
+	switch {
+	case rt == tyFloat:
+		ft, base = tyFloat, strings.TrimSuffix(name, "f")
+	case rt == tyLDouble:
+		ft, base = tyLDouble, strings.TrimSuffix(name, "l")
+	case rt == tyDouble:
+	case name == "lround" || name == "lrint":
+	default:
+		return nil, false
+	}
+	switch base {
+	case "pow", "fmod", "copysign", "fmin", "fmax", "atan2", "hypot":
+		return []*Type{ft, ft}, true
+	case "fma":
+		return []*Type{ft, ft, ft}, true
+	}
+	return []*Type{ft}, true
 }
 
 func floatConst(f float64, ty *Type, t *Token) *Node {

@@ -46,6 +46,12 @@ const (
 	XMM14
 	XMM15
 
+	// high byte registers %ah, %ch, %dh, %bh (encoded as 4..7 without REX)
+	AH Reg = 36
+	CH Reg = 37
+	DH Reg = 38
+	BH Reg = 39
+
 	NoReg Reg = -1
 	RIP   Reg = -2
 )
@@ -75,6 +81,9 @@ func sizeIdx(size int) int {
 
 // RegName returns the AT&T name of a register of the given size
 func RegName(r Reg, size int) string {
+	if r >= AH && r <= BH {
+		return [...]string{"%ah", "%ch", "%dh", "%bh"}[r-AH]
+	}
 	if r.IsXMM() {
 		return fmt.Sprintf("%%xmm%d", r-XMM0)
 	}
@@ -196,8 +205,16 @@ type Reloc struct {
 }
 
 type fixup struct {
-	at    int // offset of the rel32 field
-	label Label
+	at     int // offset of the rel32 (or rel8) field
+	label  Label
+	size   int   // 4 (0 means 4) or 1
+	trail  int   // bytes of the instruction after the field
+	addend int64 // added to the label position
+
+	// label difference (label - minus) of labels in la, size bytes
+	diff  bool
+	la    *Asm
+	minus Label
 }
 
 // Asm accumulates machine code for one section
@@ -207,6 +224,56 @@ type Asm struct {
 	labels  []int
 	fixups  []fixup
 	Listing *strings.Builder // when not nil, AT&T text of every instruction is appended
+
+	// LabelSyms are labels referenced through local symbols (absolute
+	// addresses or references from other sections); the code generator
+	// defines a symbol for each after Finish
+	LabelSyms []LabelSym
+	SymPrefix string // makes the label symbol names unique per object
+	MaxAlign  int64  // largest alignment requested by assembly text
+}
+
+// gnuNops are the multi-byte nops GNU as uses for code alignment
+var gnuNops = [][]byte{
+	{},
+	{0x90},
+	{0x66, 0x90},
+	{0x0f, 0x1f, 0x00},
+	{0x0f, 0x1f, 0x40, 0x00},
+	{0x0f, 0x1f, 0x44, 0x00, 0x00},
+	{0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00},
+	{0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00},
+	{0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+	{0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+	{0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+	{0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+}
+
+// Nops emits n bytes of no-op instructions
+func (a *Asm) Nops(n int) {
+	for n > 0 {
+		k := min(n, 11)
+		a.Code = append(a.Code, gnuNops[k]...)
+		n -= k
+	}
+}
+
+// LabelSym names a label for relocations
+type LabelSym struct {
+	Name  string
+	Label Label
+}
+
+// LabelSymbol returns the local symbol name of a label
+func (a *Asm) LabelSymbol(l Label) string {
+	name := fmt.Sprintf(".Laltc.%s.%d", a.SymPrefix, int(l))
+	for _, ls := range a.LabelSyms {
+		if ls.Label == l {
+			return name
+		}
+	}
+	a.LabelSyms = append(a.LabelSyms, LabelSym{name, l})
+	return name
 }
 
 // NewLabel creates an unbound label
@@ -236,12 +303,31 @@ func (a *Asm) Comment(format string, args ...any) {
 // Finish resolves the label references; it returns an error for unbound labels
 func (a *Asm) Finish() error {
 	for _, f := range a.fixups {
+		if f.diff {
+			p1, p2 := f.la.labels[f.label], f.la.labels[f.minus]
+			if p1 < 0 || p2 < 0 {
+				return fmt.Errorf("undefined label in a label difference")
+			}
+			elf.PutLE(a.Code[f.at:], uint64(int64(p1-p2)+f.addend), f.size)
+			continue
+		}
 		pos := a.labels[f.label]
 		if pos < 0 {
 			return fmt.Errorf("unbound label .L%d", int(f.label))
 		}
-		rel := pos - (f.at + 4)
-		elf.PutLE(a.Code[f.at:], uint64(int64(rel)), 4)
+		size := f.size
+		if size == 0 {
+			size = 4
+		}
+		rel := int64(pos) + f.addend - int64(f.at+size+f.trail)
+		if size == 1 {
+			if !fitsI8(rel) {
+				return fmt.Errorf("short jump out of range")
+			}
+			a.Code[f.at] = byte(rel)
+			continue
+		}
+		elf.PutLE(a.Code[f.at:], uint64(rel), 4)
 	}
 	a.fixups = nil
 	return nil
@@ -354,10 +440,10 @@ func (a *Asm) enc(pfx []byte, w bool, op []byte, reg int, rm Operand, trail int,
 	disp := int64(mem.Disp)
 	mod := byte(0)
 	switch {
+	case mem.Base == NoReg:
+		mod = 0 // SIB with no base: disp32 follows
 	case mem.Sym != "":
 		mod = 2
-	case mem.Base == NoReg:
-		mod = 0
 	case disp == 0 && mem.Base.num()&7 != 5:
 		mod = 0
 	case fitsI8(disp):
@@ -806,7 +892,7 @@ func (a *Asm) Jcc(c Cond, l Label) {
 		fmt.Fprintf(a.Listing, "\tj%s\t.L%d\n", condNames[c], int(l))
 	}
 	a.b(0x0F, 0x80+byte(c))
-	a.fixups = append(a.fixups, fixup{len(a.Code), l})
+	a.fixups = append(a.fixups, fixup{at: len(a.Code), label: l})
 	a.imm(0, 4)
 }
 
@@ -816,7 +902,7 @@ func (a *Asm) Jmp(l Label) {
 		fmt.Fprintf(a.Listing, "\tjmp\t.L%d\n", int(l))
 	}
 	a.b(0xE9)
-	a.fixups = append(a.fixups, fixup{len(a.Code), l})
+	a.fixups = append(a.fixups, fixup{at: len(a.Code), label: l})
 	a.imm(0, 4)
 }
 
@@ -852,7 +938,7 @@ func (a *Asm) LabelAddr(dst Reg, l Label) {
 		fmt.Fprintf(a.Listing, "\tleaq\t.L%d(%%rip), %s\n", int(l), RegName(dst, 8))
 	}
 	a.enc(nil, true, []byte{0x8D}, dst.num(), Mem{Base: RIP, Index: NoReg}, 0, false)
-	a.fixups = append(a.fixups, fixup{len(a.Code) - 4, l})
+	a.fixups = append(a.fixups, fixup{at: len(a.Code) - 4, label: l})
 }
 
 // Push pushes a 64-bit register

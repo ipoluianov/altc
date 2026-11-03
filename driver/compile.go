@@ -122,6 +122,15 @@ func Preprocess(path string, data []byte, cfg *Config) (string, []Diagnostic) {
 	if err != nil {
 		return "", []Diagnostic{{Severity: SevError, Message: err.Error()}}
 	}
+	if isAsmSource(path) {
+		pc.Asm = true
+	}
+	return preprocessText(pc, path, data, cfg.NoWarnings)
+}
+
+// preprocessText runs the preprocessor and prints the tokens as text
+// (the -E output, also the input of the assembler for .S files)
+func preprocessText(pc cc.PPConfig, path string, data []byte, noWarn bool) (string, []Diagnostic) {
 	pp := cc.NewPreprocessor(pc)
 	toks := pp.Run(path, data)
 	var sb strings.Builder
@@ -157,7 +166,49 @@ func Preprocess(path string, data []byte, cfg *Config) (string, []Diagnostic) {
 		sb.WriteString(t.Text)
 	}
 	sb.WriteByte('\n')
-	return sb.String(), toDiags(pp.Errors, cfg.NoWarnings)
+	return sb.String(), toDiags(pp.Errors, noWarn)
+}
+
+// IsSource tells whether a file is compiled by CompileSource (.c, .s, .S)
+func IsSource(path string) bool {
+	return strings.HasSuffix(path, ".c") || isAsmSource(path)
+}
+
+func isAsmSource(path string) bool {
+	return strings.HasSuffix(path, ".s") || strings.HasSuffix(path, ".S")
+}
+
+// assembleSource assembles a .s file (or the preprocessed text of a .S file)
+func assembleSource(path, text string, u *Unit) {
+	res, err := x64.Generate(&cc.Program{TopAsm: []string{text}}, path, false)
+	if err != nil {
+		d := Diagnostic{File: path, Severity: SevError, Message: err.Error()}
+		msg := strings.TrimPrefix(err.Error(), "error: ")
+		if f, l, rest, ok := splitFileLine(msg); ok {
+			d.File, d.Line, d.Message = f, l, rest
+		}
+		u.Diagnostics = append(u.Diagnostics, d)
+		return
+	}
+	u.Obj = res.Obj
+}
+
+// splitFileLine parses "file:line: msg" produced for preprocessed sources
+func splitFileLine(msg string) (string, int, string, bool) {
+	i := strings.Index(msg, ": ")
+	if i < 0 {
+		return "", 0, "", false
+	}
+	head := msg[:i]
+	j := strings.LastIndexByte(head, ':')
+	if j < 0 {
+		return "", 0, "", false
+	}
+	line, err := strconv.Atoi(head[j+1:])
+	if err != nil {
+		return "", 0, "", false
+	}
+	return head[:j], line, msg[i+2:], true
 }
 
 // Unit is the result of compiling one source file
@@ -168,7 +219,8 @@ type Unit struct {
 	Deps        []string
 }
 
-// CompileSource compiles one C source file to an object
+// CompileSource compiles one source file to an object: C, assembler (.s)
+// or assembler with C preprocessing (.S)
 func CompileSource(path string, data []byte, cfg *Config) (u *Unit) {
 	u = &Unit{}
 	pc, err := cfg.ppConfig()
@@ -186,6 +238,20 @@ func CompileSource(path string, data []byte, cfg *Config) (u *Unit) {
 			u.Diagnostics = append(u.Diagnostics, Diagnostic{File: path, Severity: SevError, Message: msg})
 		}
 	}()
+	switch {
+	case strings.HasSuffix(path, ".s"):
+		assembleSource(path, string(data), u)
+		return u
+	case strings.HasSuffix(path, ".S"):
+		pc.Asm = true
+		text, diags := preprocessText(pc, path, data, cfg.NoWarnings)
+		u.Diagnostics = diags
+		if hasError(diags) {
+			return u
+		}
+		assembleSource(path, text, u)
+		return u
+	}
 	pp := cc.NewPreprocessor(pc)
 	toks := pp.Run(path, data)
 	u.Deps = pp.Deps
@@ -300,6 +366,94 @@ T _Complex NAME(T a, T b, T c, T d) { \
 __ALTC_CDIV(__divsc3, float)
 __ALTC_CDIV(__divdc3, double)
 __ALTC_CDIV(__divxc3, long double)
+
+/* complex multiplication with the C11 Annex G recovery of infinities */
+#define __ALTC_CMUL(NAME, T, INF) \
+T _Complex NAME(T a, T b, T c, T d) { \
+	T ac = a * c, bd = b * d, ad = a * d, bc = b * c; \
+	T x = ac - bd, y = ad + bc; \
+	if (__builtin_isnan(x) && __builtin_isnan(y)) { \
+		int recalc = 0; \
+		if (__builtin_isinf(a) || __builtin_isinf(b)) { \
+			a = __builtin_copysignl(__builtin_isinf(a) ? 1 : 0, a); \
+			b = __builtin_copysignl(__builtin_isinf(b) ? 1 : 0, b); \
+			if (__builtin_isnan(c)) c = __builtin_copysignl(0, c); \
+			if (__builtin_isnan(d)) d = __builtin_copysignl(0, d); \
+			recalc = 1; \
+		} \
+		if (__builtin_isinf(c) || __builtin_isinf(d)) { \
+			c = __builtin_copysignl(__builtin_isinf(c) ? 1 : 0, c); \
+			d = __builtin_copysignl(__builtin_isinf(d) ? 1 : 0, d); \
+			if (__builtin_isnan(a)) a = __builtin_copysignl(0, a); \
+			if (__builtin_isnan(b)) b = __builtin_copysignl(0, b); \
+			recalc = 1; \
+		} \
+		if (!recalc && (__builtin_isinf(ac) || __builtin_isinf(bd) || __builtin_isinf(ad) || __builtin_isinf(bc))) { \
+			if (__builtin_isnan(a)) a = __builtin_copysignl(0, a); \
+			if (__builtin_isnan(b)) b = __builtin_copysignl(0, b); \
+			if (__builtin_isnan(c)) c = __builtin_copysignl(0, c); \
+			if (__builtin_isnan(d)) d = __builtin_copysignl(0, d); \
+			recalc = 1; \
+		} \
+		if (recalc) { \
+			x = INF * (a * c - b * d); \
+			y = INF * (a * d + b * c); \
+		} \
+	} \
+	return __builtin_complex(x, y); \
+}
+__ALTC_CMUL(__mulsc3, float, __builtin_inff())
+__ALTC_CMUL(__muldc3, double, __builtin_inf())
+__ALTC_CMUL(__mulxc3, long double, __builtin_infl())
+
+/* integer powers: __builtin_powi */
+#define __ALTC_POWI(NAME, T) \
+T NAME(T x, int m) { \
+	unsigned n = m < 0 ? -(unsigned)m : (unsigned)m; \
+	T y = n % 2 ? x : 1; \
+	while (n >>= 1) { x = x * x; if (n % 2) y = y * x; } \
+	return m < 0 ? 1 / y : y; \
+}
+__ALTC_POWI(__powisf2, float)
+__ALTC_POWI(__powidf2, double)
+__ALTC_POWI(__powixf2, long double)
+
+/* bit operations */
+int __popcountdi2(long a) { unsigned long x = a; int n = 0; while (x) { x &= x - 1; n++; } return n; }
+int __popcountsi2(int a) { return __popcountdi2((unsigned)a); }
+int __popcountti2(__altc_i128 a) { return __popcountdi2((long)a) + __popcountdi2((long)((__altc_u128)a >> 64)); }
+int __paritydi2(long a) { return __popcountdi2(a) & 1; }
+int __paritysi2(int a) { return __popcountdi2((unsigned)a) & 1; }
+int __clzdi2(long a) { unsigned long x = a; int n = 0; if (!x) return 64; while (!(x >> 63)) { x <<= 1; n++; } return n; }
+int __clzsi2(int a) { return __clzdi2((unsigned)a) - 32; }
+int __ctzdi2(long a) { unsigned long x = a; int n = 0; if (!x) return 64; while (!(x & 1)) { x >>= 1; n++; } return n; }
+int __ctzsi2(int a) { return (unsigned)a ? __ctzdi2((unsigned)a) : 32; }
+int __ffsdi2(long a) { return a ? __ctzdi2(a) + 1 : 0; }
+int __ffssi2(int a) { return a ? __ctzdi2((unsigned)a) + 1 : 0; }
+int __bswapsi2(int a) { return __builtin_bswap32(a); }
+long __bswapdi2(long a) { return __builtin_bswap64(a); }
+
+/* more 128-bit conversions and arithmetic */
+float __floatuntisf(__altc_u128 a) { return (float)__floatuntidf(a); }
+float __floattisf(__altc_i128 a) { return (float)__floattidf(a); }
+long double __floatuntixf(__altc_u128 a) {
+	return (long double)(unsigned long)(a >> 64) * 18446744073709551616.0L + (long double)(unsigned long)a;
+}
+long double __floattixf(__altc_i128 a) { return a < 0 ? -__floatuntixf(-(__altc_u128)a) : __floatuntixf((__altc_u128)a); }
+__altc_u128 __fixunssfti(float f) { return __fixunsdfti(f); }
+__altc_i128 __fixsfti(float f) { return __fixdfti(f); }
+__altc_u128 __fixunsxfti(long double d) {
+	if (!(d > 0)) return 0;
+	unsigned long hi = (unsigned long)(d / 18446744073709551616.0L);
+	long double rest = d - (long double)hi * 18446744073709551616.0L;
+	if (rest < 0) rest = 0;
+	return ((__altc_u128)hi << 64) + (unsigned long)rest;
+}
+__altc_i128 __fixxfti(long double d) { return d < 0 ? -(__altc_i128)__fixunsxfti(-d) : (__altc_i128)__fixunsxfti(d); }
+__altc_i128 __multi3(__altc_i128 a, __altc_i128 b) { return a * b; }
+__altc_i128 __ashlti3(__altc_i128 a, int n) { return a << n; }
+__altc_i128 __ashrti3(__altc_i128 a, int n) { return a >> n; }
+__altc_i128 __lshrti3(__altc_i128 a, int n) { return (__altc_i128)((__altc_u128)a >> n); }
 `
 
 var (

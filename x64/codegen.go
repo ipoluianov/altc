@@ -35,6 +35,13 @@ type gen struct {
 	vaTemps     map[*cc.Node]int64
 	overAligned map[*cc.Obj]int64 // locals reached through an aligned pointer
 	listing     *strings.Builder
+
+	// inline assembly
+	asmSlots   map[*cc.AsmOperand]int64 // frame slots of asm operands
+	asmSaveOff int64                    // save area of callee-saved registers (0: none)
+	asmSecs    []*asmSection            // sections created by assembly text
+	topLabels  map[string]*TextLabel    // labels of file-scope asm
+	topSyms    map[string]*asmSym       // what file-scope asm says about symbols
 }
 
 type constEntry struct {
@@ -52,7 +59,7 @@ type Result struct {
 // Generate compiles a parsed program to an object
 func Generate(prog *cc.Program, name string, wantListing bool) (*Result, error) {
 	g := &gen{
-		a:       &Asm{},
+		a:       &Asm{SymPrefix: "t"},
 		obj:     elf.NewObject(name),
 		prog:    prog,
 		labels:  map[string]Label{},
@@ -230,6 +237,9 @@ func (g *gen) run() (err error) {
 		}
 		g.placeData(sec, s, ob, align)
 	}
+	if err := g.topLevelAsm(); err != nil {
+		return err
+	}
 	// functions
 	for _, ob := range g.prog.Globals {
 		if g.defined[ob.AsmName] != ob || !ob.IsFunction {
@@ -273,6 +283,13 @@ func (g *gen) run() (err error) {
 		return err
 	}
 	text.Data = g.a.Code
+	if g.a.MaxAlign > text.Align {
+		text.Align = g.a.MaxAlign
+	}
+	pend, err := g.finishAsm(text, syms)
+	if err != nil {
+		return err
+	}
 	// aliases
 	for _, ob := range g.prog.Globals {
 		if ob.Alias == "" {
@@ -296,13 +313,16 @@ func (g *gen) run() (err error) {
 		g.rodata.Data = append(g.rodata.Data, c.data...)
 	}
 	// code relocations
-	for _, r := range g.a.Relocs {
-		s, ok := syms[r.Sym]
-		if !ok {
-			s = o.Symbol(r.Sym)
-			syms[r.Sym] = s
+	pend = append(pend, pendingRelocs{text, g.a.Relocs})
+	for _, pr := range pend {
+		for _, r := range pr.relocs {
+			s, ok := syms[r.Sym]
+			if !ok {
+				s = o.Symbol(r.Sym)
+				syms[r.Sym] = s
+			}
+			pr.sec.Relocs = append(pr.sec.Relocs, elf.Reloc{Offset: r.Offset, Type: r.Type, Sym: s, Addend: r.Addend})
 		}
-		text.Relocs = append(text.Relocs, elf.Reloc{Offset: r.Offset, Type: r.Type, Sym: s, Addend: r.Addend})
 	}
 	// data relocations
 	for _, ob := range g.prog.Globals {

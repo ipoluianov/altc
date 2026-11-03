@@ -2,8 +2,9 @@
 
 A C compiler for linux/amd64 written in pure Go, with a built-in
 preprocessor, assembler and linker, plus a small IDE. One binary turns a
-folder of C sources into a ready-to-run executable: no gcc, binutils or
-libc development packages are needed, only the system `libc.so.6`.
+folder of C (and assembler) sources into a ready-to-run executable: no gcc,
+binutils or libc development packages are needed, only the system
+`libc.so.6`.
 
 ## Quick start
 
@@ -22,12 +23,13 @@ altc -std=c11 -O2 -Wall -Iinclude a.c b.c -o prog -lm
 altc -c file.c           # ELF object, linkable by GNU ld as well
 altc -S file.c           # GNU assembler listing
 altc -E file.c           # preprocessed output
+altc -c start.S          # assembler sources: .s, or .S with the C preprocessor
 ```
 
 ## Project folder
 
-Without `altc.json` every `*.c` file under the folder is compiled (hidden
-folders and `build/` are skipped), and the folder and its `include/`
+Without `altc.json` every `*.c`, `*.s` and `*.S` file under the folder is
+compiled (hidden folders and `build/` are skipped), and the folder and its `include/`
 subfolder are on the include path. `altc.json` can set:
 
 ```json
@@ -66,9 +68,25 @@ subfolder are on the include path. `altc.json` can set:
   constructor/destructor with priorities, weak, alias, section, visibility,
   mode...), `__builtin_*` (va_*, offsetof, overflow checks, bit counting,
   bswap, classification, `__sync_*`, `__atomic_*`...).
+- Inline assembly: basic and extended `asm` with all common x86 constraints
+  (`r`, `q`, `Q`, `a`...`D`, `A`, `m`, `g`, `i`/`n`, `x`, `t`/`u`, matching
+  and named operands, `&`, `+`, flag outputs `=@cc<cond>`), operand
+  modifiers (`%b0`, `%k1`, `%h2`, `%c3`, `%l[label]`, `%=`...), clobbers,
+  `asm goto`, local register variables (`register long r asm("r10")`) and
+  file-scope `asm`.
 
-Not supported yet: extended inline assembly (only barrier `asm` statements),
-vector types, debug information; the generated code is not optimized.
+Not supported yet: vector types and intrinsics headers, debug information
+and unwind tables, AVX (VEX-encoded) instructions; the generated code is
+not optimized.
+
+## Assembler
+
+The built-in AT&T assembler handles inline asm, file-scope asm and `.s`/`.S`
+files: general-purpose, x87, SSE up to SSE4.2, AES, SHA and PCLMUL
+instructions, short/long jump relaxation, numeric and named labels, label
+differences, sections (`.section`, `.pushsection`...), data and symbol
+directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
+`-S` output it produces the same bytes and relocations as GNU as.
 
 ## How it works
 
@@ -98,11 +116,13 @@ vector types, debug information; the generated code is not optimized.
 go test ./...                                 # everything
 go test ./tests -run TestCompareWithGCC       # C programs vs gcc output
 ABI_SEEDS=40 go test ./tests -run TestABI     # cross-compiler ABI calls
-go test ./x64 -run Encoding                   # encoder vs GNU as
+go test ./tests -run TestAssembleGCCOutput    # gcc -S output vs GNU as, run
+go test ./x64 -run 'Encoding|AssembleText'    # encoder vs GNU as
+ASM_COMPARE_DIR=dir ASM_COMPARE_MATCH=/x86_64/ go test ./x64 -run AssembleFiles
 include/verify/run.sh                         # header layout vs glibc
 ```
 
-The comparison tests need gcc only as a reference.
+The comparison tests need gcc and GNU as only as a reference.
 
 ## License
 

@@ -794,6 +794,9 @@ func (p *parser) copyStructConst(o *Obj, e *Node, ty *Type, buf []byte, offset i
 
 // gvarInitializer parses the initializer of a static object
 func (p *parser) gvarInitializer(o *Obj) {
+	saved := p.staticInit
+	p.staticInit = true
+	defer func() { p.staticInit = saved }()
 	init, ty := p.parseInitializer(o.Ty)
 	declared := o.Ty
 	o.Ty = ty

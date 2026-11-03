@@ -27,6 +27,7 @@ type File struct {
 	Contents  []byte
 	ID        int
 	Trigraphs bool // replace ??= and friends (strict ISO modes before C23)
+	Asm       bool // assembler source (.S): unmatched quotes are plain characters
 }
 
 // Token is a preprocessing token

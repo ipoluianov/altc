@@ -642,6 +642,7 @@ func (g *gen) function(fn *cc.Obj) {
 			g.vaTemps[n] = -offset
 		}
 	})
+	offset = g.asmFrame(fn, offset)
 	stackSize := alignTo(offset, 16)
 
 	g.a.Push(RBP)
@@ -649,6 +650,7 @@ func (g *gen) function(fn *cc.Obj) {
 	if stackSize > 0 {
 		g.a.Alu(SUB, 8, Q(RSP), Imm(stackSize))
 	}
+	g.saveCalleeRegs()
 	g.a.Mov(8, M(RBP, int32(fn.AllocaBottom.Offset)), Q(RSP))
 	for v, area := range g.overAligned {
 		al := max(v.Align, v.Ty.Align())
@@ -709,6 +711,7 @@ func (g *gen) function(fn *cc.Obj) {
 		g.a.Alu(XOR, 4, D(RAX), D(RAX))
 	}
 	g.a.Bind(g.retLabel)
+	g.restoreCalleeRegs()
 	g.a.Leave()
 	g.a.Ret()
 	if g.depth != 0 {
@@ -843,11 +846,8 @@ func (g *gen) genStmt(n *cc.Node) {
 	case cc.NExprStmt:
 		g.genDiscard(n.LHS)
 	case cc.NAsm:
-		switch n.AsmText {
-		case "mfence":
-			g.a.Mfence()
-		case "pause", "rep; nop", "rep nop":
-			g.a.Raw(0xF3, 0x90)
+		if n.Asm != nil {
+			g.genAsm(n)
 		}
 	default:
 		g.genDiscard(n)

@@ -123,13 +123,17 @@ func (p *parser) complexBinary(op NodeKind, a, b *Node, tok *Token) *Node {
 	case NSub:
 		res = makeComplex(ct, bin(NSub, ar, br), bin(NSub, ai, bi), tok)
 	case NMul:
-		if !b.Ty.IsComplex() {
+		switch {
+		case !b.Ty.IsComplex():
 			res = makeComplex(ct, bin(NMul, ar, br), bin(NMul, ai, br), tok)
-		} else if !a.Ty.IsComplex() {
+		case !a.Ty.IsComplex():
 			res = makeComplex(ct, bin(NMul, ar, br), bin(NMul, ar, bi), tok)
-		} else {
+		case p.fn == nil:
 			res = makeComplex(ct, bin(NSub, bin(NMul, ar, br), bin(NMul, ai, bi)),
 				bin(NAdd, bin(NMul, ar, bi), bin(NMul, ai, br)), tok)
+		default:
+			// libgcc-compatible helper: recovers infinities (C11 Annex G)
+			res = p.complexHelper("mul", ct, ar, ai, br, bi, tok)
 		}
 	case NDiv:
 		if !b.Ty.IsComplex() {
@@ -139,7 +143,7 @@ func (p *parser) complexBinary(op NodeKind, a, b *Node, tok *Token) *Node {
 		if p.fn == nil {
 			p.errorAt(tok, "complex division is not a constant expression")
 		}
-		res = p.complexDiv(ct, ar, ai, br, bi, tok)
+		res = p.complexHelper("div", ct, ar, ai, br, bi, tok)
 	case NEq, NNe:
 		eq := bin(NLogAnd, bin(NEq, ar, br), bin(NEq, ai, bi))
 		if op == NNe {
@@ -153,14 +157,15 @@ func (p *parser) complexBinary(op NodeKind, a, b *Node, tok *Token) *Node {
 	return seq(p, tok, []*Node{pa, pb}, res)
 }
 
-// complexDiv calls the libgcc-compatible helper of the runtime
-func (p *parser) complexDiv(ct *Type, ar, ai, br, bi *Node, tok *Token) *Node {
-	name := "__divdc3"
+// complexHelper calls a libgcc-compatible helper of the runtime
+// (__mulsc3, __divdc3...)
+func (p *parser) complexHelper(op string, ct *Type, ar, ai, br, bi *Node, tok *Token) *Node {
+	name := "__" + op + "dc3"
 	switch ct.Base.Kind {
 	case TyFloat:
-		name = "__divsc3"
+		name = "__" + op + "sc3"
 	case TyLongDouble:
-		name = "__divxc3"
+		name = "__" + op + "xc3"
 	}
 	o := p.globalsByName[name]
 	if o == nil {

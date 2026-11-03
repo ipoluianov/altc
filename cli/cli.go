@@ -270,7 +270,7 @@ func gccMode(args []string) int {
 	}
 	var sources []string
 	for _, in := range inputs {
-		if strings.HasSuffix(in, ".c") || in == "-" {
+		if driver.IsSource(in) || in == "-" {
 			sources = append(sources, in)
 		}
 	}
@@ -352,7 +352,7 @@ func gccMode(args []string) int {
 				fmt.Fprintln(os.Stderr, "altc:", err)
 				failed = true
 			}
-		case strings.HasSuffix(in, ".c") || in == "-":
+		case driver.IsSource(in) || in == "-":
 			if verbose {
 				fmt.Fprintln(os.Stderr, "compiling", in)
 			}
@@ -371,8 +371,10 @@ func gccMode(args []string) int {
 				failed = true
 				continue
 			}
-			base := strings.TrimSuffix(filepath.Base(in), ".c")
+			base := strings.TrimSuffix(filepath.Base(in), filepath.Ext(in))
 			switch {
+			case asmOnly && strings.HasSuffix(in, ".s"):
+				// already assembly: nothing to do (like gcc)
 			case asmOnly:
 				dst := out
 				if dst == "" {

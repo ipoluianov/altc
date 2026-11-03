@@ -2,6 +2,7 @@ package cc
 
 import (
 	"fmt"
+	"strings"
 )
 
 func (p *parser) function(ty *Type, name *Token, attr *declAttr, asmLabel string) {
@@ -238,6 +239,24 @@ func (p *parser) blockItem() []*Node {
 		}
 		return nil
 	}
+	if t.Is("__attribute__") || t.Is("__attribute") {
+		// GNU attribute statement: __attribute__((fallthrough));
+		save := p.pos
+		p.attributes(&declAttr{})
+		if p.consume(";") {
+			return []*Node{{Kind: NBlock, Tok: t}}
+		}
+		p.pos = save
+	}
+	if p.isAttrStart(t) {
+		// [[attributes]] before a statement (e.g. [[fallthrough]];)
+		save := p.pos
+		p.attributes(&declAttr{})
+		if !p.isTypename(p.cur()) && !(p.cur().Kind == TIdent && p.cur().kw() && isStorageClass(p.cur().Text)) {
+			return []*Node{p.stmt()}
+		}
+		p.pos = save
+	}
 	if p.isTypename(t) && !p.peekAt(1).Is(":") || (t.Is("__extension__") && p.isTypename(p.peekAt(1))) {
 		attr := &declAttr{}
 		basety := p.declspec(attr)
@@ -415,6 +434,7 @@ func (p *parser) declaration(basety *Type, attr *declAttr) *Node {
 		}
 		v := p.newLvar(name.Text, ty)
 		v.Tok = name
+		v.RegName = strings.TrimPrefix(a.asmName, "%")
 		if a.align > 0 {
 			v.Align = a.align
 		}
@@ -716,40 +736,140 @@ func (p *parser) labeledBody() *Node {
 
 func (p *parser) asmStmt() *Node {
 	t := p.next()
-	for p.is("volatile") || p.is("__volatile__") || p.is("__volatile") || p.is("inline") || p.is("goto") {
+	for p.is("volatile") || p.is("__volatile__") || p.is("__volatile") || p.is("inline") || p.is("__inline") ||
+		p.is("__inline__") || p.is("goto") {
 		p.next()
 	}
 	p.expect("(")
-	text := ""
-	for p.cur().Kind == TStr {
-		_, body := literalPrefix(p.next().Text)
-		text += body
-	}
-	hasOperands := false
-	depth := 0
-	for !(depth == 0 && p.is(")")) {
-		x := p.next()
-		if x.Kind == TEOF {
-			p.errorAt(t, "unterminated asm statement")
+	st := &AsmStmt{Template: p.asmString(), Basic: true}
+	n := &Node{Kind: NAsm, Tok: t, AsmText: st.Template, Asm: st}
+	sec := 0
+	for !p.is(")") {
+		if p.consume(":") {
+			sec++
+			st.Basic = false
+			continue
 		}
-		if x.Is("(") {
-			depth++
-		} else if x.Is(")") {
-			depth--
+		if p.consume("::") {
+			sec += 2
+			st.Basic = false
+			continue
 		}
-		if x.Kind != TPunct || x.Text != ":" {
-			hasOperands = true
+		switch sec {
+		case 1, 2:
+			op := p.asmOperand(sec == 1)
+			if sec == 1 {
+				st.Outputs = append(st.Outputs, op)
+			} else {
+				st.Inputs = append(st.Inputs, op)
+			}
+		case 3:
+			if p.cur().Kind != TStr {
+				p.errorAt(p.cur(), "expected string literal")
+			}
+			st.Clobbers = append(st.Clobbers, p.asmString())
+		case 4:
+			id := p.next()
+			if id.Kind != TIdent {
+				p.errorAt(id, "expected identifier")
+			}
+			g := &Node{Kind: NGoto, Tok: id, Label: id.Text, blocks: append([]*Node(nil), p.blocks...)}
+			p.gotos = append(p.gotos, g)
+			st.Labels = append(st.Labels, g)
+		default:
+			p.errorAt(p.cur(), "expected ')'")
+		}
+		if !p.consume(",") && !p.is(":") && !p.is("::") && !p.is(")") {
+			p.errorAt(p.cur(), "expected ',' or ':' in asm statement")
 		}
 	}
 	p.expect(")")
 	p.expect(";")
-	n := &Node{Kind: NAsm, Tok: t, AsmText: text}
-	if text == "" || isBarrierAsm(text) {
-		return n // compiler barrier: nothing to do
+	if len(st.Outputs)+len(st.Inputs)+len(st.Labels) > 30 {
+		p.errorAt(t, "more than 30 operands in 'asm'")
 	}
-	_ = hasOperands
-	p.errorAt(t, "inline assembly is not supported")
 	return n
+}
+
+// asmString reads concatenated string literals
+func (p *parser) asmString() string {
+	if p.cur().Kind != TStr {
+		p.errorAt(p.cur(), "expected string literal")
+	}
+	var text []byte
+	for p.cur().Kind == TStr {
+		t := p.next()
+		_, body := literalPrefix(t.Text)
+		cps, err := decodeLiteral(body, false, false)
+		if err != nil {
+			p.errorAt(t, "%v", err)
+		}
+		for _, c := range cps {
+			text = append(text, byte(c))
+		}
+	}
+	return string(text)
+}
+
+// asmOperand parses [name] "constraint" (expression)
+func (p *parser) asmOperand(output bool) *AsmOperand {
+	op := &AsmOperand{}
+	if p.consume("[") {
+		op.Name = p.next().Text
+		p.expect("]")
+	}
+	tok := p.cur()
+	op.Constraint = p.asmString()
+	p.expect("(")
+	e := p.expr()
+	p.expect(")")
+	addType(e)
+	op.Expr = e
+	c := op.Constraint
+	if output {
+		if !strings.HasPrefix(c, "=") && !strings.HasPrefix(c, "+") {
+			p.errorAt(tok, "output operand constraint lacks '='")
+		}
+		if !isLvalue(e) {
+			p.errorAt(e.Tok, "invalid lvalue in asm output")
+		}
+		return op
+	}
+	if strings.ContainsAny(c, "=+") {
+		p.errorAt(tok, "input operand constraint contains '%c'", c[strings.IndexAny(c, "=+")])
+	}
+	if strings.ContainsAny(c, "inIJKLMNOeEFGsZXg") {
+		if e.Ty.IsInteger() && p.isConstExpr(e) {
+			op.IsConst, op.Val = true, p.eval(e)
+		} else if strings.ContainsAny(c, "is") {
+			if v, sym, ok := p.tryAddrConst(e); ok {
+				op.IsConst, op.Val, op.Sym = true, v, sym
+			}
+		}
+	}
+	return op
+}
+
+// tryAddrConst evaluates an address constant without reporting errors
+func (p *parser) tryAddrConst(e *Node) (v int64, sym string, ok bool) {
+	if e.Ty.Kind != TyPtr && e.Ty.Kind != TyFunc && e.Ty.Kind != TyArray {
+		return 0, "", false
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if _, isFatal := r.(fatal); !isFatal {
+				panic(r)
+			}
+			ok = false
+		}
+	}()
+	nerr := len(p.errs)
+	v = p.eval2(e, &sym)
+	if len(p.errs) != nerr || sym == "" || strings.Contains(sym, "\x00") {
+		p.errs = p.errs[:nerr]
+		return 0, "", false
+	}
+	return v, sym, true
 }
 
 // withCleanups runs the active cleanups before a return; the value is
@@ -787,14 +907,6 @@ func (p *parser) jumpWithCleanups(j *Node, depth int) *Node {
 	return blk
 }
 
-func isBarrierAsm(s string) bool {
-	switch s {
-	case "", " ", "nop", "mfence", "lfence", "sfence", "pause", "rep; nop", "rep nop":
-		return true
-	}
-	return false
-}
-
 // truncInt converts a value to the representation of an integer type
 func truncInt(v int64, t *Type) int64 {
 	switch t.Size() {
@@ -815,4 +927,12 @@ func truncInt(v int64, t *Type) int64 {
 		return int64(int32(v))
 	}
 	return v
+}
+
+func isStorageClass(s string) bool {
+	switch s {
+	case "static", "extern", "typedef", "auto", "register", "_Thread_local", "thread_local", "__thread", "constexpr", "inline":
+		return true
+	}
+	return false
 }

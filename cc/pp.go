@@ -39,6 +39,7 @@ type PPConfig struct {
 	Defines    []string     // "-DNAME=VAL" / "-UNAME" in command line order, without the dash letter: "DNAME=VAL"
 	PreInclude []string     // -include files
 	ReadFile   func(path string) ([]byte, error)
+	Asm        bool // preprocessing assembler source: __ASSEMBLER__, lenient lexing and directives
 }
 
 type cond struct {
@@ -122,10 +123,15 @@ func (pp *Preprocessor) Define(def string) {
 func (pp *Preprocessor) defineText(text string) {
 	f := &File{Name: "<command line>", Contents: []byte(text)}
 	toks, _ := Tokenize(f)
+	var line []*Token
 	for _, t := range toks {
+		if t.Kind == TEOF {
+			break
+		}
 		t.File = nil
+		line = append(line, t)
 	}
-	pp.readDefine(toks, 0)
+	pp.readDefine(line, 0)
 }
 
 // Undef removes a macro
@@ -136,7 +142,7 @@ func (pp *Preprocessor) Macros() map[string]*Macro { return pp.macros }
 
 func (pp *Preprocessor) newFile(name string, data []byte) *File {
 	pp.nextID++
-	return &File{Name: name, Contents: data, ID: pp.nextID, Trigraphs: !pp.cfg.GNU && pp.cfg.Std < 2023}
+	return &File{Name: name, Contents: data, ID: pp.nextID, Trigraphs: !pp.cfg.GNU && pp.cfg.Std < 2023, Asm: pp.cfg.Asm}
 }
 
 func (pp *Preprocessor) definePredefined() {
@@ -144,6 +150,9 @@ func (pp *Preprocessor) definePredefined() {
 	var b strings.Builder
 	def := func(name, val string) { fmt.Fprintf(&b, "#define %s %s\n", name, val) }
 	def("__STDC__", "1")
+	if pp.cfg.Asm {
+		def("__ASSEMBLER__", "1")
+	}
 	switch {
 	case std >= 2023:
 		def("__STDC_VERSION__", "202311L")
@@ -451,6 +460,7 @@ func (pp *Preprocessor) expand(t *Token) bool {
 		}
 		if len(body) > 0 {
 			body[0].Space = t.Space
+			startLine(body[0], t)
 		}
 		pp.push(body)
 		return true
@@ -472,11 +482,21 @@ func (pp *Preprocessor) expand(t *Token) bool {
 	}
 	if len(body) > 0 {
 		body[0].Space = t.Space
+		startLine(body[0], t)
 	} else if t.Space {
 		pp.spaceNext()
 	}
 	pp.push(body)
 	return true
+}
+
+// startLine keeps an expansion at the start of a line when the macro name
+// was (the -E output, and statements of assembler sources, are line based)
+func startLine(first, name *Token) {
+	if name.BOL {
+		first.BOL = true
+		first.File, first.Line = name.File, name.Line
+	}
 }
 
 func (m *Macro) hasPaste() bool {
@@ -829,7 +849,9 @@ func (pp *Preprocessor) directive(s *source, hash *Token) {
 		return
 	}
 	if t.Kind != TIdent {
-		pp.errorf(t, "invalid preprocessing directive")
+		if !pp.cfg.Asm {
+			pp.errorf(t, "invalid preprocessing directive")
+		}
 		pp.lineToks(s)
 		return
 	}
@@ -935,7 +957,10 @@ func (pp *Preprocessor) directive(s *source, hash *Token) {
 	case "ident", "sccs", "assert", "unassert":
 		pp.lineToks(s)
 	default:
-		pp.errorf(t, "invalid preprocessing directive #%s", t.Text)
+		if !pp.cfg.Asm {
+			// in assembler source "# text" is a comment
+			pp.errorf(t, "invalid preprocessing directive #%s", t.Text)
+		}
 		pp.lineToks(s)
 	}
 }

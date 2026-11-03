@@ -138,7 +138,7 @@ func (p *Project) SourceFiles() ([]string, error) {
 				}
 				return nil
 			}
-			if strings.HasSuffix(d.Name(), ".c") && !seen[path] {
+			if IsSource(d.Name()) && !seen[path] {
 				seen[path] = true
 				files = append(files, path)
 			}

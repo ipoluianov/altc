@@ -50,6 +50,7 @@ type parser struct {
 	errs                []*Error
 	uniq                int
 	gotos               []*Node
+	staticInit          bool // parsing the initializer of an object with static storage
 	labels              []*Node
 	brk, cont           string
 	sw                  *Node
@@ -1448,9 +1449,12 @@ func (p *parser) topLevel() {
 	}
 	if p.is("asm") || p.is("__asm__") || p.is("__asm") {
 		t := p.next()
-		p.skipBalanced()
+		p.expect("(")
+		text := p.asmString()
+		p.expect(")")
 		p.expect(";")
-		p.warnAt(t, "file-scope asm statement ignored")
+		p.prog.TopAsm = append(p.prog.TopAsm, text)
+		p.prog.AsmToks = append(p.prog.AsmToks, t)
 		return
 	}
 	attr := &declAttr{}

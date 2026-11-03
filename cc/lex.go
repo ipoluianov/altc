@@ -132,6 +132,7 @@ func (lx *lexer) add(kind TokKind, start, end int, bol, space bool) *Token {
 
 func (lx *lexer) run() {
 	src := lx.src
+	asm := lx.file.Asm
 	n := len(src)
 	bol, space := true, false
 	i := 0
@@ -180,8 +181,8 @@ func (lx *lexer) run() {
 				}
 			}
 			lx.add(TNum, start, i, bol, space)
-		case isIdentStart(c):
-			for i < n && isIdentChar(src[i]) {
+		case isIdentStart(c) && !(asm && c == '$'):
+			for i < n && isIdentChar(src[i]) && !(asm && src[i] == '$') {
 				i++
 			}
 			word := string(src[start:i])
@@ -265,6 +266,9 @@ func (lx *lexer) scanQuoted(i int, q byte) int {
 	j := i + 1
 	for j < len(src) && src[j] != q {
 		if src[j] == '\n' {
+			if lx.file.Asm {
+				return i + 1
+			}
 			if q == '"' {
 				lx.errorAt(i, "missing terminating \" character")
 			} else {
@@ -278,6 +282,9 @@ func (lx *lexer) scanQuoted(i int, q byte) int {
 		j++
 	}
 	if j >= len(src) {
+		if lx.file.Asm {
+			return i + 1
+		}
 		lx.errorAt(i, "unterminated literal")
 		return j
 	}

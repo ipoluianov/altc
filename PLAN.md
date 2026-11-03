@@ -10,6 +10,7 @@ Goal: `altc <folder>` → a ready-to-run ELF executable for linux/amd64.
                 │
                 ▼
                x64/     code generator (SysV ABI) + x86-64 assembler (encoding)
+.s/.S sources ─►        AT&T assembler (inline asm, file-scope asm, .s files)
                 │
                 ▼
                elf/     object model, ELF .o writer/reader, .a archives,
@@ -50,7 +51,10 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
 7. Driver and CLI (gcc-compatible flags + folder mode).
 8. Tests: C programs with output compared to gcc; large projects (Lua, sqlite).
 9. IDE.
-10. Later: optimizations (register allocation), DWARF, `-static`.
+10. GNU extended inline asm; AT&T assembler for `.s`/`.S` files (verified
+    byte for byte against GNU as on gcc's output of the test programs).
+11. Later: optimizations (register allocation), DWARF and unwind tables
+    (`.cfi_*`), vector types, `-static`.
 
 ## CLI
 

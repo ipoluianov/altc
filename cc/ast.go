@@ -110,11 +110,32 @@ type Node struct {
 
 	Builtin string
 	AsmText string
+	Asm     *AsmStmt
 
 	// blocks and loops that declare VLAs: slot for the saved stack pointer
 	// (for a goto: the slot to restore before jumping out of VLA scopes)
 	StackSave *Obj
 	blocks    []*Node // enclosing blocks of a label or goto
+}
+
+// AsmStmt is an inline assembly statement
+type AsmStmt struct {
+	Template string
+	Basic    bool // no operand sections: '%' is not special
+	Outputs  []*AsmOperand
+	Inputs   []*AsmOperand
+	Clobbers []string
+	Labels   []*Node // asm goto targets (their UniqueLabel is resolved like a goto)
+}
+
+// AsmOperand is an operand of an extended asm statement
+type AsmOperand struct {
+	Name       string // [name]
+	Constraint string
+	Expr       *Node
+	IsConst    bool // constant value (immediate operands): Sym + Val
+	Val        int64
+	Sym        string
 }
 
 // InitReloc is an address stored in initialized data
@@ -137,7 +158,8 @@ type Obj struct {
 	Align   int64
 
 	// locals
-	Offset int64
+	Offset  int64
+	RegName string // local register variable: register asm("name")
 
 	// globals
 	IsFunction   bool
@@ -179,5 +201,7 @@ func LabelSymbol(fn, label string) string { return ".Llabel." + fn + "." + label
 
 // Program is a parsed translation unit
 type Program struct {
-	Globals []*Obj // variables and functions in definition order
+	Globals []*Obj   // variables and functions in definition order
+	TopAsm  []string // file-scope asm statements
+	AsmToks []*Token // their positions (for diagnostics)
 }

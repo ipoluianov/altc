@@ -38,6 +38,14 @@ func Walk(n *Node, f func(*Node)) {
 	for _, a := range n.Args {
 		Walk(a, f)
 	}
+	if n.Asm != nil {
+		for _, o := range n.Asm.Outputs {
+			Walk(o.Expr, f)
+		}
+		for _, o := range n.Asm.Inputs {
+			Walk(o.Expr, f)
+		}
+	}
 }
 
 // Common types for the code generator

@@ -249,6 +249,11 @@ func (p *parser) eval2(n *Node, label *string) int64 {
 		if n.Var.ConstExpr != nil {
 			return p.eval2(n.Var.ConstExpr, label)
 		}
+		if v, ok := constVarValue(n.Var); ok && p.staticInit {
+			// GNU extension: a const object with a constant initializer
+			// used in a static initializer
+			return v
+		}
 		if label == nil {
 			p.errorAt(n.Tok, "expression is not a compile-time constant")
 		}
@@ -408,4 +413,21 @@ func (p *parser) evalLD(n *Node) *big.Float {
 		return nil
 	}
 	return new(big.Float).SetPrec(64).SetFloat64(f)
+}
+
+// constVarValue reads the value of a const-qualified, non-volatile integer
+// object with static storage and a constant initializer
+func constVarValue(o *Obj) (int64, bool) {
+	t := o.Ty
+	if o.IsLocal || !t.Const || t.Volatile || !t.IsInteger() || t.Size() > 8 || len(o.Relocs) > 0 || o.IsExtern {
+		return 0, false
+	}
+	if o.InitData == nil || int64(len(o.InitData)) < t.Size() {
+		return 0, false
+	}
+	var u uint64
+	for i := t.Size() - 1; i >= 0; i-- {
+		u = u<<8 | uint64(o.InitData[i])
+	}
+	return truncInt(int64(u), t), true
 }

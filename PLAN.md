@@ -1,0 +1,62 @@
+# AltC — plan
+
+A C compiler in pure Go (no cgo, no external as/ld) plus a simple IDE.
+Goal: `altc <folder>` → a ready-to-run ELF executable for linux/amd64.
+
+## Architecture
+
+```
+.c sources ──► cc/      tokenizer, preprocessor, parser, types, AST
+                │
+                ▼
+               x64/     code generator (SysV ABI) + x86-64 assembler (encoding)
+                │
+                ▼
+               elf/     object model, ELF .o writer/reader, .a archives,
+                │       .so dynamic symbol reader, linker
+                ▼
+         ELF64 executable (ET_EXEC), dynamically linked with libc.so.6 / libm.so.6
+```
+
+* `include/` — built-in standard headers (embedded), layout-compatible with
+  glibc x86-64. System `/usr/include` is not required.
+* libc is the system `libc.so.6` (present on every glibc Linux). The linker
+  generates `_start` itself (calls `__libc_start_main`).
+* `driver/` — build pipeline: files, project folder (`altc.json` optional),
+  parallel compilation, diagnostics.
+* `ide/` — a simple IDE on nui: file tree, editor tabs, syntax highlighting,
+  output panel, F7 build, F5 run, jump to error.
+
+## Language
+
+Standards: `-std=c89/c90/c99/c11/c17/c23` (and gnu variants). A superset is
+accepted: the full preprocessor (variadic macros, `#`/`##`, `__has_include`,
+`_Pragma`, `#include_next`, `#elifdef`, `#embed`), all types (x87
+`long double`, bit-fields, VLA, flexible array members), designated
+initializers, compound literals, `_Generic`, `_Static_assert`, `_Alignas`,
+`_Alignof`, `_Noreturn`, `_Thread_local`, `__attribute__` and `[[...]]`
+attributes, C23 (`bool/true/false`, `nullptr`, `typeof`, `0b`, digit
+separators, `static_assert`, `constexpr`, `auto`), GNU extensions (statement
+expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
+
+## Stages
+
+1. x86-64 assembler (encoding) + tests against GNU as.
+2. ELF: object model, .o writer, linker (PLT/GOT, .dynamic, TLS, init_array).
+3. Tokenizer + preprocessor.
+4. Built-in headers.
+5. Parser + types + constant expressions.
+6. Code generator (SysV ABI: structs by value, varargs, float/double/long double).
+7. Driver and CLI (gcc-compatible flags + folder mode).
+8. Tests: C programs with output compared to gcc; large projects (Lua, sqlite).
+9. IDE.
+10. Later: optimizations (register allocation), DWARF, `-static`.
+
+## CLI
+
+```
+altc build [dir]           build a project (current dir by default)
+altc run [dir] [-- args]   build and run
+altc file.c ... -o prog    gcc-like: -c -S -E -I -D -U -L -l -std= -o -w
+altc ide [dir]             open the IDE (same as no arguments)
+```

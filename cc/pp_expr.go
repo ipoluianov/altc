@@ -167,7 +167,7 @@ func (pp *Preprocessor) currentFileSource() *source {
 
 var knownAttributes = map[string]bool{
 	"aligned": true, "packed": true, "noreturn": true, "unused": true, "used": true, "always_inline": true,
-	"noinline": true, "format": true, "deprecated": true, "weak": true, "alias": true, "visibility": true,
+	"noinline": true, "format": true, "deprecated": true, "weak": true, "alias": true, "ifunc": true, "visibility": true,
 	"constructor": true, "destructor": true, "cold": true, "hot": true, "pure": true, "const": true,
 	"malloc": true, "nonnull": true, "warn_unused_result": true, "sentinel": true, "section": true,
 	"fallthrough": true, "may_alias": true, "returns_nonnull": true, "nothrow": true, "leaf": true,

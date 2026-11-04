@@ -27,17 +27,24 @@ type declAttr struct {
 	align                                                                           int64
 	weak, used, hidden, ctor, dtor, packed, unusedAttr                              bool
 	alias, section, asmName                                                         string
+	ifunc                                                                           bool
 	mode                                                                            string
+	vecSize                                                                         int64
+	vecTok                                                                          *Token
 	cleanup                                                                         *Token
 	prio                                                                            int64
 	gnuInline                                                                       bool
+	alwaysInline, noinline                                                          bool
+	target                                                                          string
+	targetClones                                                                    []string
 	deprecated                                                                      bool
 }
 
 // Options for the parser
 type Options struct {
-	Std int  // 1989, 1999, 2011, 2017, 2023
-	GNU bool // GNU dialect
+	Std      int   // 1989, 1999, 2011, 2017, 2023
+	GNU      bool  // GNU dialect
+	VecAlign int64 // largest alignment of vector types (16; 32 with AVX)
 }
 
 type parser struct {
@@ -124,6 +131,8 @@ func (p *parser) declareBuiltinTypes() {
 	va.Typedef = "__builtin_va_list"
 	p.vaListTy = va
 	p.sc.vars["__builtin_va_list"] = &varScope{typedef: va}
+	p.sc.vars["__int128_t"] = &varScope{typedef: tyInt128}
+	p.sc.vars["__uint128_t"] = &varScope{typedef: tyUInt128}
 	// TS 18661 floating types (glibc typedefs them itself when the compiler does not)
 	for name, t := range map[string]*Type{"_Float32": tyFloat, "_Float64": tyDouble, "_Float32x": tyDouble, "_Float64x": tyLDouble} {
 		p.sc.vars[name] = &varScope{typedef: t}
@@ -499,6 +508,9 @@ func (p *parser) attrList(a *declAttr, end string) {
 			a.weak = true
 		case "alias":
 			a.alias = strArg()
+		case "ifunc":
+			a.alias = strArg()
+			a.ifunc = true
 		case "section":
 			a.section = strArg()
 		case "visibility":
@@ -520,6 +532,23 @@ func (p *parser) attrList(a *declAttr, end string) {
 			a.noreturn = true
 		case "used":
 			a.used = true
+		case "target":
+			a.target = strings.ToLower(strArg())
+		case "target_clones":
+			for _, x := range args {
+				if x.Kind == TStr {
+					_, body := literalPrefix(x.Text)
+					for _, c := range strings.Split(body, ",") {
+						if c = strings.TrimSpace(strings.ToLower(c)); c != "" {
+							a.targetClones = append(a.targetClones, c)
+						}
+					}
+				}
+			}
+		case "always_inline":
+			a.alwaysInline = true
+		case "noinline", "noipa":
+			a.noinline = true
 		case "gnu_inline":
 			a.gnuInline = true
 		case "unused", "maybe_unused":
@@ -534,8 +563,16 @@ func (p *parser) attrList(a *declAttr, end string) {
 			if len(args) > 0 {
 				a.mode = strings.Trim(args[0].Text, "_")
 			}
-		case "vector_size", "ext_vector_type":
-			p.errorAt(t, "vector types are not supported")
+		case "vector_size":
+			if len(args) > 0 {
+				saved := p.pos
+				p.pos = argStart + 1
+				a.vecSize = p.constExpr()
+				a.vecTok = t
+				p.pos = saved
+			}
+		case "ext_vector_type":
+			p.errorAt(t, "ext_vector_type is not supported")
 		}
 	}
 }
@@ -795,6 +832,10 @@ func (p *parser) declspec(attr *declAttr) *Type {
 	if attr != nil && attr.mode != "" {
 		ty = modeType(ty, attr.mode)
 		attr.mode = ""
+	}
+	if attr != nil && attr.vecSize > 0 {
+		ty = p.applyVectorSize(ty, attr.vecSize, attr.vecTok)
+		attr.vecSize = 0
 	}
 	return ty.withQuals(isConst, isVolatile, isRestrict, isAtomic)
 }
@@ -1207,6 +1248,10 @@ func (p *parser) structMembers(ty *Type) {
 				m.Ty = modeType(m.Ty, mattr.mode)
 				m.Align = m.Ty.Align()
 			}
+			if mattr.vecSize > 0 {
+				m.Ty = p.applyVectorSize(m.Ty, mattr.vecSize, mattr.vecTok)
+				m.Align = m.Ty.Align()
+			}
 			if p.consume(":") {
 				w := p.constExpr()
 				if !m.Ty.IsInteger() {
@@ -1517,6 +1562,9 @@ func (p *parser) typedefDecl(basety *Type, attr *declAttr) []*Token {
 		if a.mode != "" {
 			ty = modeType(ty, a.mode)
 		}
+		if a.vecSize > 0 {
+			ty = p.applyVectorSize(ty, a.vecSize, a.vecTok)
+		}
 		if a.align > 0 || a.packed {
 			ty = ty.clone()
 			ty.Origin = nil
@@ -1616,6 +1664,7 @@ func (p *parser) applyAttrs(o *Obj, a *declAttr) {
 	}
 	if a.alias != "" {
 		o.Alias = a.alias
+		o.IFunc = a.ifunc
 	}
 	if a.section != "" {
 		o.Section = a.section
@@ -1634,6 +1683,18 @@ func (p *parser) applyAttrs(o *Obj, a *declAttr) {
 	}
 	if a.noreturn {
 		o.Noreturn = true
+	}
+	if a.alwaysInline {
+		o.AlwaysInline = true
+	}
+	if a.target != "" {
+		o.Target = a.target
+	}
+	if len(a.targetClones) > 0 {
+		o.TargetClones = a.targetClones
+	}
+	if a.noinline {
+		o.NoInline = true
 	}
 	if a.used {
 		o.IsUsed = true
@@ -1666,6 +1727,9 @@ func (p *parser) globalDecl(basety *Type, attr *declAttr) {
 		}
 		if a.mode != "" {
 			ty = modeType(ty, a.mode)
+		}
+		if a.vecSize > 0 {
+			ty = p.applyVectorSize(ty, a.vecSize, a.vecTok)
 		}
 		if ty.Kind == TyFunc {
 			o := p.declareGlobal(name, ty, &a)

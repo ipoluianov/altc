@@ -141,6 +141,8 @@ func (g *gen) genInt128Binary(n *cc.Node) {
 
 // callAligned calls a runtime helper keeping the stack 16-byte aligned
 func (g *gen) callAligned(name string) {
+	g.spillXMM()
+	defer g.reloadXMM()
 	if g.depth%2 != 0 {
 		g.a.Alu(SUB, 8, Q(RSP), Imm(8))
 		g.a.Call(name)

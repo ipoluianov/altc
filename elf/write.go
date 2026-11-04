@@ -67,6 +67,9 @@ func WriteObject(o *Object) []byte {
 		switch s.Type {
 		case SymFunc:
 			typ = 2
+			if s.IFunc {
+				typ = 10 // STT_GNU_IFUNC
+			}
 		case SymObject, SymCommon:
 			typ = 1
 		case SymTLS:

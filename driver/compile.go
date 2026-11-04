@@ -27,6 +27,31 @@ type Config struct {
 	NoStdInc    bool     // -nostdinc: no built-in and no system headers
 	NoWarnings  bool     // -w
 	Listing     bool     // produce assembler text (-S)
+	NoRegAlloc  bool     // -O0: keep every local variable in the frame
+	ISA         x64.ISA  // instruction set extensions (-march, -m<feature>)
+}
+
+// MachineFlag applies -march=..., -m<feature> and -mno-<feature>
+func (c *Config) MachineFlag(opt string) (bool, error) {
+	return c.ISA.MachineFlag(opt)
+}
+
+// vecAlign is the largest alignment of vector types, like gcc: 16 bytes,
+// 32 with AVX
+func (c *Config) vecAlign() int64 {
+	if c.ISA.Has(x64.ISAAVX) {
+		return 32
+	}
+	return 16
+}
+
+// isaDefines are the predefined macros of the enabled extensions
+func (c *Config) isaDefines() []string {
+	var ds []string
+	for _, m := range c.ISA.Macros() {
+		ds = append(ds, "D"+m+"=1")
+	}
+	return ds
 }
 
 // StdLevel converts a -std= value to the numeric level and dialect
@@ -76,7 +101,7 @@ func (c *Config) ppConfig() (cc.PPConfig, error) {
 	if err != nil {
 		return cc.PPConfig{}, err
 	}
-	pc := cc.PPConfig{Std: level, GNU: gnu, QuoteDirs: c.QuoteDirs, Defines: c.Defines, PreInclude: c.PreInclude}
+	pc := cc.PPConfig{Std: level, GNU: gnu, QuoteDirs: c.QuoteDirs, Defines: append(c.isaDefines(), c.Defines...), PreInclude: c.PreInclude}
 	for _, d := range c.IncludeDirs {
 		pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: d})
 	}
@@ -259,12 +284,12 @@ func CompileSource(path string, data []byte, cfg *Config) (u *Unit) {
 	if hasError(u.Diagnostics) {
 		return u
 	}
-	prog, perrs := cc.Parse(toks, cc.Options{Std: pc.Std, GNU: pc.GNU})
+	prog, perrs := cc.Parse(toks, cc.Options{Std: pc.Std, GNU: pc.GNU, VecAlign: cfg.vecAlign()})
 	u.Diagnostics = append(u.Diagnostics, toDiags(perrs, cfg.NoWarnings)...)
 	if hasError(u.Diagnostics) {
 		return u
 	}
-	res, err := x64.Generate(prog, path, cfg.Listing)
+	res, err := x64.GenerateWith(prog, path, x64.Options{Listing: cfg.Listing, NoRegAlloc: cfg.NoRegAlloc, ISA: cfg.ISA})
 	if err != nil {
 		u.Diagnostics = append(u.Diagnostics, parseGenError(path, err))
 		return u
@@ -454,6 +479,92 @@ __altc_i128 __multi3(__altc_i128 a, __altc_i128 b) { return a * b; }
 __altc_i128 __ashlti3(__altc_i128 a, int n) { return a << n; }
 __altc_i128 __ashrti3(__altc_i128 a, int n) { return a >> n; }
 __altc_i128 __lshrti3(__altc_i128 a, int n) { return (__altc_i128)((__altc_u128)a >> n); }
+
+/* CPU feature detection for __builtin_cpu_supports and target_clones */
+static unsigned __altc_cpu_ecx1, __altc_cpu_edx1, __altc_cpu_ebx7, __altc_cpu_ecx7, __altc_cpu_ecxe1;
+static unsigned __altc_cpu_xcr0, __altc_cpu_vendor;
+static int __altc_cpu_ready;
+static void __altc_cpuid(unsigned leaf, unsigned sub, unsigned *a, unsigned *b, unsigned *c, unsigned *d) {
+	__asm__ __volatile__("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "0"(leaf), "2"(sub));
+}
+int __altc_cpu_init(void) {
+	unsigned a, b, c, d, max, ext;
+	if (__altc_cpu_ready)
+		return 0;
+	__altc_cpuid(0, 0, &max, &b, &c, &d);
+	__altc_cpu_vendor = b;
+	__altc_cpuid(1, 0, &a, &b, &__altc_cpu_ecx1, &__altc_cpu_edx1);
+	if (max >= 7)
+		__altc_cpuid(7, 0, &a, &__altc_cpu_ebx7, &__altc_cpu_ecx7, &d);
+	__altc_cpuid(0x80000000, 0, &ext, &b, &c, &d);
+	if (ext >= 0x80000001)
+		__altc_cpuid(0x80000001, 0, &a, &b, &__altc_cpu_ecxe1, &d);
+	if (__altc_cpu_ecx1 & (1u << 27)) {
+		unsigned lo, hi;
+		__asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0));
+		__altc_cpu_xcr0 = lo;
+	}
+	__altc_cpu_ready = 1;
+	return 0;
+}
+static int __altc_streq(const char *a, const char *b) {
+	while (*a && *a == *b)
+		a++, b++;
+	return *a == *b;
+}
+int __altc_cpu_supports(const char *f) {
+	static const struct { const char *name; unsigned char reg, bit; } feats[] = {
+		{"cmov", 1, 15}, {"mmx", 1, 23}, {"sse", 1, 25}, {"sse2", 1, 26},
+		{"sse3", 0, 0}, {"pclmul", 0, 1}, {"ssse3", 0, 9}, {"fma", 0, 12}, {"sse4.1", 0, 19}, {"sse4.2", 0, 20},
+		{"movbe", 0, 22}, {"popcnt", 0, 23}, {"aes", 0, 25}, {"avx", 0, 28}, {"f16c", 0, 29}, {"rdrnd", 0, 30},
+		{"bmi", 2, 3}, {"avx2", 2, 5}, {"bmi2", 2, 8}, {"avx512f", 2, 16}, {"avx512dq", 2, 17}, {"rdseed", 2, 18},
+		{"adx", 2, 19}, {"avx512ifma", 2, 21}, {"avx512cd", 2, 28}, {"sha", 2, 29}, {"avx512bw", 2, 30},
+		{"avx512vl", 2, 31}, {"avx512vbmi", 3, 1}, {"gfni", 3, 8}, {"vaes", 3, 9}, {"vpclmulqdq", 3, 10},
+		{"avx512vnni", 3, 11}, {"avx512bitalg", 3, 12}, {"avx512vpopcntdq", 3, 14},
+		{"lzcnt", 4, 5}, {"abm", 4, 5}, {"sse4a", 4, 6}, {"xop", 4, 11}, {"fma4", 4, 16},
+	};
+	unsigned regs[5];
+	int ymm, zmm;
+	__altc_cpu_init();
+	regs[0] = __altc_cpu_ecx1;
+	regs[1] = __altc_cpu_edx1;
+	regs[2] = __altc_cpu_ebx7;
+	regs[3] = __altc_cpu_ecx7;
+	regs[4] = __altc_cpu_ecxe1;
+	ymm = (__altc_cpu_xcr0 & 6) == 6;
+	zmm = (__altc_cpu_xcr0 & 0xe6) == 0xe6;
+	if (__altc_streq(f, "x86-64"))
+		return 1;
+	if (__altc_streq(f, "x86-64-v2"))
+		return __altc_cpu_supports("sse4.2") && __altc_cpu_supports("popcnt") && __altc_cpu_supports("ssse3");
+	if (__altc_streq(f, "x86-64-v3"))
+		return __altc_cpu_supports("x86-64-v2") && __altc_cpu_supports("avx2") && __altc_cpu_supports("bmi2") &&
+		       __altc_cpu_supports("fma") && __altc_cpu_supports("f16c") && __altc_cpu_supports("lzcnt") &&
+		       __altc_cpu_supports("movbe");
+	if (__altc_streq(f, "x86-64-v4"))
+		return __altc_cpu_supports("x86-64-v3") && __altc_cpu_supports("avx512f") && __altc_cpu_supports("avx512bw") &&
+		       __altc_cpu_supports("avx512cd") && __altc_cpu_supports("avx512dq") && __altc_cpu_supports("avx512vl");
+	for (unsigned i = 0; i < sizeof feats / sizeof feats[0]; i++) {
+		if (!__altc_streq(f, feats[i].name))
+			continue;
+		if (!(regs[feats[i].reg] >> feats[i].bit & 1))
+			return 0;
+		if (feats[i].name[0] == 'a' && feats[i].name[1] == 'v' && feats[i].name[2] == 'x')
+			return feats[i].name[3] == '5' ? zmm : ymm;
+		if (__altc_streq(f, "fma") || __altc_streq(f, "f16c") || __altc_streq(f, "vaes") || __altc_streq(f, "vpclmulqdq"))
+			return ymm;
+		return 1;
+	}
+	return 0;
+}
+int __altc_cpu_is(const char *name) {
+	__altc_cpu_init();
+	if (__altc_streq(name, "intel"))
+		return __altc_cpu_vendor == 0x756e6547; /* "Genu" */
+	if (__altc_streq(name, "amd"))
+		return __altc_cpu_vendor == 0x68747541; /* "Auth" */
+	return 0;
+}
 `
 
 var (
@@ -461,6 +572,42 @@ var (
 	runtimeObjs []*elf.Object
 	runtimeErr  error
 )
+
+// cpuModelSource is libgcc's interface to the processor features, used by
+// code gcc compiles for __builtin_cpu_supports and target_clones. The bit
+// numbers are those of gcc's enum processor_features.
+const cpuModelSource = `
+int __altc_cpu_supports(const char *f);
+int __altc_cpu_is(const char *name);
+struct __processor_model { unsigned int __cpu_vendor, __cpu_type, __cpu_subtype, __cpu_features[1]; } __cpu_model;
+unsigned int __cpu_features2[4];
+static const struct { const char *name; unsigned char bit; } __altc_cpu_bits[] = {
+%s};
+__attribute__((constructor(101))) int __cpu_indicator_init(void) {
+	if (__cpu_model.__cpu_vendor)
+		return 0;
+	for (unsigned i = 0; i < sizeof __altc_cpu_bits / sizeof __altc_cpu_bits[0]; i++) {
+		unsigned b = __altc_cpu_bits[i].bit;
+		if (!__altc_cpu_supports(__altc_cpu_bits[i].name))
+			continue;
+		if (b < 32)
+			__cpu_model.__cpu_features[0] |= 1u << b;
+		else
+			__cpu_features2[(b - 32) / 32] |= 1u << ((b - 32) %% 32);
+	}
+	__cpu_model.__cpu_vendor = __altc_cpu_is("intel") ? 1 : __altc_cpu_is("amd") ? 2 : 3;
+	return 0;
+}
+`
+
+// cpuModelCode fills cpuModelSource with the feature bits
+func cpuModelCode() string {
+	var b strings.Builder
+	for _, f := range cc.CPUFeatures {
+		fmt.Fprintf(&b, "\t{\"%s\", %d},\n", f.Name, f.Bit)
+	}
+	return fmt.Sprintf(cpuModelSource, b.String())
+}
 
 // runtimeObjects compiles the runtime support once per process; each
 // function becomes its own lazily linked object
@@ -476,6 +623,14 @@ func runtimeObjects() ([]*elf.Object, error) {
 			return
 		}
 		runtimeObjs = []*elf.Object{u.Obj}
+		// libgcc's CPU model, in an object of its own: linked (and its
+		// constructor run) only when gcc-compiled code refers to it
+		c := CompileSource("<altc-cpumodel>", []byte(cpuModelCode()), &Config{Std: "gnu17", NoStdInc: true})
+		if c.Obj == nil {
+			runtimeErr = fmt.Errorf("runtime: %v", c.Diagnostics)
+			return
+		}
+		runtimeObjs = append(runtimeObjs, c.Obj)
 	})
 	return runtimeObjs, runtimeErr
 }

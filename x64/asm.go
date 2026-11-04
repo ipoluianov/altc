@@ -85,6 +85,9 @@ func RegName(r Reg, size int) string {
 		return [...]string{"%ah", "%ch", "%dh", "%bh"}[r-AH]
 	}
 	if r.IsXMM() {
+		if size == 32 {
+			return fmt.Sprintf("%%ymm%d", r-XMM0)
+		}
 		return fmt.Sprintf("%%xmm%d", r-XMM0)
 	}
 	if r == RIP {
@@ -231,6 +234,7 @@ type Asm struct {
 	LabelSyms []LabelSym
 	SymPrefix string // makes the label symbol names unique per object
 	MaxAlign  int64  // largest alignment requested by assembly text
+	AVX       bool   // encode SSE instructions in their VEX forms
 }
 
 // gnuNops are the multi-byte nops GNU as uses for code alignment
@@ -380,7 +384,6 @@ func (a *Asm) enc(pfx []byte, w bool, op []byte, reg int, rm Operand, trail int,
 		rex |= 4
 	}
 	var mem Mem
-	isMem := false
 	switch o := rm.(type) {
 	case R:
 		if o.Reg.num()&8 != 0 {
@@ -391,7 +394,6 @@ func (a *Asm) enc(pfx []byte, w bool, op []byte, reg int, rm Operand, trail int,
 		}
 	case Mem:
 		mem = o
-		isMem = true
 		if mem.Base >= 0 && mem.Base.num()&8 != 0 {
 			rex |= 1
 		}
@@ -410,6 +412,58 @@ func (a *Asm) enc(pfx []byte, w bool, op []byte, reg int, rm Operand, trail int,
 		a.b(0x40 | rex)
 	}
 	a.b(op...)
+	a.modRM(reg, rm, trail)
+}
+
+// vexBits returns the inverted R, X, B extension bits of a VEX prefix
+func vexBits(reg int, rm Operand) (r, x, b byte) {
+	r, x, b = 1, 1, 1
+	if reg&8 != 0 {
+		r = 0
+	}
+	switch o := rm.(type) {
+	case R:
+		if o.Reg.num()&8 != 0 {
+			b = 0
+		}
+	case Mem:
+		if o.Base >= 0 && o.Base.num()&8 != 0 {
+			b = 0
+		}
+		if o.Index >= 0 && o.Index.num()&8 != 0 {
+			x = 0
+		}
+	}
+	return
+}
+
+// encVEX emits a VEX-encoded instruction: pp is the implied prefix (0:
+// none, 1: 66, 2: F3, 3: F2), mmmmm the opcode map (1: 0F, 2: 0F38, 3:
+// 0F3A), l the vector length (0: 128, 1: 256) and vvvv the extra
+// register operand (0 when unused)
+func (a *Asm) encVEX(pp, mmmmm byte, w bool, l int, vvvv int, op byte, reg int, rm Operand, trail int) {
+	r, x, b := vexBits(reg, rm)
+	v := byte(^vvvv&15) << 3
+	wb := byte(0)
+	if w {
+		wb = 0x80
+	}
+	if mmmmm == 1 && !w && x == 1 && b == 1 {
+		a.b(0xC5, r<<7|v|byte(l)<<2|pp)
+	} else {
+		a.b(0xC4, r<<7|x<<6|b<<5|mmmmm, wb|v|byte(l)<<2|pp)
+	}
+	a.b(op)
+	a.modRM(reg, rm, trail)
+}
+
+// modRM emits the ModRM byte, SIB and displacement of an operand
+func (a *Asm) modRM(reg int, rm Operand, trail int) {
+	var mem Mem
+	isMem := false
+	if m, ok := rm.(Mem); ok {
+		mem, isMem = m, true
+	}
 	r := byte(reg&7) << 3
 	if !isMem {
 		a.b(0xC0 | r | byte(rm.(R).Reg.num()&7))
@@ -996,6 +1050,24 @@ func (a *Asm) Bswap(size int, r Reg) {
 	a.b(0x0F, 0xC8+byte(r.num()&7))
 }
 
+// Popcnt counts the set bits (needs POPCNT)
+func (a *Asm) Popcnt(size int, dst Reg, src Operand) {
+	a.list("popcnt"+sfx[size], Sized(dst, size), src)
+	a.enc([]byte{0xF3}, size == 8, []byte{0x0F, 0xB8}, dst.num(), src, 0, false)
+}
+
+// Lzcnt counts the leading zero bits (needs LZCNT)
+func (a *Asm) Lzcnt(size int, dst Reg, src Operand) {
+	a.list("lzcnt"+sfx[size], Sized(dst, size), src)
+	a.enc([]byte{0xF3}, size == 8, []byte{0x0F, 0xBD}, dst.num(), src, 0, false)
+}
+
+// Tzcnt counts the trailing zero bits (needs BMI)
+func (a *Asm) Tzcnt(size int, dst Reg, src Operand) {
+	a.list("tzcnt"+sfx[size], Sized(dst, size), src)
+	a.enc([]byte{0xF3}, size == 8, []byte{0x0F, 0xBC}, dst.num(), src, 0, false)
+}
+
 // Bit scan and count instructions
 func (a *Asm) Bsr(size int, dst Reg, src Operand) {
 	a.list("bsr"+sfx[size], Sized(dst, size), src)
@@ -1089,103 +1161,136 @@ func ssSd(double bool) string {
 	return "ss"
 }
 
+// sse emits a legacy SSE instruction of the 0F map or, when AVX is
+// enabled, its VEX form (which avoids SSE/AVX transition penalties). nds:
+// the destination is also the first source (VEX.vvvv). The listing
+// operands are destination first.
+func (a *Asm) sse(mn string, pfx []byte, w bool, op byte, reg int, rm Operand, nds bool, dst, src Operand) {
+	if !a.AVX {
+		a.list(mn, dst, src)
+		a.enc(pfx, w, []byte{0x0F, op}, reg, rm, 0, false)
+		return
+	}
+	if nds {
+		a.list("v"+mn, dst, dst, src)
+		a.encVEX(ppOf(pfx), 1, w, 0, reg, op, reg, rm, 0)
+		return
+	}
+	a.list("v"+mn, dst, src)
+	a.encVEX(ppOf(pfx), 1, w, 0, 0, op, reg, rm, 0)
+}
+
+// Movups loads or stores a 16-byte (or, with AVX, 32-byte) vector
+func (a *Asm) Movups(size int, dst, src Operand) {
+	op, reg, rm := byte(0x10), dst, src
+	if _, ok := dst.(Mem); ok {
+		op, reg, rm = 0x11, src, dst
+	}
+	r := reg.(R).Reg
+	if size == 32 {
+		a.list("vmovups", vecOp(dst, 32), vecOp(src, 32))
+		a.encVEX(0, 1, false, 1, 0, op, r.num(), vecOp(rm, 32), 0)
+		return
+	}
+	a.sse("movups", nil, false, op, r.num(), rm, false, dst, src)
+}
+
+// MovapsY copies a 32-byte ymm register
+func (a *Asm) MovapsY(dst, src Reg) {
+	a.list("vmovaps", R{dst, 32}, R{src, 32})
+	a.encVEX(0, 1, false, 1, 0, 0x28, dst.num(), R{src, 32}, 0)
+}
+
+func vecOp(o Operand, size int) Operand {
+	if r, ok := o.(R); ok {
+		return R{r.Reg, size}
+	}
+	return o
+}
+
 // FArith emits addss/addsd etc: dst = dst op src
 func (a *Asm) FArith(op FOp, double bool, dst Reg, src Operand) {
-	a.list(fopNames[op]+ssSd(double), X(dst), src)
-	a.enc(ssePfx(double), false, []byte{0x0F, byte(op)}, dst.num(), src, 0, false)
+	a.sse(fopNames[op]+ssSd(double), ssePfx(double), false, byte(op), dst.num(), src, true, X(dst), src)
 }
 
 // MovF loads or stores a float/double: movss/movsd
 func (a *Asm) MovF(double bool, dst, src Operand) {
-	a.list("mov"+ssSd(double), dst, src)
 	if d, ok := dst.(R); ok {
-		a.enc(ssePfx(double), false, []byte{0x0F, 0x10}, d.Reg.num(), src, 0, false)
+		_, regSrc := src.(R)
+		a.sse("mov"+ssSd(double), ssePfx(double), false, 0x10, d.Reg.num(), src, regSrc, dst, src)
 		return
 	}
 	s := src.(R)
-	a.enc(ssePfx(double), false, []byte{0x0F, 0x11}, s.Reg.num(), dst, 0, false)
+	a.sse("mov"+ssSd(double), ssePfx(double), false, 0x11, s.Reg.num(), dst, false, dst, src)
 }
 
 // Movaps copies an XMM register
 func (a *Asm) Movaps(dst, src Reg) {
-	a.list("movaps", X(dst), X(src))
-	a.enc(nil, false, []byte{0x0F, 0x28}, dst.num(), X(src), 0, false)
+	a.sse("movaps", nil, false, 0x28, dst.num(), X(src), false, X(dst), X(src))
 }
 
 // MovqToX moves a 64-bit (or 32-bit) general register into an XMM register
 func (a *Asm) MovqToX(size int, dst Reg, src Reg) {
+	mn := "movd"
 	if size == 8 {
-		a.list("movq", X(dst), Q(src))
-	} else {
-		a.list("movd", X(dst), D(src))
+		mn = "movq"
 	}
-	a.enc([]byte{0x66}, size == 8, []byte{0x0F, 0x6E}, dst.num(), Sized(src, size), 0, false)
+	a.sse(mn, []byte{0x66}, size == 8, 0x6E, dst.num(), Sized(src, size), false, X(dst), Sized(src, size))
 }
 
 // MovqFromX moves the low 64 (or 32) bits of an XMM register into a general register
 func (a *Asm) MovqFromX(size int, dst Reg, src Reg) {
+	mn := "movd"
 	if size == 8 {
-		a.list("movq", Q(dst), X(src))
-	} else {
-		a.list("movd", D(dst), X(src))
+		mn = "movq"
 	}
-	a.enc([]byte{0x66}, size == 8, []byte{0x0F, 0x7E}, src.num(), Sized(dst, size), 0, false)
+	a.sse(mn, []byte{0x66}, size == 8, 0x7E, src.num(), Sized(dst, size), false, Sized(dst, size), X(src))
 }
 
 // Xorp clears or flips bits of an XMM register (xorps/xorpd)
 func (a *Asm) Xorp(double bool, dst Reg, src Operand) {
 	if double {
-		a.list("xorpd", X(dst), src)
-		a.enc([]byte{0x66}, false, []byte{0x0F, sseXor}, dst.num(), src, 0, false)
+		a.sse("xorpd", []byte{0x66}, false, sseXor, dst.num(), src, true, X(dst), src)
 		return
 	}
-	a.list("xorps", X(dst), src)
-	a.enc(nil, false, []byte{0x0F, sseXor}, dst.num(), src, 0, false)
+	a.sse("xorps", nil, false, sseXor, dst.num(), src, true, X(dst), src)
 }
 
 // Andp masks an XMM register (andps/andpd)
 func (a *Asm) Andp(double bool, dst Reg, src Operand) {
 	if double {
-		a.list("andpd", X(dst), src)
-		a.enc([]byte{0x66}, false, []byte{0x0F, sseAnd}, dst.num(), src, 0, false)
+		a.sse("andpd", []byte{0x66}, false, sseAnd, dst.num(), src, true, X(dst), src)
 		return
 	}
-	a.list("andps", X(dst), src)
-	a.enc(nil, false, []byte{0x0F, sseAnd}, dst.num(), src, 0, false)
+	a.sse("andps", nil, false, sseAnd, dst.num(), src, true, X(dst), src)
 }
 
 // Ucomi compares two scalars and sets flags (ucomiss/ucomisd)
 func (a *Asm) Ucomi(double bool, x Reg, y Operand) {
 	if double {
-		a.list("ucomisd", X(x), y)
-		a.enc([]byte{0x66}, false, []byte{0x0F, sseUcomi}, x.num(), y, 0, false)
+		a.sse("ucomisd", []byte{0x66}, false, sseUcomi, x.num(), y, false, X(x), y)
 		return
 	}
-	a.list("ucomiss", X(x), y)
-	a.enc(nil, false, []byte{0x0F, sseUcomi}, x.num(), y, 0, false)
+	a.sse("ucomiss", nil, false, sseUcomi, x.num(), y, false, X(x), y)
 }
 
 // CvtIntToF converts a signed 32/64-bit integer to float/double
 func (a *Asm) CvtIntToF(double bool, dst Reg, srcSize int, src Operand) {
-	a.list("cvtsi2"+ssSd(double)+sfx[srcSize], X(dst), src)
-	a.enc(ssePfx(double), srcSize == 8, []byte{0x0F, 0x2A}, dst.num(), src, 0, false)
+	a.sse("cvtsi2"+ssSd(double)+sfx[srcSize], ssePfx(double), srcSize == 8, 0x2A, dst.num(), src, true, X(dst), src)
 }
 
 // CvtFToInt converts float/double to a signed integer with truncation
 func (a *Asm) CvtFToInt(double bool, dstSize int, dst Reg, src Operand) {
-	a.list("cvtt"+ssSd(double)+"2si"+sfx[dstSize], Sized(dst, dstSize), src)
-	a.enc(ssePfx(double), dstSize == 8, []byte{0x0F, 0x2C}, dst.num(), src, 0, false)
+	a.sse("cvtt"+ssSd(double)+"2si"+sfx[dstSize], ssePfx(double), dstSize == 8, 0x2C, dst.num(), src, false, Sized(dst, dstSize), src)
 }
 
 // CvtFF converts between float and double; toDouble selects cvtss2sd
 func (a *Asm) CvtFF(toDouble bool, dst Reg, src Operand) {
 	if toDouble {
-		a.list("cvtss2sd", X(dst), src)
-		a.enc([]byte{0xF3}, false, []byte{0x0F, sseCvt}, dst.num(), src, 0, false)
+		a.sse("cvtss2sd", []byte{0xF3}, false, sseCvt, dst.num(), src, true, X(dst), src)
 		return
 	}
-	a.list("cvtsd2ss", X(dst), src)
-	a.enc([]byte{0xF2}, false, []byte{0x0F, sseCvt}, dst.num(), src, 0, false)
+	a.sse("cvtsd2ss", []byte{0xF2}, false, sseCvt, dst.num(), src, true, X(dst), src)
 }
 
 // ---- x87 ----
@@ -1334,4 +1439,22 @@ func (a *Asm) ShrdCL(dst Operand, src Reg) {
 		fmt.Fprintf(a.Listing, "\tshrdq\t%%cl, %s, %s\n", Q(src), dst)
 	}
 	a.enc(nil, true, []byte{0x0F, 0xAD}, src.num(), dst, 0, false)
+}
+
+// asmMark is a position in the output that generation can return to
+type asmMark struct {
+	code, relocs, labels, fixups, labelSyms int
+}
+
+func (a *Asm) mark() asmMark {
+	return asmMark{len(a.Code), len(a.Relocs), len(a.labels), len(a.fixups), len(a.LabelSyms)}
+}
+
+// reset drops everything emitted after the mark
+func (a *Asm) reset(m asmMark) {
+	a.Code = a.Code[:m.code]
+	a.Relocs = a.Relocs[:m.relocs]
+	a.labels = a.labels[:m.labels]
+	a.fixups = a.fixups[:m.fixups]
+	a.LabelSyms = a.LabelSyms[:m.labelSyms]
 }

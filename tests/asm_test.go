@@ -46,14 +46,18 @@ func TestAssembleGCCOutput(t *testing.T) {
 				if strings.HasPrefix(l, "// skip: ") {
 					t.Skip(strings.TrimPrefix(l, "// skip: "))
 				}
+				if strings.HasPrefix(l, "// skip-asm: ") {
+					t.Skip(strings.TrimPrefix(l, "// skip-asm: "))
+				}
 			}
 			std := stdFor(src)
+			flags := flagsFor(t, src)
 			asmFile := filepath.Join(tmp, name+".s")
-			if out, err := exec.Command(gcc, "-std="+std, "-w", "-O2", "-S", "-o", asmFile, f).CombinedOutput(); err != nil {
+			if out, err := exec.Command(gcc, append(append([]string{"-std=" + std, "-w", "-O2"}, flags...), "-S", "-o", asmFile, f)...).CombinedOutput(); err != nil {
 				t.Fatalf("gcc -S: %v\n%s", err, out)
 			}
 			ref := filepath.Join(tmp, name+".gcc2")
-			if out, err := exec.Command(gcc, "-std="+std, "-w", "-O2", "-o", ref, f, "-lm").CombinedOutput(); err != nil {
+			if out, err := exec.Command(gcc, append(append([]string{"-std=" + std, "-w", "-O2"}, flags...), "-o", ref, f, "-lm")...).CombinedOutput(); err != nil {
 				t.Fatalf("gcc: %v\n%s", err, out)
 			}
 			gasObj := filepath.Join(tmp, name+".gas.o")

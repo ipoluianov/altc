@@ -222,7 +222,22 @@ func (pp *Preprocessor) definePredefined() {
 	}
 	def("__USER_LABEL_PREFIX__", "")
 	def("__REGISTER_PREFIX__", "")
-	def("__VERSION__", "\"AltC\"")
+	def("__VERSION__", "\"14.2.0 (AltC)\"")
+	// AltC accepts the GNU C dialect gcc 14 does (statement expressions,
+	// attributes, builtins, inline asm, vector types), so it identifies
+	// itself as gcc like clang does
+	def("__GNUC__", "14")
+	def("__GNUC_MINOR__", "2")
+	def("__GNUC_PATCHLEVEL__", "0")
+	def("__GNUC_STDC_INLINE__", "1")
+	def("__GNUC_WIDE_EXECUTION_CHARSET_NAME", "\"UTF-32LE\"")
+	def("__GNUC_EXECUTION_CHARSET_NAME", "\"UTF-8\"")
+	for _, n := range []string{"1", "2", "4", "8"} {
+		def("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_"+n, "1")
+	}
+	def("__GCC_ASM_FLAG_OUTPUTS__", "1")
+	def("__GCC_IEC_559", "2")
+	def("__GCC_IEC_559_COMPLEX", "2")
 	// GNU spellings of keywords that some code uses without the compiler
 	def("__restrict__", "restrict")
 	f := pp.newFile("<built-in>", []byte(b.String()))

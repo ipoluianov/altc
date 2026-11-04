@@ -375,6 +375,9 @@ func (p *parser) declaration(basety *Type, attr *declAttr) *Node {
 		if a.mode != "" {
 			ty = modeType(ty, a.mode)
 		}
+		if a.vecSize > 0 {
+			ty = p.applyVectorSize(ty, a.vecSize, a.vecTok)
+		}
 		if ty.Kind == TyVoid {
 			p.errorAt(name, "variable '%s' declared void", name.Text)
 		}

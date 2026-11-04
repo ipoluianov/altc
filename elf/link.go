@@ -294,6 +294,20 @@ func (l *Linker) scanRelocs() {
 			for _, r := range sec.Relocs {
 				s := l.resolve(r.Sym)
 				imp := l.imp(s)
+				if imp == nil && s.IFunc && s.Section != nil {
+					// a local IFUNC: every reference goes through a PLT entry
+					// whose GOT slot the dynamic loader fills by calling the
+					// resolver (R_X86_64_IRELATIVE)
+					if _, ok := l.got[s]; !ok {
+						l.got[s] = l.gotSize
+						l.gotSize += 8
+					}
+					if _, ok := l.plt[s]; !ok {
+						l.plt[s] = l.pltSize
+						l.pltSize += 16
+					}
+					continue
+				}
 				switch r.Type {
 				case R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX, R_X86_64_GOT32:
 					if _, ok := l.got[s]; !ok {
@@ -395,6 +409,11 @@ func (l *Linker) symAddr(s *Symbol) int64 {
 	}
 	if s.Abs {
 		return s.Value
+	}
+	if s.IFunc {
+		if off, ok := l.plt[s]; ok {
+			return l.secAddr(".plt") + int64(off)
+		}
 	}
 	if s.Section != nil {
 		return s.Section.Addr + s.Value
@@ -752,6 +771,10 @@ func (l *Linker) layoutAndWrite() []byte {
 			l.dynRelocs = append(l.dynRelocs, dynReloc{off: at, typ: R_X86_64_GLOB_DAT, imp: imp})
 			continue
 		}
+		if s.IFunc && l.imp(s) == nil && s.Section != nil {
+			l.dynRelocs = append(l.dynRelocs, dynReloc{off: at, typ: R_X86_64_IRELATIVE, addend: s.Section.Addr + s.Value})
+			continue
+		}
 		le.PutUint64(img[at-baseAddr:], uint64(l.symAddr(s)))
 	}
 	for s, off := range l.gotTP {
@@ -1081,7 +1104,7 @@ func (l *Linker) dynamicCount() int {
 func (l *Linker) countDynRelocs() int {
 	n := 0
 	for s := range l.got {
-		if imp := l.imp(s); imp != nil && !imp.needCopy {
+		if imp := l.imp(s); imp != nil && !imp.needCopy || imp == nil && s.IFunc && s.Section != nil {
 			n++
 		}
 	}

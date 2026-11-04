@@ -280,6 +280,35 @@ func (g *gen) genAsm(n *cc.Node) {
 		g.assembleInFunc(n, st.Template, map[string]*TextLabel{})
 		return
 	}
+	ops, nOut := g.asmOperands(n)
+	clobbered, x87Clob := g.asmClobbers(n)
+
+	// phase A: evaluate the operands into the frame
+	for _, o := range ops {
+		e := o.op.Expr
+		switch {
+		case o.out:
+			g.asmLocation(n, o, e)
+		case o.kind == akImm:
+		case o.kind == akMem:
+			if isAddressable(e) {
+				g.asmLocation(n, o, e)
+			} else {
+				g.genExpr(e)
+				g.spillValue(n, o.ty, o.slot)
+				o.mem = M(RBP, int32(o.slot))
+			}
+		default:
+			g.genExpr(e)
+			g.spillValue(n, o.ty, o.slot)
+		}
+	}
+	g.asmRun(n, ops, nOut, clobbered, x87Clob)
+}
+
+// asmOperands classifies the operands of an extended asm statement
+func (g *gen) asmOperands(n *cc.Node) ([]*asmOp, int) {
+	st := n.Asm
 	var ops []*asmOp
 	outIdx := map[string]int{}
 	for i, op := range st.Outputs {
@@ -326,9 +355,12 @@ func (g *gen) genAsm(n *cc.Node) {
 		}
 		ops = append(ops, o)
 	}
-	nOut := len(st.Outputs)
+	return ops, len(st.Outputs)
+}
 
-	// clobbers
+// asmClobbers reads the clobber list of an asm statement
+func (g *gen) asmClobbers(n *cc.Node) (map[Reg]bool, map[int]bool) {
+	st := n.Asm
 	clobbered := map[Reg]bool{}
 	x87Clob := map[int]bool{}
 	for _, c := range st.Clobbers {
@@ -351,27 +383,13 @@ func (g *gen) genAsm(n *cc.Node) {
 			clobbered[r.r] = true
 		}
 	}
+	return clobbered, x87Clob
+}
 
-	// phase A: evaluate the operands into the frame
-	for _, o := range ops {
-		e := o.op.Expr
-		switch {
-		case o.out:
-			g.asmLocation(n, o, e)
-		case o.kind == akImm:
-		case o.kind == akMem:
-			if isAddressable(e) {
-				g.asmLocation(n, o, e)
-			} else {
-				g.genExpr(e)
-				g.spillValue(n, o.ty, o.slot)
-				o.mem = M(RBP, int32(o.slot))
-			}
-		default:
-			g.genExpr(e)
-			g.spillValue(n, o.ty, o.slot)
-		}
-	}
+// asmRun assigns registers, loads the inputs, assembles the template and
+// writes the outputs; the operands are already in their frame slots
+func (g *gen) asmRun(n *cc.Node, ops []*asmOp, nOut int, clobbered map[Reg]bool, x87Clob map[int]bool) {
+	st := n.Asm
 
 	// phase B: registers
 	usedOut := map[Reg]bool{}
@@ -607,7 +625,14 @@ func (g *gen) genAsm(n *cc.Node) {
 				g.a.Mov(8, M(RBP, int32(o.slot+8)), Q(o.reg2))
 			}
 		case akXMM:
-			g.a.enc([]byte{0x66}, false, []byte{0x0F, 0xD6}, o.reg.num(), M(RBP, int32(o.slot)), 0, false) // movq
+			switch o.ty.Size() {
+			case 16:
+				g.a.Movups(16, M(RBP, int32(o.slot)), X(o.reg))
+			case 32:
+				g.a.Movups(32, M(RBP, int32(o.slot)), R{o.reg, 32})
+			default:
+				g.a.enc([]byte{0x66}, false, []byte{0x0F, 0xD6}, o.reg.num(), M(RBP, int32(o.slot)), 0, false) // movq
+			}
 		}
 	}
 	for _, o := range ops[:nOut] {
@@ -689,7 +714,9 @@ func (g *gen) loadXMM(r Reg, t *cc.Type, m Mem) {
 	case t.Kind == cc.TyFloat || t.Size() == 4:
 		g.a.MovF(false, X(r), m)
 	case t.Size() == 16:
-		g.a.enc([]byte{0xF3}, false, []byte{0x0F, 0x6F}, r.num(), m, 0, false) // movdqu
+		g.a.Movups(16, X(r), m)
+	case t.Size() == 32:
+		g.a.Movups(32, R{r, 32}, m)
 	default:
 		g.a.enc([]byte{0xF3}, false, []byte{0x0F, 0x7E}, r.num(), m, 0, false) // movq
 	}
@@ -887,6 +914,9 @@ func formatAsmOperand(o *asmOp, mod byte) (string, error) {
 		}
 		return RegName(o.reg, size), nil
 	case akXMM:
+		if o.ty != nil && o.ty.Size() == 32 && mod != 'x' {
+			return RegName(o.reg, 32), nil
+		}
 		return RegName(o.reg, 16), nil
 	case akX87:
 		if o.st == 0 {
@@ -1178,8 +1208,18 @@ func (g *gen) finishAsm(text *elf.Section, syms map[string]*elf.Symbol) ([]pendi
 		s.Value = int64(tl.A.LabelPos(tl.L)) + tl.Off
 		s.Size = info.size
 		switch info.typ {
-		case "function", "gnu_indirect_function":
+		case "function", "gnu_indirect_function", "STT_GNU_IFUNC":
 			s.Type = elf.SymFunc
+			s.IFunc = info.typ != "function"
+			if s.Size == 0 && tl.Off == 0 {
+				// a .set alias of a function (an ifunc and its resolver) gets its size
+				for other, ol := range g.topLabels {
+					if oi := g.topSyms[other]; other != name && ol.A == tl.A && ol.L == tl.L && ol.Off == 0 && oi != nil && oi.size > 0 {
+						s.Size = oi.size
+						break
+					}
+				}
+			}
 		case "object":
 			s.Type = elf.SymObject
 		case "tls_object":

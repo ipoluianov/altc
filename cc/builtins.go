@@ -54,7 +54,8 @@ func init() {
 		__atomic_fetch_add __atomic_fetch_sub __atomic_fetch_and __atomic_fetch_or __atomic_fetch_xor __atomic_fetch_nand
 		__atomic_add_fetch __atomic_sub_fetch __atomic_and_fetch __atomic_or_fetch __atomic_xor_fetch __atomic_nand_fetch
 		__atomic_thread_fence __atomic_signal_fence __atomic_test_and_set __atomic_clear __atomic_always_lock_free
-		__atomic_is_lock_free`) {
+		__atomic_is_lock_free __builtin_altc_insn __builtin_altc_insni __builtin_altc_broadcast
+		__builtin_cpu_supports __builtin_cpu_is __builtin_cpu_init`) {
 		builtinNames[n] = true
 	}
 }
@@ -220,6 +221,49 @@ func (p *parser) builtin(t *Token) *Node {
 	}
 	p.next()
 	switch name {
+	case "__builtin_cpu_supports", "__builtin_cpu_is", "__builtin_cpu_init":
+		return p.cpuBuiltin(name, t)
+	case "__builtin_altc_broadcast":
+		// __builtin_altc_broadcast(probe, x): x in every element of the
+		// vector type of probe
+		p.expect("(")
+		probe := p.assign()
+		addType(probe)
+		p.expect(",")
+		x := p.assign()
+		addType(x)
+		p.expect(")")
+		vt := probe.Ty.Unqual()
+		if !vt.IsVector() {
+			p.errorAt(t, "__builtin_altc_broadcast needs a vector type")
+		}
+		return &Node{Kind: NCast, LHS: newCast(x, vt.Base), Ty: vt, Tok: t}
+	case "__builtin_altc_insn", "__builtin_altc_insni":
+		// __builtin_altc_insn(probe, "mnemonic", operands...): the instruction
+		// on the operands; probe is never evaluated and gives the result
+		// type. The insni form has an immediate before the operands.
+		p.expect("(")
+		probe := p.assign()
+		addType(probe)
+		p.expect(",")
+		st := p.next()
+		if st.Kind != TStr {
+			p.errorAt(st, "expected the instruction mnemonic")
+		}
+		_, mn := literalPrefix(st.Text)
+		n := &Node{Kind: NBuiltin, Builtin: "altc_insn", AsmText: mn, Tok: t, Ty: probe.Ty.Unqual()}
+		if name == "__builtin_altc_insni" {
+			p.expect(",")
+			n.Val = p.constExpr()
+			n.Begin = 1
+		}
+		for p.consume(",") {
+			a := p.assign()
+			addType(a)
+			n.Args = append(n.Args, a)
+		}
+		p.expect(")")
+		return n
 	case "__builtin_complex":
 		a := p.args(2)
 		if !a[0].Ty.IsFlonum() {

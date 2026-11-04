@@ -29,6 +29,7 @@ const (
 	TyUnion
 	TyNullptr
 	TyComplex // _Complex T: Base is T; stored like struct { T re, im; }
+	TyVector  // GNU vector: Base is the element type, ArrayLen the count
 )
 
 // Type is a C type. Qualified versions are copies that share Rec and Base.
@@ -374,6 +375,8 @@ func compatible(a, b *Type) bool {
 		return true
 	case TyPtr:
 		return compatible(a.Base, b.Base)
+	case TyVector:
+		return a.Size() == b.Size() && compatible(a.Base, b.Base)
 	case TyFunc:
 		if !compatible(a.Ret, b.Ret) {
 			return false
@@ -452,6 +455,9 @@ func typeString(t *Type, inner string) string {
 			ps = append(ps, "void")
 		}
 		return typeString(t.Ret, inner+"("+strings.Join(ps, ", ")+")")
+	}
+	if t.Kind == TyVector {
+		return strings.TrimSpace(q + typeString(t.Base, "") + fmt.Sprintf(" __attribute__((vector_size(%d))) ", t.Size()) + inner)
 	}
 	var base string
 	switch t.Kind {

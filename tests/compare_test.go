@@ -80,14 +80,15 @@ func TestCompareWithGCC(t *testing.T) {
 				}
 			}
 			std := stdFor(src)
+			flags := flagsFor(t, src)
 			ref := filepath.Join(tmp, name+".gcc")
-			if out, err := exec.Command(gcc, "-std="+std, "-w", "-O0", "-o", ref, f, "-lm").CombinedOutput(); err != nil {
+			if out, err := exec.Command(gcc, append(append([]string{"-std=" + std, "-w", "-O0"}, flags...), "-o", ref, f, "-lm")...).CombinedOutput(); err != nil {
 				t.Fatalf("gcc: %v\n%s", err, out)
 			}
 			want, wantCode := run(t, ref, tmp)
 
 			abs, _ := filepath.Abs(f)
-			u := driver.CompileSource(abs, src, &driver.Config{Std: std, NoWarnings: true})
+			u := driver.CompileSource(abs, src, withFlags(testConfig(&driver.Config{Std: std, NoWarnings: true}), flags))
 			if u.Obj == nil {
 				for _, d := range u.Diagnostics {
 					t.Error(d)

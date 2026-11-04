@@ -3,6 +3,7 @@ package x64
 import (
 	"fmt"
 	"math"
+	"os"
 	"strings"
 
 	"github.com/ipoluianov/altc/cc"
@@ -42,6 +43,27 @@ type gen struct {
 	asmSecs    []*asmSection            // sections created by assembly text
 	topLabels  map[string]*TextLabel    // labels of file-scope asm
 	topSyms    map[string]*asmSym       // what file-scope asm says about symbols
+
+	// register variables
+	regVars    map[*cc.Obj]Reg // locals living in callee-saved registers
+	regSaved   []Reg           // registers saved in the prologue
+	regSaveOff int64           // their save area
+	noRegAlloc bool            // keep every local in the frame
+	isa        ISA             // instruction set extensions of the function being compiled
+	baseISA    ISA             // those of the unit (command line)
+
+	// temporaries in callee-saved registers not used by variables
+	tempRegs  []Reg    // available registers
+	tempTop   int      // registers in use
+	tempUsed  int      // most registers in use at once
+	tempLimit int      // registers the function may use (-1: all)
+	dryLabels []string // labels created by the trial generation
+
+	xmmVars []*cc.Obj // float variables in xmm8-xmm15 (spilled around calls)
+
+	irReason string           // why the IR backend did not take the current function
+	inlineOK map[*cc.Obj]bool // functions that calls may be replaced by
+	noInline bool             // no inlining at all
 }
 
 type constEntry struct {
@@ -56,15 +78,33 @@ type Result struct {
 	Listing string // GNU assembler text (when requested)
 }
 
+// Options of code generation
+type Options struct {
+	Listing    bool // produce GNU assembler text
+	NoRegAlloc bool // keep every local variable in the frame
+	ISA        ISA  // enabled instruction set extensions
+}
+
 // Generate compiles a parsed program to an object
 func Generate(prog *cc.Program, name string, wantListing bool) (*Result, error) {
+	return GenerateWith(prog, name, Options{Listing: wantListing})
+}
+
+// GenerateWith compiles a parsed program to an object with options
+func GenerateWith(prog *cc.Program, name string, opts Options) (*Result, error) {
+	wantListing := opts.Listing
 	g := &gen{
-		a:       &Asm{SymPrefix: "t"},
-		obj:     elf.NewObject(name),
-		prog:    prog,
-		labels:  map[string]Label{},
-		defined: map[string]*cc.Obj{},
-		consts:  map[string]string{},
+		noRegAlloc: opts.NoRegAlloc,
+		isa:        opts.ISA,
+		baseISA:    opts.ISA,
+		a:          &Asm{SymPrefix: "t", AVX: opts.ISA.Has(ISAAVX)},
+		obj:        elf.NewObject(name),
+		prog:       prog,
+		labels:     map[string]Label{},
+		defined:    map[string]*cc.Obj{},
+		consts:     map[string]string{},
+		inlineOK:   map[*cc.Obj]bool{},
+		noInline:   os.Getenv("ALTC_NOINLINE") != "",
 	}
 	if wantListing {
 		g.listing = &strings.Builder{}
@@ -240,11 +280,58 @@ func (g *gen) run() (err error) {
 	if err := g.topLevelAsm(); err != nil {
 		return err
 	}
-	// functions
+	// functions; static inline ones come last and only when something
+	// still refers to them (calls that were not inlined, addresses)
+	var funcs, deferred []*cc.Obj
 	for _, ob := range g.prog.Globals {
 		if g.defined[ob.AsmName] != ob || !ob.IsFunction {
 			continue
 		}
+		if ob.IsStatic && (ob.IsInline || ob.AlwaysInline) && !ob.LabelAddrs && !ob.Ctor && !ob.Dtor {
+			deferred = append(deferred, ob)
+			continue
+		}
+		funcs = append(funcs, ob)
+	}
+	referenced := func(name string) bool {
+		for _, r := range g.a.Relocs {
+			if r.Sym == name {
+				return true
+			}
+		}
+		for _, s := range g.asmSecs {
+			for _, r := range s.a.Relocs {
+				if r.Sym == name {
+					return true
+				}
+			}
+		}
+		for _, x := range g.prog.Globals {
+			for _, r := range x.Relocs {
+				if r.Label == name {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for i := 0; i < len(funcs) || len(deferred) > 0; i++ {
+		if i >= len(funcs) {
+			// emit the deferred functions referenced so far
+			var rest []*cc.Obj
+			for _, ob := range deferred {
+				if referenced(ob.AsmName) {
+					funcs = append(funcs, ob)
+				} else {
+					rest = append(rest, ob)
+				}
+			}
+			if len(rest) == len(deferred) {
+				break
+			}
+			deferred = rest
+		}
+		ob := funcs[i]
 		s := symFor(ob)
 		s.Type = elf.SymFunc
 		for len(g.a.Code)%16 != 0 {
@@ -260,7 +347,11 @@ func (g *gen) run() (err error) {
 			}
 			fmt.Fprintf(g.listing, "\t.type\t%s, @function\n%s:\n", ob.AsmName, ob.AsmName)
 		}
-		g.function(ob)
+		if len(ob.TargetClones) > 0 {
+			g.targetClones(ob, s, text, data, initArr, syms)
+			continue
+		}
+		g.compileFunction(ob, ob.Target)
 		s.Size = int64(len(g.a.Code)) - start
 		if ob.LabelAddrs {
 			// symbols for labels whose addresses are stored in static data
@@ -301,6 +392,9 @@ func (g *gen) run() (err error) {
 		}
 		s := symFor(ob)
 		s.Section, s.Value, s.Size, s.Type = target.Section, target.Value, target.Size, target.Type
+		if ob.IFunc {
+			s.Type, s.IFunc = elf.SymFunc, true
+		}
 	}
 	// constant pool
 	for _, c := range g.constSec {
@@ -311,6 +405,10 @@ func (g *gen) run() (err error) {
 		s := o.AddLocal(&elf.Symbol{Name: c.name, Bind: elf.BindLocal, Section: g.rodata, Value: off, Type: elf.SymObject})
 		syms[c.name] = s
 		g.rodata.Data = append(g.rodata.Data, c.data...)
+		if g.listing != nil {
+			fmt.Fprintf(g.listing, "\t.section\t.rodata\n\t.align\t%d\n%s:\n", c.align, c.name)
+			g.listData(c.data, nil)
+		}
 	}
 	// code relocations
 	pend = append(pend, pendingRelocs{text, g.a.Relocs})
@@ -481,6 +579,9 @@ func (g *gen) label(name string) Label {
 	}
 	l := g.a.NewLabel()
 	g.labels[name] = l
+	if g.dryLabels != nil {
+		g.dryLabels = append(g.dryLabels, name)
+	}
 	return l
 }
 
@@ -866,6 +967,9 @@ func (g *gen) genAddr(n *cc.Node) {
 	switch n.Kind {
 	case cc.NVar:
 		v := n.Var
+		if _, ok := g.varReg(v); ok {
+			g.fail(n, "internal error: address of register variable %s", v.Name)
+		}
 		if v.IsLocal {
 			if _, ok := g.overAligned[v]; ok || v.Ty.Kind == cc.TyVLA {
 				g.a.Mov(8, Q(RAX), M(RBP, int32(v.Offset)))
@@ -937,6 +1041,16 @@ func (g *gen) genAddr(n *cc.Node) {
 // genDiscard evaluates an expression for its side effects only
 func (g *gen) genDiscard(n *cc.Node) {
 	if n == nil {
+		return
+	}
+	n = pureDiscard(n)
+	if n.Kind == cc.NAssign && n.LHS.Kind == cc.NVar {
+		if r, ok := g.varReg(n.LHS.Var); ok {
+			g.assignRegVar(n, r, false)
+			return
+		}
+	}
+	if n.Kind == cc.NAssign && g.storeConst(n) {
 		return
 	}
 	g.genExpr(n)
@@ -1075,6 +1189,20 @@ func (g *gen) genExpr(n *cc.Node) {
 		}
 		return
 	case cc.NVar:
+		if r, ok := g.varReg(n.Var); ok {
+			if r.IsXMM() {
+				g.a.MovF(true, X(XMM0), X(r))
+			} else {
+				g.a.Mov(8, Q(RAX), Q(r))
+			}
+			return
+		}
+		if !n.Var.IsLocal && directScalar(n.Ty) {
+			if m, ok := g.lvalMem(n); ok {
+				g.loadDirect(n.Ty, m)
+				return
+			}
+		}
 		if n.Var.IsLocal && n.Ty.IsScalar() && n.Ty.Kind != cc.TyLongDouble && n.Ty.Size() <= 8 && !g.isOver(n.Var) {
 			g.loadDirect(n.Ty, M(RBP, int32(n.Var.Offset)))
 			return
@@ -1083,6 +1211,12 @@ func (g *gen) genExpr(n *cc.Node) {
 		g.load(n.Ty)
 		return
 	case cc.NMember:
+		if directScalar(n.Ty) {
+			if m, ok := g.lvalMem(n); ok {
+				g.loadDirect(n.Ty, m)
+				return
+			}
+		}
 		g.genAddr(n)
 		g.load(n.Ty)
 		m := n.Member
@@ -1096,6 +1230,12 @@ func (g *gen) genExpr(n *cc.Node) {
 		}
 		return
 	case cc.NDeref:
+		if directScalar(n.Ty) {
+			if m, ok := g.lvalMem(n); ok {
+				g.loadDirect(n.Ty, m)
+				return
+			}
+		}
 		g.genExpr(n.LHS)
 		g.load(n.Ty)
 		return
@@ -1121,6 +1261,14 @@ func (g *gen) genExpr(n *cc.Node) {
 	case cc.NCast:
 		if n.Ty.IsComplex() || n.LHS.Ty.IsComplex() {
 			g.genComplexCast(n)
+			return
+		}
+		if v, ok := intConst(n); ok {
+			g.a.MovImm(RAX, v)
+			return
+		}
+		if f, ok := floatConst(n); ok {
+			g.genNum(&cc.Node{Kind: cc.NNum, Ty: n.Ty, FVal: f, Tok: n.Tok})
 			return
 		}
 		g.genExpr(n.LHS)
@@ -1409,6 +1557,12 @@ func (g *gen) genNum(n *cc.Node) {
 
 func (g *gen) genAssign(n *cc.Node) {
 	lhs := n.LHS
+	if lhs.Kind == cc.NVar {
+		if r, ok := g.varReg(lhs.Var); ok {
+			g.assignRegVar(n, r, true)
+			return
+		}
+	}
 	// fast path: local scalar variable
 	if lhs.Kind == cc.NVar && lhs.Var.IsLocal && lhs.Ty.IsScalar() && !isLD(lhs.Ty) && lhs.Var.Ty.Kind != cc.TyVLA && !g.isOver(lhs.Var) {
 		g.genExpr(n.RHS)
@@ -1421,6 +1575,26 @@ func (g *gen) genAssign(n *cc.Node) {
 		default:
 			g.storeSized(m, RAX, lhs.Ty.Size())
 		}
+		return
+	}
+	if directScalar(lhs.Ty) && lhs.Kind != cc.NVar {
+		if m, ok := g.lvalMem(lhs); ok {
+			g.genExpr(n.RHS)
+			g.storeAt(lhs.Ty, m)
+			return
+		}
+	}
+	if directScalar(lhs.Ty) && !(lhs.Kind == cc.NMember && lhs.Member.Bitfield) {
+		g.genAddr(lhs)
+		if t, ok := g.saveTemp(); ok {
+			g.genExpr(n.RHS)
+			g.storeAt(lhs.Ty, M(t, 0))
+			g.freeTemp()
+			return
+		}
+		g.push()
+		g.genExpr(n.RHS)
+		g.store(n.Ty)
 		return
 	}
 	g.genAddr(lhs)
@@ -1465,6 +1639,10 @@ func (g *gen) genAssign(n *cc.Node) {
 func (g *gen) memzero(v *cc.Obj) {
 	size := v.Ty.Size()
 	if size <= 0 {
+		return
+	}
+	if r, ok := g.varReg(v); ok {
+		g.a.Alu(XOR, 4, D(r), D(r))
 		return
 	}
 	off := v.Offset
@@ -1522,15 +1700,44 @@ func (g *gen) intOperands(n *cc.Node, allowImm bool) (int, bool, Operand) {
 	}
 	uns := lt.IsUnsigned() || lt.Kind == cc.TyPtr || lt.Kind == cc.TyNullptr || lt.IsArray() || lt.Kind == cc.TyFunc
 	var imm Operand
+	c, isConst := intConst(n.RHS)
 	switch {
-	case allowImm && n.RHS.Kind == cc.NNum && n.RHS.Ty.IsInteger() && fitsI32(n.RHS.Val):
+	case allowImm && isConst && fitsI32(c):
 		g.genExpr(n.LHS)
-		imm = Imm(n.RHS.Val)
+		imm = Imm(c)
+	case isReg(g.opReg(n.RHS, sz)):
+		g.genExpr(n.LHS)
+		r, _ := g.opReg(n.RHS, sz)
+		imm = Sized(r, sz)
+	case commutative(n.Kind) && isReg(g.opReg(n.LHS, sz)):
+		g.genExpr(n.RHS)
+		r, _ := g.opReg(n.LHS, sz)
+		imm = Sized(r, sz)
+	case isSimpleVar(n.RHS) && g.regVars[n.RHS.Var] != 0:
+		// a register variable narrower than the operation
+		g.genExpr(n.LHS)
+		g.a.Mov(8, Q(RDI), Q(g.regVars[n.RHS.Var]))
 	case isSimpleVar(n.RHS) && !g.isOver(n.RHS.Var):
 		g.genExpr(n.LHS)
 		g.loadInto(RDI, n.RHS.Ty, M(RBP, int32(n.RHS.Var.Offset)))
+	case n.Kind != cc.NShl && n.Kind != cc.NShr && isMem(g.memOperand(n.RHS, sz)):
+		g.genExpr(n.LHS)
+		imm, _ = g.memOperand(n.RHS, sz)
+	case commutative(n.Kind) && isMem(g.memOperand(n.LHS, sz)):
+		g.genExpr(n.RHS)
+		imm, _ = g.memOperand(n.LHS, sz)
+	case g.isLeaf(n.LHS):
+		g.genExpr(n.RHS)
+		g.a.Mov(8, Q(RDI), Q(RAX))
+		g.genExpr(n.LHS)
 	default:
 		g.genExpr(n.RHS)
+		if t, ok := g.saveTemp(); ok {
+			g.genExpr(n.LHS)
+			imm = Sized(t, sz)
+			g.freeTemp()
+			break
+		}
 		g.push()
 		g.genExpr(n.LHS)
 		g.pop(RDI)
@@ -1541,13 +1748,20 @@ func (g *gen) intOperands(n *cc.Node, allowImm bool) (int, bool, Operand) {
 // genIntCompare emits the comparison and returns the condition that is
 // true when the relation holds
 func (g *gen) genIntCompare(n *cc.Node) Cond {
+	if c, ok := g.compareRegVar(n); ok {
+		return c
+	}
 	sz, uns, imm := g.intOperands(n, true)
 	if imm != nil {
 		g.a.Alu(CMP, sz, Sized(RAX, sz), imm)
 	} else {
 		g.a.Alu(CMP, sz, Sized(RAX, sz), Sized(RDI, sz))
 	}
-	switch n.Kind {
+	return compareCond(n.Kind, uns)
+}
+
+func compareCond(k cc.NodeKind, uns bool) Cond {
+	switch k {
 	case cc.NEq:
 		return CondE
 	case cc.NNe:
@@ -1583,8 +1797,16 @@ func (g *gen) genIntBinary(n *cc.Node) {
 	case cc.NSub:
 		g.a.Alu(SUB, sz, ax, src)
 	case cc.NMul:
-		if imm != nil {
-			g.a.Imul3(sz, RAX, ax, int64(imm.(Imm)))
+		if c, ok := imm.(Imm); ok && c > 0 && c&(c-1) == 0 {
+			k := 0
+			for int64(1)<<k != int64(c) {
+				k++
+			}
+			if k > 0 {
+				g.a.ShiftImm(SHL, sz, ax, k)
+			}
+		} else if c, ok := imm.(Imm); ok {
+			g.a.Imul3(sz, RAX, ax, int64(c))
 		} else {
 			g.a.Imul2(sz, RAX, src)
 		}
@@ -1617,10 +1839,10 @@ func (g *gen) genIntBinary(n *cc.Node) {
 		case uns:
 			op = SHR
 		}
-		if imm != nil {
-			g.a.ShiftImm(op, sz, ax, int(int64(imm.(Imm))&int64(sz*8-1)))
+		if c, ok := imm.(Imm); ok {
+			g.a.ShiftImm(op, sz, ax, int(int64(c)&int64(sz*8-1)))
 		} else {
-			g.a.Mov(4, D(RCX), D(RDI))
+			g.a.Mov(4, D(RCX), Sized(src.(R).Reg, 4))
 			g.a.ShiftCL(op, sz, ax)
 		}
 	default:
@@ -1635,10 +1857,35 @@ func (g *gen) genIntBinary(n *cc.Node) {
 
 func (g *gen) genFloatBinary(n *cc.Node) {
 	dbl := isDouble(n.LHS.Ty)
-	g.genExpr(n.RHS)
-	g.pushf()
-	g.genExpr(n.LHS)
-	g.popf(XMM1)
+	switch {
+	case g.floatSrc(n.RHS) != nil:
+		g.genExpr(n.LHS)
+		g.a.MovF(dbl, X(XMM1), g.floatSrc(n.RHS))
+	case (n.Kind == cc.NAdd || n.Kind == cc.NMul) && g.floatSrc(n.LHS) != nil:
+		// commutative: the left operand is used in place
+		g.genExpr(n.RHS)
+		op := FAdd
+		if n.Kind == cc.NMul {
+			op = FMul
+		}
+		g.a.FArith(op, dbl, XMM0, g.floatSrc(n.LHS))
+		return
+	case g.floatLeaf(n.LHS):
+		g.genExpr(n.RHS)
+		g.a.MovF(true, X(XMM1), X(XMM0))
+		g.genExpr(n.LHS)
+	default:
+		g.genExpr(n.RHS)
+		if t, ok := g.saveTempF(); ok {
+			g.genExpr(n.LHS)
+			g.a.MovqToX(8, XMM1, t)
+			g.freeTemp()
+			break
+		}
+		g.pushf()
+		g.genExpr(n.LHS)
+		g.popf(XMM1)
+	}
 	switch n.Kind {
 	case cc.NAdd:
 		g.a.FArith(FAdd, dbl, XMM0, X(XMM1))

@@ -47,6 +47,10 @@ func (p *Project) Config() (*Config, []string, []string, error) {
 			cfg.Std = f[5:]
 		case f == "-w":
 			cfg.NoWarnings = true
+		case strings.HasPrefix(f, "-m"):
+			if _, err := cfg.MachineFlag(f); err != nil {
+				return nil, nil, nil, err
+			}
 		case strings.HasPrefix(f, "-l"):
 			libs = append(libs, arg("-l"))
 		case strings.HasPrefix(f, "-L"):

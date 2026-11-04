@@ -19,6 +19,11 @@ type initializer struct {
 func newInitializer(ty *Type, isFlexible bool) *initializer {
 	init := &initializer{ty: ty}
 	switch ty.Kind {
+	case TyVector:
+		init.children = make([]*initializer, ty.ArrayLen)
+		for i := range init.children {
+			init.children[i] = newInitializer(ty.Base, false)
+		}
 	case TyArray:
 		if isFlexible && ty.ArrayLen < 0 {
 			init.isFlexible = true
@@ -150,7 +155,7 @@ func (p *parser) structDesignator(ty *Type) *Member {
 // designation parses designators followed by "=" and the initializer
 func (p *parser) designation(init *initializer) {
 	if p.is("[") {
-		if init.ty.Kind != TyArray {
+		if init.ty.Kind != TyArray && init.ty.Kind != TyVector {
 			p.errorAt(p.cur(), "array index in non-array initializer")
 		}
 		begin, end := p.arrayDesignator(init.ty)
@@ -417,6 +422,15 @@ func (p *parser) initializer2(init *initializer) {
 			p.arrayInitializer2(init, 0)
 		}
 		return
+	case TyVector:
+		if p.is("{") {
+			p.arrayInitializer1(init)
+			return
+		}
+		init.expr = p.assign()
+		addType(init.expr)
+		p.checkAssign(init.ty, init.expr, init.tok, "initialization")
+		return
 	case TyVLA:
 		p.errorAt(p.cur(), "variable-sized object may not be initialized")
 	case TyStruct:
@@ -514,6 +528,22 @@ func (p *parser) initDesgExpr(d *initDesg, tok *Token) *Node {
 }
 
 func (p *parser) createLvarInit(init *initializer, ty *Type, d *initDesg, tok *Token) *Node {
+	if ty.Kind == TyVector && init.expr == nil {
+		// element by element through a pointer to the elements
+		n := &Node{Kind: NNull, Tok: tok}
+		for i := int64(0); i < ty.ArrayLen && i < int64(len(init.children)); i++ {
+			c := init.children[i]
+			if c.expr == nil {
+				continue
+			}
+			addr := newUnary(NAddr, p.initDesgExpr(d, tok), tok)
+			addType(addr)
+			ptr := &Node{Kind: NCast, LHS: addr, Ty: pointerTo(ty.Base), Tok: tok}
+			elem := newUnary(NDeref, p.newAdd(ptr, newLong(i, tok), tok), tok)
+			n = p.newBinary(NComma, n, p.newBinary(NAssign, elem, c.expr, tok), tok)
+		}
+		return n
+	}
 	if ty.Kind == TyArray {
 		n := &Node{Kind: NNull, Tok: tok}
 		for i := int64(0); i < ty.ArrayLen && i < int64(len(init.children)); i++ {
@@ -566,7 +596,7 @@ func (p *parser) lvarInitializer(v *Obj) *Node {
 	}
 	d := &initDesg{v: v}
 	lhs := &Node{Kind: NMemzero, Var: v, Tok: tok}
-	if !v.Ty.IsRecord() && !v.Ty.IsArray() {
+	if !v.Ty.IsRecord() && !v.Ty.IsArray() && !(v.Ty.IsVector() && init.expr == nil) {
 		// scalars need no zeroing
 		rhs := p.createLvarInit(init, v.Ty, d, tok)
 		addType(rhs)
@@ -660,6 +690,16 @@ func float80FromFloat64(f float64) []byte {
 
 func (p *parser) writeGvarData(o *Obj, init *initializer, ty *Type, buf []byte, offset int64) {
 	switch ty.Kind {
+	case TyVector:
+		if init.expr == nil {
+			sz := ty.Base.Size()
+			for i := int64(0); i < ty.ArrayLen && i < int64(len(init.children)); i++ {
+				p.writeGvarData(o, init.children[i], ty.Base, buf, offset+sz*i)
+			}
+			return
+		}
+		p.errorAt(init.tok, "initializer element is not constant")
+		return
 	case TyArray:
 		sz := ty.Base.Size()
 		for i := int64(0); i < ty.ArrayLen && i < int64(len(init.children)); i++ {

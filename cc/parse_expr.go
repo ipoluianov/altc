@@ -55,6 +55,10 @@ func (p *parser) checkAssign(to *Type, e *Node, tok *Token, ctx string) {
 		p.warnAt(tok, "%s makes pointer from integer without a cast", ctx)
 	case to.IsInteger() && to.Kind != TyBool && decayType(from).Kind == TyPtr:
 		p.warnAt(tok, "%s makes integer from pointer without a cast", ctx)
+	case to.IsVector() || from.IsVector():
+		if !to.IsVector() || !from.IsVector() || to.Size() != from.Size() {
+			p.errorAt(tok, "incompatible types in %s ('%s' from '%s')", ctx, to, from)
+		}
 	case to.IsComplex() && (from.IsNumeric() || from.IsComplex()):
 	case from.IsComplex() && to.IsNumeric():
 	case to.IsRecord() && !(from.IsRecord() && from.Rec == to.Rec):
@@ -101,6 +105,11 @@ func (p *parser) assign() *Node {
 
 // arith builds a binary arithmetic node (with pointer arithmetic for + and -)
 func (p *parser) arith(op NodeKind, lhs, rhs *Node, tok *Token) *Node {
+	addType(lhs)
+	addType(rhs)
+	if lhs.Ty.IsVector() || rhs.Ty.IsVector() {
+		return p.vectorBinary(op, lhs, rhs, tok)
+	}
 	switch op {
 	case NAdd:
 		return p.newAdd(lhs, rhs, tok)
@@ -295,6 +304,9 @@ func (p *parser) bitand() *Node {
 func (p *parser) compare(k NodeKind, lhs, rhs *Node, tok *Token) *Node {
 	addType(lhs)
 	addType(rhs)
+	if lhs.Ty.IsVector() || rhs.Ty.IsVector() {
+		return p.vectorBinary(k, lhs, rhs, tok)
+	}
 	if (lhs.Ty.IsComplex() || rhs.Ty.IsComplex()) && (k == NEq || k == NNe) {
 		return p.complexBinary(k, lhs, rhs, tok)
 	}
@@ -384,6 +396,9 @@ func (p *parser) elemSize(ptrTy *Type, tok *Token) *Node {
 func (p *parser) newAdd(lhs, rhs *Node, tok *Token) *Node {
 	addType(lhs)
 	addType(rhs)
+	if lhs.Ty.IsVector() || rhs.Ty.IsVector() {
+		return p.vectorBinary(NAdd, lhs, rhs, tok)
+	}
 	if lhs.Ty.IsComplex() || rhs.Ty.IsComplex() {
 		return p.complexBinary(NAdd, lhs, rhs, tok)
 	}
@@ -411,6 +426,9 @@ func (p *parser) newAdd(lhs, rhs *Node, tok *Token) *Node {
 func (p *parser) newSub(lhs, rhs *Node, tok *Token) *Node {
 	addType(lhs)
 	addType(rhs)
+	if lhs.Ty.IsVector() || rhs.Ty.IsVector() {
+		return p.vectorBinary(NSub, lhs, rhs, tok)
+	}
 	if lhs.Ty.IsComplex() || rhs.Ty.IsComplex() {
 		return p.complexBinary(NSub, lhs, rhs, tok)
 	}
@@ -506,6 +524,15 @@ func (p *parser) cast() *Node {
 		if ty.Kind == TyUnion || ty.Kind == TyStruct && e.Ty.IsRecord() && e.Ty.Rec == ty.Rec {
 			return e
 		}
+		if ty.IsVector() || e.Ty.IsVector() {
+			if ty.Size() != e.Ty.Size() {
+				p.errorAt(t, "cannot convert a value of type '%s' to '%s' (sizes differ)", e.Ty, ty)
+			}
+			if !ty.IsVector() || !e.Ty.IsVector() {
+				p.errorAt(t, "conversion between a vector and a scalar is not supported")
+			}
+			return &Node{Kind: NCast, LHS: e, Ty: ty.Unqual(), Tok: t}
+		}
 		if ty.Kind != TyVoid && !ty.IsScalar() && !ty.IsComplex() {
 			p.errorAt(t, "conversion to non-scalar type requested")
 		}
@@ -529,7 +556,7 @@ func (p *parser) unary() *Node {
 			p.next()
 			e := p.cast()
 			addType(e)
-			if e.Ty.IsComplex() {
+			if e.Ty.IsComplex() || e.Ty.IsVector() {
 				return e
 			}
 			if !e.Ty.IsNumeric() {
@@ -542,6 +569,9 @@ func (p *parser) unary() *Node {
 			addType(e)
 			if e.Ty.IsComplex() {
 				return p.complexUnary(NNeg, e, t)
+			}
+			if e.Ty.IsVector() {
+				return &Node{Kind: NNeg, LHS: e, Ty: e.Ty.Unqual(), Tok: t}
 			}
 			if !e.Ty.IsNumeric() {
 				p.errorAt(t, "wrong type argument to unary minus")
@@ -583,6 +613,9 @@ func (p *parser) unary() *Node {
 			addType(e)
 			if e.Ty.IsComplex() {
 				return p.complexUnary(NBitNot, e, t)
+			}
+			if e.Ty.IsVector() {
+				return &Node{Kind: NBitNot, LHS: e, Ty: e.Ty.Unqual(), Tok: t}
 			}
 			if !e.Ty.IsInteger() {
 				p.errorAt(t, "wrong type argument to bit-complement")
@@ -749,6 +782,10 @@ func (p *parser) postfix() *Node {
 			p.expect("]")
 			addType(n)
 			addType(idx)
+			if n.Ty.IsVector() {
+				n = p.vectorIndex(n, idx, t)
+				continue
+			}
 			if decayType(n.Ty).Kind != TyPtr && decayType(idx.Ty).Kind != TyPtr {
 				p.errorAt(t, "subscripted value is neither array nor pointer")
 			}

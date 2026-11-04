@@ -54,11 +54,7 @@
 # define __KERNEL_STRICT_NAMES
 #endif
 
-/* Compiler version tests.  AltC does not define __GNUC__, so they always
-   fail there; they are only true when these headers are used by GCC or
-   clang (as in the verification suite), where glibc headers taken from
-   /usr/include need them to agree with the compiler's own keywords (for
-   example the _FloatN types).  */
+/* Compiler version tests: AltC identifies itself as GCC 14.2.  */
 #if defined __GNUC__ && defined __GNUC_MINOR__
 # define __GNUC_PREREQ(maj, min) \
   ((__GNUC__ << 16) + __GNUC_MINOR__ >= ((maj) << 16) + (min))

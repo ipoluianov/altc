@@ -55,7 +55,8 @@ def headers():
     for root, dirs, files in os.walk(INC):
         dirs[:] = [d for d in dirs if d != '_altc']
         for f in files:
-            if f.endswith('.h'):
+            # the x86 intrinsic headers rely on AltC builtins
+            if f.endswith('.h') and 'intrin' not in f and f not in ('cpuid.h', 'mm_malloc.h'):
                 hs.append(os.path.relpath(os.path.join(root, f), INC))
     return sorted(hs)
 

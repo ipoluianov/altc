@@ -109,6 +109,7 @@ func ReadObject(name string, data []byte) (*Object, error) {
 		switch goelf.ST_TYPE(es.Info) {
 		case goelf.STT_FUNC, goelf.STT_GNU_IFUNC:
 			s.Type = SymFunc
+			s.IFunc = goelf.ST_TYPE(es.Info) == goelf.STT_GNU_IFUNC
 		case goelf.STT_OBJECT:
 			s.Type = SymObject
 		case goelf.STT_TLS:

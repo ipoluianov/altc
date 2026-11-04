@@ -218,7 +218,7 @@ func TestABIInterop(t *testing.T) {
 			altcObj := func(name string) *elf.Object {
 				p := filepath.Join(dir, name+".c")
 				src, _ := os.ReadFile(p)
-				u := driver.CompileSource(p, src, &driver.Config{NoWarnings: true})
+				u := driver.CompileSource(p, src, testConfig(&driver.Config{NoWarnings: true}))
 				if u.Obj == nil {
 					t.Fatalf("altc %s: %v", name, u.Diagnostics)
 				}

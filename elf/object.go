@@ -121,6 +121,7 @@ type Symbol struct {
 	Type    SymType
 	Hidden  bool // visibility hidden/internal: never exported
 	Abs     bool // absolute symbol (SHN_ABS)
+	IFunc   bool // STT_GNU_IFUNC: the value is a resolver returning the address
 }
 
 // Defined tells whether the symbol has a definition in its object

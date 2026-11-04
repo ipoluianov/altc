@@ -356,20 +356,67 @@ func (g *gen) genCall(n *cc.Node) {
 	}
 	// register arguments: push in order, then pop into registers
 	type dest struct {
-		fp  bool
-		reg Reg
+		fp    bool
+		reg   Reg
+		inTmp bool // the value waits in a temporary register
+		tmp   Reg
 	}
 	var dests []dest
+	type deferred struct {
+		reg  Reg
+		load func(Reg)
+	}
+	var late []deferred
 	gp, fp = 0, 0
 	if retInMem {
 		gp = 1
 	}
+	// the last evaluated argument goes to its register without the stack
+	lastEval := -1
+	for i, a := range n.Args {
+		if !slots[i].stack && g.argLoader(a) == nil {
+			lastEval = i
+		}
+	}
+	if lastEval >= 0 {
+		t := n.Args[lastEval].Ty
+		if t.IsRecord() || is128(t) {
+			lastEval = -1
+		}
+	}
+	var lastMove func()
 	for i, a := range n.Args {
 		if slots[i].stack {
 			continue
 		}
 		t := a.Ty
+		if ld := g.argLoader(a); ld != nil {
+			if isSSE(t) {
+				late = append(late, deferred{XMM0 + Reg(fp), ld})
+				fp++
+			} else {
+				late = append(late, deferred{argGP[gp], ld})
+				gp++
+			}
+			continue
+		}
 		g.genExpr(a)
+		if i == lastEval {
+			if isSSE(t) {
+				r := XMM0 + Reg(fp)
+				lastMove = func() {
+					if r != XMM0 {
+						g.a.MovF(true, X(r), X(XMM0))
+					}
+				}
+				fp++
+			} else {
+				r := argGP[gp]
+				lastMove = func() { g.a.Mov(8, Q(r), Q(RAX)) }
+				gp++
+			}
+			continue
+		}
 		switch {
 		case t.IsRecord():
 			if t.Size() == 0 {
@@ -383,39 +430,60 @@ func (g *gen) genCall(n *cc.Node) {
 					g.loadSized(R11, M(R10, int32(k*8)), chunk)
 					g.a.Push(R11)
 					g.depth++
-					dests = append(dests, dest{true, XMM0 + Reg(fp)})
+					dests = append(dests, dest{fp: true, reg: XMM0 + Reg(fp)})
 					fp++
 				} else {
 					g.loadSized(R11, M(R10, int32(k*8)), chunk)
 					g.a.Push(R11)
 					g.depth++
-					dests = append(dests, dest{false, argGP[gp]})
+					dests = append(dests, dest{reg: argGP[gp]})
 					gp++
 				}
 			}
 		case isSSE(t):
-			g.pushf()
-			dests = append(dests, dest{true, XMM0 + Reg(fp)})
+			if tr, ok := g.saveTempF(); ok {
+				dests = append(dests, dest{true, XMM0 + Reg(fp), true, tr})
+			} else {
+				g.pushf()
+				dests = append(dests, dest{fp: true, reg: XMM0 + Reg(fp)})
+			}
 			fp++
 		case is128(t):
 			g.push()
 			g.a.Push(RDX)
 			g.depth++
-			dests = append(dests, dest{false, argGP[gp]}, dest{false, argGP[gp+1]})
+			dests = append(dests, dest{reg: argGP[gp]}, dest{reg: argGP[gp+1]})
 			gp += 2
 		default:
-			g.push()
-			dests = append(dests, dest{false, argGP[gp]})
+			if tr, ok := g.saveTemp(); ok {
+				dests = append(dests, dest{false, argGP[gp], true, tr})
+			} else {
+				g.push()
+				dests = append(dests, dest{reg: argGP[gp]})
+			}
 			gp++
 		}
 	}
+	if lastMove != nil {
+		lastMove()
+	}
 	for i := len(dests) - 1; i >= 0; i-- {
 		d := dests[i]
-		if d.fp {
+		switch {
+		case d.inTmp && d.fp:
+			g.a.MovqToX(8, d.reg, d.tmp)
+			g.freeTemp()
+		case d.inTmp:
+			g.a.Mov(8, Q(d.reg), Q(d.tmp))
+			g.freeTemp()
+		case d.fp:
 			g.popf(d.reg)
-		} else {
+		default:
 			g.pop(d.reg)
 		}
+	}
+	for _, d := range late {
+		d.load(d.reg)
 	}
 	if direct == "" {
 		g.pop(R10)
@@ -426,11 +494,13 @@ func (g *gen) genCall(n *cc.Node) {
 	if ft.Variadic || ft.OldStyle {
 		g.a.Mov(4, D(RAX), Imm(int64(fp)))
 	}
+	g.spillXMM()
 	if direct != "" {
 		g.a.Call(direct)
 	} else {
 		g.a.CallInd(Q(R10))
 	}
+	g.reloadXMM()
 	if area > 0 {
 		g.a.Alu(ADD, 8, Q(RSP), Imm(area))
 		g.depth -= int(area / 8)
@@ -505,8 +575,37 @@ func (g *gen) copyStructToRet(t *cc.Type) {
 
 // ---- functions ----
 
+// function generates a function. When registers are left over by the
+// variables, a trial generation counts how many of them the temporaries
+// need, so that the prologue saves only those.
 func (g *gen) function(fn *cc.Obj) {
+	g.tempLimit = -1
+	if !g.noRegAlloc && fn.Body != nil && !hasAsm(fn.Body) {
+		mk := g.a.mark()
+		listing := g.a.Listing
+		g.a.Listing = nil
+		g.dryLabels = []string{}
+		g.functionBody(fn)
+		for _, name := range g.dryLabels {
+			delete(g.labels, name)
+		}
+		g.dryLabels = nil
+		g.a.reset(mk)
+		g.a.Listing = listing
+		g.tempLimit = g.tempUsed
+	}
+	g.functionBody(fn)
+}
+
+func (g *gen) functionBody(fn *cc.Obj) {
 	g.fn = fn
+	if usesVectors(fn) {
+		reason := g.irReason
+		if reason == "" {
+			reason = "-O0"
+		}
+		g.fail(fn.Body, "vector types in '%s' need the optimizing backend, which cannot compile it: %s", fn.Name, reason)
+	}
 	g.depth = 0
 	g.retLabel = g.a.NewLabel()
 	ft := fn.Ty
@@ -583,6 +682,7 @@ func (g *gen) function(fn *cc.Obj) {
 	}
 	g.gpUsed, g.fpUsed = gp, fp
 	g.stackArgSz = stackOff - 16
+	g.allocRegVars(fn)
 	// local variables
 	offset := int64(0)
 	g.overAligned = map[*cc.Obj]int64{}
@@ -592,6 +692,9 @@ func (g *gen) function(fn *cc.Obj) {
 	}
 	for _, v := range fn.Locals {
 		if onStack[v] {
+			continue
+		}
+		if r, ok := g.regVars[v]; ok && !r.IsXMM() {
 			continue
 		}
 		sz := v.Ty.Size()
@@ -643,6 +746,7 @@ func (g *gen) function(fn *cc.Obj) {
 		}
 	})
 	offset = g.asmFrame(fn, offset)
+	offset = g.regFrame(offset)
 	stackSize := alignTo(offset, 16)
 
 	g.a.Push(RBP)
@@ -651,6 +755,7 @@ func (g *gen) function(fn *cc.Obj) {
 		g.a.Alu(SUB, 8, Q(RSP), Imm(stackSize))
 	}
 	g.saveCalleeRegs()
+	g.saveVarRegs()
 	g.a.Mov(8, M(RBP, int32(fn.AllocaBottom.Offset)), Q(RSP))
 	for v, area := range g.overAligned {
 		al := max(v.Align, v.Ty.Align())
@@ -695,6 +800,8 @@ func (g *gen) function(fn *cc.Obj) {
 					gi++
 				}
 			}
+		case isSSE(t) && g.regVars[v] != 0:
+			g.a.MovF(true, X(g.regVars[v]), X(XMM0+Reg(rp.fp)))
 		case isFloat(t):
 			g.a.MovF(false, M(RBP, int32(v.Offset)), X(XMM0+Reg(rp.fp)))
 		case isDouble(t):
@@ -703,7 +810,20 @@ func (g *gen) function(fn *cc.Obj) {
 			g.a.Mov(8, M(RBP, int32(v.Offset)), Q(argGP[rp.gp]))
 			g.a.Mov(8, M(RBP, int32(v.Offset+8)), Q(argGP[rp.gp+1]))
 		default:
+			if r, ok := g.varReg(v); ok {
+				g.extendInto(r, t, argGP[rp.gp])
+				continue
+			}
 			g.storeSized(M(RBP, int32(v.Offset)), argGP[rp.gp], t.Size())
+		}
+	}
+	for _, v := range fn.Params {
+		if r, ok := g.varReg(v); ok && onStack[v] {
+			if r.IsXMM() {
+				g.a.MovF(isDouble(v.Ty), X(r), M(RBP, int32(v.Offset)))
+				continue
+			}
+			g.loadInto(r, v.Ty, M(RBP, int32(v.Offset)))
 		}
 	}
 	g.genStmt(fn.Body)
@@ -711,6 +831,7 @@ func (g *gen) function(fn *cc.Obj) {
 		g.a.Alu(XOR, 4, D(RAX), D(RAX))
 	}
 	g.a.Bind(g.retLabel)
+	g.restoreVarRegs()
 	g.restoreCalleeRegs()
 	g.a.Leave()
 	g.a.Ret()
@@ -997,7 +1118,26 @@ func (g *gen) genBuiltin(n *cc.Node) {
 	if sz < 4 {
 		sz = 4
 	}
+	if g.unaryBuiltin(n.Builtin, sz) {
+		return
+	}
 	switch n.Builtin {
+	case "isnan", "isinf", "isfinite", "isnormal", "signbit", "signbitf", "signbitl", "isinf_sign":
+		g.genFloatClass(n.Builtin, at)
+	default:
+		g.fail(n, "builtin %s is not supported", n.Builtin)
+	}
+}
+
+// unaryIntBuiltins work on rax and use only rax, rcx and rdx
+var unaryIntBuiltins = map[string]bool{
+	"bswap16": true, "bswap32": true, "bswap64": true, "clz": true, "ctz": true,
+	"ffs": true, "popcount": true, "parity": true, "clrsb": true,
+}
+
+// unaryBuiltin computes an integer builtin of the value in rax
+func (g *gen) unaryBuiltin(name string, sz int) bool {
+	switch name {
 	case "bswap16":
 		g.a.ShiftImm(ROL, 2, W(RAX), 8)
 		g.a.Movzx(4, RAX, 2, W(RAX))
@@ -1006,9 +1146,17 @@ func (g *gen) genBuiltin(n *cc.Node) {
 	case "bswap64":
 		g.a.Bswap(8, RAX)
 	case "clz":
+		if g.isa.Has(ISALZCNT) {
+			g.a.Lzcnt(sz, RAX, Sized(RAX, sz))
+			break
+		}
 		g.a.Bsr(sz, RAX, Sized(RAX, sz))
 		g.a.Alu(XOR, 4, D(RAX), Imm(int64(sz*8-1)))
 	case "ctz":
+		if g.isa.Has(ISABMI) {
+			g.a.Tzcnt(sz, RAX, Sized(RAX, sz))
+			break
+		}
 		g.a.Bsf(sz, RAX, Sized(RAX, sz))
 	case "ffs":
 		g.a.Bsf(sz, RAX, Sized(RAX, sz))
@@ -1016,8 +1164,12 @@ func (g *gen) genBuiltin(n *cc.Node) {
 		g.a.Cmov(CondE, 4, RAX, D(RDX))
 		g.a.Alu(ADD, 4, D(RAX), Imm(1))
 	case "popcount", "parity":
-		g.popcount(sz)
-		if n.Builtin == "parity" {
+		if g.isa.Has(ISAPOPCNT) {
+			g.a.Popcnt(sz, RAX, Sized(RAX, sz))
+		} else {
+			g.popcount(sz)
+		}
+		if name == "parity" {
 			g.a.Alu(AND, 4, D(RAX), Imm(1))
 		}
 	case "clrsb":
@@ -1029,11 +1181,10 @@ func (g *gen) genBuiltin(n *cc.Node) {
 		g.a.Alu(OR, sz, Sized(RAX, sz), Imm(1))
 		g.a.Bsr(sz, RAX, Sized(RAX, sz))
 		g.a.Alu(XOR, 4, D(RAX), Imm(int64(sz*8-1)))
-	case "isnan", "isinf", "isfinite", "isnormal", "signbit", "signbitf", "signbitl", "isinf_sign":
-		g.genFloatClass(n.Builtin, at)
 	default:
-		g.fail(n, "builtin %s is not supported", n.Builtin)
+		return false
 	}
+	return true
 }
 
 // popcount counts the set bits of rax (size 4 or 8) with SWAR arithmetic

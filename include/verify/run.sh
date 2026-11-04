@@ -27,7 +27,9 @@ MIX="-nostdinc -isystem $INC -idirafter /usr/include/x86_64-linux-gnu -idirafter
 FAIL=0
 fail () { echo "FAIL: $*"; FAIL=1; }
 
-HDRS=$(cd "$INC" && find . -name '*.h' ! -path './_altc/*' | sed 's|^\./||' | sort)
+# the x86 intrinsic headers rely on AltC builtins and are tested by the
+# comparison tests instead
+HDRS=$(cd "$INC" && find . -name '*.h' ! -path './_altc/*' ! -name '*intrin*.h' ! -name 'cpuid.h' ! -name 'mm_malloc.h' | sed 's|^\./||' | sort)
 
 echo "== 1. header self-containment and warnings"
 for std in c89 c99 c11 c17 c2x gnu89 gnu17; do

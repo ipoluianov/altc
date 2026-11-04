@@ -490,7 +490,7 @@ type aop struct {
 }
 
 func (o aop) isGP() bool  { return o.kind == okReg && !o.reg.IsXMM() }
-func (o aop) isXMM() bool { return o.kind == okReg && o.reg.IsXMM() }
+func (o aop) isXMM() bool { return o.kind == okReg && o.reg.IsXMM() && o.size != 32 }
 func (o aop) isRM() bool  { return o.isGP() || o.kind == okMem }
 
 // xval is the value of an expression: v + sym (or + a label)
@@ -2939,7 +2939,12 @@ func (t *textAsm) directive(name, rest string) error {
 		if len(args) != 2 || t.env.Symbol == nil {
 			return nil
 		}
+		// the size of a global function is a difference of labels of this
+		// text, not of relocatable symbols
+		saved := t.globals
+		t.globals = nil
 		v, err := t.expr(args[1])
+		t.globals = saved
 		if err != nil || !v.isConst() {
 			return nil // sizes that are not constant are ignored
 		}

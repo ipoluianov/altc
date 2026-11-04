@@ -24,7 +24,43 @@ altc -c file.c           # ELF object, linkable by GNU ld as well
 altc -S file.c           # GNU assembler listing
 altc -E file.c           # preprocessed output
 altc -c start.S          # assembler sources: .s, or .S with the C preprocessor
+altc -march=native f.c   # use the extensions of this processor (AVX2...)
 ```
+
+## Processor extensions and SIMD
+
+Like gcc, AltC generates code for the x86-64 baseline (SSE2) unless asked
+for more:
+
+- `-march=x86-64-v2|x86-64-v3|haswell|skylake|znver3|native|...` and
+  `-m<feature>` / `-mno-<feature>` (`sse4.2`, `popcnt`, `avx`, `avx2`,
+  `fma`, `bmi`, `bmi2`, `lzcnt`, `f16c`, `aes`, `pclmul`, `sha`...) enable
+  extensions and define the same macros as gcc (`__SSE4_2__`, `__AVX2__`...).
+  With AVX all SSE instructions use their VEX forms; `popcnt`, `lzcnt` and
+  `tzcnt` replace the generic sequences when enabled. In `altc.json` the
+  options go in `cflags`.
+- GNU vector types (`__attribute__((vector_size(16)))`) with element-wise
+  operators, comparisons, `v[i]`, initializers and casts.
+- `<immintrin.h>` and the other intrinsic headers (`xmmintrin.h` to
+  `avx2intrin.h`, `fmaintrin.h`, `f16cintrin.h`, `wmmintrin.h`,
+  `bmi2intrin.h`...), `<cpuid.h>`, `<mm_malloc.h>`; SSE to SSE4.2, AVX,
+  AVX2, FMA, F16C, AES, PCLMUL, BMI1/2 intrinsics are inlined.
+- `__builtin_cpu_supports("avx2")`, `__builtin_cpu_is`, `__builtin_cpu_init`
+  read libgcc's processor model (`__cpu_model`, `__cpu_features2`) like gcc
+  does; AltC's runtime provides it, so objects of both compilers link with
+  either linker. `__attribute__((target("avx2")))` compiles one function
+  for more extensions; `__attribute__((target_clones("avx2", "default")))`
+  compiles a version per target and picks one at startup.
+- `__attribute__((ifunc("resolver")))` and IFUNC symbols
+  (`.type f, @gnu_indirect_function`): the linker calls the resolver at
+  startup (`R_X86_64_IRELATIVE`), so gcc's `target_clones` output links too.
+- AltC predefines `__GNUC__` 14, `__GNUC_MINOR__` 2 and the other macros
+  of gcc 14.2, so code that checks for GNU C takes its GNU paths.
+- Loops over arrays (`c[i] = a[i] * k + b[i]`, integer `sum += a[i]`) are
+  vectorized automatically, with a run-time check that the arrays do not
+  overlap; a few scalar iterations first align the stored array to the
+  vector size, and loop heads start on 16-byte boundaries. Floating-point
+  reductions stay scalar (as in gcc without `-ffast-math`).
 
 ## Project folder
 
@@ -75,15 +111,15 @@ subfolder are on the include path. `altc.json` can set:
   `asm goto`, local register variables (`register long r asm("r10")`) and
   file-scope `asm`.
 
-Not supported yet: vector types and intrinsics headers, debug information
-and unwind tables, AVX (VEX-encoded) instructions; the generated code is
-not optimized.
+Not supported yet: debug information and unwind tables, AVX-512, MMX
+(`__m64`), `__builtin_cpu_is` with processor names (only `"intel"` and
+`"amd"` are known; the others give 0).
 
 ## Assembler
 
 The built-in AT&T assembler handles inline asm, file-scope asm and `.s`/`.S`
-files: general-purpose, x87, SSE up to SSE4.2, AES, SHA and PCLMUL
-instructions, short/long jump relaxation, numeric and named labels, label
+files: general-purpose, x87, SSE up to SSE4.2, AVX, AVX2, FMA, F16C, BMI1/2,
+AES, SHA and PCLMUL instructions, short/long jump relaxation, numeric and named labels, label
 differences, sections (`.section`, `.pushsection`...), data and symbol
 directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
 `-S` output it produces the same bytes and relocations as GNU as.
@@ -109,6 +145,24 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
   libgcc helpers for `__int128` come from a small runtime compiled on the
   fly.
 - Objects from gcc (`-fno-pic` or PIE) and static archives can be linked in.
+- Functions are compiled through an SSA intermediate representation
+  (`x64/ir*.go`): lowering builds SSA directly from the AST (locals whose
+  address is never taken become values), then constant folding and
+  algebraic simplification, global value numbering (with reuse of loads
+  while memory is unchanged), loop-invariant code motion, dead code
+  elimination, loop rotation, x86 addressing modes, division by constants
+  as multiplications, CFG cleanup, inlining of small and always_inline
+  functions, and loop vectorization. Registers are assigned by priority
+  (uses weighted by loop depth) over live ranges with holes; phis are
+  coalesced with their operands; values living across calls get
+  callee-saved registers or stack slots.
+- Functions the IR does not cover (`long double`, `__int128`, asm goto,
+  VLAs, atomics, K&R definitions, computed goto, `setjmp`) use the older
+  stack-machine generator, which keeps the most used locals in callee-saved
+  registers. The two mix freely within a file.
+- The result is typically close to gcc `-O2` on scalar code, and close to
+  `-O3` on simple array loops. `-O0` uses the stack machine without
+  register allocation; other `-O` levels are accepted and ignored.
 
 ## Tests
 
@@ -123,6 +177,22 @@ include/verify/run.sh                         # header layout vs glibc
 ```
 
 The comparison tests need gcc and GNU as only as a reference.
+
+Environment variables for working on the IR backend:
+
+```sh
+ALTC_NOIR=1          # use the stack-machine generator for every function
+ALTC_IR_STATS=1      # report which functions use the IR and why others do not
+ALTC_IR_DUMP=name    # print the IR of a function after allocation (* for all)
+ALTC_IR_STRICT=1     # fail on internal IR errors instead of falling back
+ALTC_NOINLINE=1      # no inlining (ALTC_NOINLINE_FN=f,g: not these functions)
+ALTC_NOVECTORIZE=1   # no loop vectorization
+ALTC_TEST_FLAGS=-march=haswell go test ./tests   # the suite with other flags
+```
+
+A test can start with `// flags: -mavx2 -mfma` (compiled with these flags
+by both compilers, skipped on processors without them) and
+`// skip-asm: reason` (not part of TestAssembleGCCOutput).
 
 ## License
 

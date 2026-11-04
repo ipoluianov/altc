@@ -37,15 +37,5 @@ extern float _Complex clog10f(float _Complex);
 extern long double _Complex clog10l(long double _Complex);
 #endif
 
-/* the trivial ones inline */
-#define creal(z) __builtin_creal(z)
-#define cimag(z) __builtin_cimag(z)
-#define crealf(z) __builtin_crealf(z)
-#define cimagf(z) __builtin_cimagf(z)
-#define creall(z) __builtin_creall(z)
-#define cimagl(z) __builtin_cimagl(z)
-#define conj(z) __builtin_conj(z)
-#define conjf(z) __builtin_conjf(z)
-#define conjl(z) __builtin_conjl(z)
 
 #endif

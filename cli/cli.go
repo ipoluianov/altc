@@ -255,6 +255,13 @@ func gccMode(args []string) int {
 		case a == "-static" || a == "-shared":
 			fmt.Fprintf(os.Stderr, "altc: %s is not supported\n", a)
 			return 1
+		case a == "-O0":
+			cfg.NoRegAlloc = true
+		case strings.HasPrefix(a, "-m") && a != "-m64":
+			if _, err := cfg.MachineFlag(a); err != nil {
+				fmt.Fprintf(os.Stderr, "altc: %v\n", err)
+				return 2
+			}
 		case strings.HasPrefix(a, "-O"), strings.HasPrefix(a, "-g"), strings.HasPrefix(a, "-W"), strings.HasPrefix(a, "-f"),
 			strings.HasPrefix(a, "-m"), a == "-pipe", a == "-pthread", a == "-MD", a == "-MMD", a == "-MP", a == "-rdynamic",
 			a == "-no-pie", a == "-pie", strings.HasPrefix(a, "--param"), a == "-pedantic", a == "-pedantic-errors":

@@ -176,6 +176,7 @@ type Obj struct {
 	IsLiteral    bool // anonymous string literal / compound literal storage
 	Section      string
 	Alias        string
+	IFunc        bool // Alias names the resolver of an indirect function
 	Ctor, Dtor   bool
 	Priority     int64 // constructor/destructor priority (0: none)
 	InitData     []byte
@@ -191,9 +192,13 @@ type Obj struct {
 	Noreturn     bool
 	Refs         []*Obj // functions and globals referenced from this one
 	HasFuncName  bool
-	ConstExpr    *Node // value of a constexpr scalar (C23)
-	LabelAddrs   bool  // labels of this function are used in static data
-	InlineOnly   bool  // GNU extern inline body: never emitted, may be redefined
+	ConstExpr    *Node    // value of a constexpr scalar (C23)
+	LabelAddrs   bool     // labels of this function are used in static data
+	InlineOnly   bool     // GNU extern inline body: never emitted, may be redefined
+	AlwaysInline bool     // __attribute__((always_inline))
+	Target       string   // __attribute__((target("...")))
+	TargetClones []string // __attribute__((target_clones(...)))
+	NoInline     bool     // __attribute__((noinline))
 }
 
 // LabelSymbol is the local symbol of a label whose address is stored in data

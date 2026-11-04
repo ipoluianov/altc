@@ -53,14 +53,27 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
 9. IDE.
 10. GNU extended inline asm; AT&T assembler for `.s`/`.S` files (verified
     byte for byte against GNU as on gcc's output of the test programs).
-11. Later: optimizations (register allocation), DWARF and unwind tables
-    (`.cfi_*`), vector types, `-static`.
+11. Register variables (callee-saved registers for integer locals whose
+    address is not taken, xmm8-xmm15 for float/double ones), temporaries in
+    spare callee-saved registers, local fast paths of the stack machine.
+12. SSA IR backend: folding, GVN, LICM, DCE, loop rotation, addressing
+    modes, magic division, priority register allocation with phi
+    coalescing; fallback to the stack machine for uncovered functions.
+13. Processor extensions: -march/-m flags, VEX (AVX/AVX2/FMA/BMI) in the
+    assembler and for scalar SSE, GNU vector types, intrinsic headers,
+    inlining, inline asm in the IR, target/target_clones,
+    __builtin_cpu_supports, loop vectorization.
+14. GCC interop: __GNUC__ 14.2, libgcc's processor model (__cpu_model),
+    IFUNC symbols and the ifunc attribute (R_X86_64_IRELATIVE).
+15. Later: long double/atomics in the IR, float reductions (-ffast-math)
+    and multi-block loops in the vectorizer, AVX-512, DWARF and unwind
+    tables (`.cfi_*`), `-static`.
 
 ## CLI
 
 ```
 altc build [dir]           build a project (current dir by default)
 altc run [dir] [-- args]   build and run
-altc file.c ... -o prog    gcc-like: -c -S -E -I -D -U -L -l -std= -o -w
+altc file.c ... -o prog    gcc-like: -c -S -E -I -D -U -L -l -std= -o -w -O0
 altc ide [dir]             open the IDE (same as no arguments)
 ```

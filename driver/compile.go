@@ -29,10 +29,22 @@ type Config struct {
 	Listing     bool     // produce assembler text (-S)
 	NoRegAlloc  bool     // -O0: keep every local variable in the frame
 	ISA         x64.ISA  // instruction set extensions (-march, -m<feature>)
+	FastMath    bool     // -ffast-math: floating-point operations may be reassociated
+	Debug       bool     // -g: DWARF debug information
 }
 
-// MachineFlag applies -march=..., -m<feature> and -mno-<feature>
+// MachineFlag applies the code generation options: -march=...,
+// -m<feature>, -mno-<feature> and the floating-point -f options; it tells
+// whether opt was one of them
 func (c *Config) MachineFlag(opt string) (bool, error) {
+	switch opt {
+	case "-ffast-math", "-Ofast", "-fassociative-math", "-funsafe-math-optimizations":
+		c.FastMath = true
+		return true, nil
+	case "-fno-fast-math", "-fno-associative-math", "-fno-unsafe-math-optimizations":
+		c.FastMath = false
+		return true, nil
+	}
 	return c.ISA.MachineFlag(opt)
 }
 
@@ -50,6 +62,9 @@ func (c *Config) isaDefines() []string {
 	var ds []string
 	for _, m := range c.ISA.Macros() {
 		ds = append(ds, "D"+m+"=1")
+	}
+	if c.FastMath {
+		ds = append(ds, "D__FAST_MATH__=1")
 	}
 	return ds
 }
@@ -289,7 +304,7 @@ func CompileSource(path string, data []byte, cfg *Config) (u *Unit) {
 	if hasError(u.Diagnostics) {
 		return u
 	}
-	res, err := x64.GenerateWith(prog, path, x64.Options{Listing: cfg.Listing, NoRegAlloc: cfg.NoRegAlloc, ISA: cfg.ISA})
+	res, err := x64.GenerateWith(prog, path, x64.Options{Listing: cfg.Listing, NoRegAlloc: cfg.NoRegAlloc, ISA: cfg.ISA, FastMath: cfg.FastMath, Debug: cfg.Debug})
 	if err != nil {
 		u.Diagnostics = append(u.Diagnostics, parseGenError(path, err))
 		return u
@@ -771,7 +786,14 @@ func Link(in *LinkInput) ([]byte, []Diagnostic) {
 		real, _ := filepath.EvalSymlinks(s.Path)
 		if !base.sharedSet[real] {
 			base.Shared = append(base.Shared, s)
+			base.sharedSet[real] = true
 		}
+	}
+	// the unwinder (_Unwind_Resume, __gcc_personality_v0 of code compiled
+	// with -fexceptions or C++), last and needed only when used, like gcc's
+	// --as-needed -lgcc_s
+	if gs := findSystemLib("libgcc_s.so.1"); gs != "" {
+		base.addShared(gs)
 	}
 	rt, err := runtimeObjects()
 	if err != nil {

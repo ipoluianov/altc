@@ -27,10 +27,10 @@ func sectionKindOf(s *goelf.Section) SectionKind {
 	case goelf.SHT_NOTE:
 		return SecOther
 	case goelf.SectionType(0x70000001):
-		return SecOther // .eh_frame: no unwinding support needed for C
+		return SecEHFrame
 	}
 	if s.Name == ".eh_frame" {
-		return SecOther
+		return SecEHFrame
 	}
 	if s.Flags&goelf.SHF_TLS != 0 {
 		if s.Type == goelf.SHT_NOBITS {
@@ -71,8 +71,8 @@ func ReadObject(name string, data []byte) (*Object, error) {
 			continue
 		}
 		kind := sectionKindOf(s)
-		if kind == SecOther {
-			continue
+		if kind == SecOther && !strings.HasPrefix(s.Name, ".debug_") {
+			continue // debug information is kept for the executable; comments and notes are not
 		}
 		sec := obj.AddSection(s.Name, kind, int64(s.Addralign))
 		if sec.Align == 0 {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ipoluianov/altc/cc"
 	"github.com/ipoluianov/altc/elf"
 )
 
@@ -218,6 +219,7 @@ type fixup struct {
 	diff  bool
 	la    *Asm
 	minus Label
+	leb   byte // the difference as a LEB128 of size bytes: 1 unsigned, 2 signed
 }
 
 // Asm accumulates machine code for one section
@@ -235,6 +237,18 @@ type Asm struct {
 	SymPrefix string // makes the label symbol names unique per object
 	MaxAlign  int64  // largest alignment requested by assembly text
 	AVX       bool   // encode SSE instructions in their VEX forms
+
+	cfi   cfiState  // call frame information of the functions (see cfi.go)
+	lines []lineRec // source lines of the code (debug information)
+	locs  []locRec  // .loc line information of assembly text
+
+	listFiles map[*cc.File]int // .file numbers of the listing
+}
+
+// locRec is a .loc directive: the code from pos comes from line of the
+// file numbered file
+type locRec struct {
+	pos, file, line int
 }
 
 // gnuNops are the multi-byte nops GNU as uses for code alignment
@@ -311,6 +325,12 @@ func (a *Asm) Finish() error {
 			p1, p2 := f.la.labels[f.label], f.la.labels[f.minus]
 			if p1 < 0 || p2 < 0 {
 				return fmt.Errorf("undefined label in a label difference")
+			}
+			if f.leb != 0 {
+				if err := putLEB(a.Code[f.at:f.at+f.size], int64(p1-p2)+f.addend, f.leb == 2); err != nil {
+					return err
+				}
+				continue
 			}
 			elf.PutLE(a.Code[f.at:], uint64(int64(p1-p2)+f.addend), f.size)
 			continue
@@ -1443,11 +1463,11 @@ func (a *Asm) ShrdCL(dst Operand, src Reg) {
 
 // asmMark is a position in the output that generation can return to
 type asmMark struct {
-	code, relocs, labels, fixups, labelSyms int
+	code, relocs, labels, fixups, labelSyms, cfi, lines int
 }
 
 func (a *Asm) mark() asmMark {
-	return asmMark{len(a.Code), len(a.Relocs), len(a.labels), len(a.fixups), len(a.LabelSyms)}
+	return asmMark{len(a.Code), len(a.Relocs), len(a.labels), len(a.fixups), len(a.LabelSyms), len(a.cfi.recs), len(a.lines)}
 }
 
 // reset drops everything emitted after the mark
@@ -1457,4 +1477,31 @@ func (a *Asm) reset(m asmMark) {
 	a.labels = a.labels[:m.labels]
 	a.fixups = a.fixups[:m.fixups]
 	a.LabelSyms = a.LabelSyms[:m.labelSyms]
+	a.cfi.recs = a.cfi.recs[:m.cfi]
+	a.lines = a.lines[:m.lines]
+}
+
+// putLEB writes v as a LEB128 of exactly len(b) bytes (padded with
+// continuation bytes when shorter)
+func putLEB(b []byte, v int64, signed bool) error {
+	var enc []byte
+	if signed {
+		enc = appendSLEB(nil, v)
+	} else {
+		enc = appendULEB(nil, uint64(v))
+	}
+	if len(enc) > len(b) {
+		return fmt.Errorf("LEB128 value %d does not fit in %d bytes", v, len(b))
+	}
+	for len(enc) < len(b) {
+		last := enc[len(enc)-1]
+		enc[len(enc)-1] = last | 0x80
+		pad := byte(0)
+		if signed && v < 0 {
+			pad = 0x7f
+		}
+		enc = append(enc, pad)
+	}
+	copy(b, enc)
+	return nil
 }

@@ -19,7 +19,9 @@ var (
 // must use the stack-machine generator
 func (g *gen) irFunction(fn *cc.Obj) (ok bool) {
 	g.irReason = ""
-	if g.noRegAlloc || irDisabled {
+	// -O0 keeps every function in the stack machine, except those with
+	// vector values, which only the IR backend compiles
+	if g.noRegAlloc && !usesVectors(fn) || irDisabled {
 		g.irReason = "the optimizing backend is disabled"
 		return false
 	}
@@ -31,8 +33,10 @@ func (g *gen) irFunction(fn *cc.Obj) (ok bool) {
 		}
 		return false
 	}
+	f.curTok = nil // values made by the optimizations take the position of the code before
 	f.isa = g.isa
 	f.noVectorize = os.Getenv("ALTC_NOVECTORIZE") != ""
+	f.fastMath = g.fastMath
 	mk := g.a.mark()
 	defer func() {
 		if r := recover(); r != nil {
@@ -153,13 +157,12 @@ func (e *irEmitter) emit() {
 	}
 	e.epilogue = a.NewLabel()
 
-	a.Push(RBP)
-	a.Mov(8, Q(RBP), Q(RSP))
+	a.FramePrologue()
 	if frame > 0 {
 		a.Alu(SUB, 8, Q(RSP), Imm(frame))
 	}
 	for _, r := range e.ra.usedCallee {
-		a.Mov(8, M(RBP, e.saveOff[r]), Q(r))
+		a.SaveReg(r, e.saveOff[r])
 	}
 	if vs := f.VaSlot; vs != nil {
 		off := int32(vs.Offset)
@@ -218,6 +221,9 @@ func (e *irEmitter) emit() {
 		}
 		a.Bind(e.labels[b])
 		for _, v := range b.Instrs {
+			if v.tok != nil {
+				e.g.lineAt(v.tok)
+			}
 			e.value(v)
 		}
 		e.terminator(b)
@@ -229,8 +235,7 @@ func (e *irEmitter) emit() {
 	for _, r := range e.ra.usedCallee {
 		a.Mov(8, Q(r), M(RBP, e.saveOff[r]))
 	}
-	a.Leave()
-	a.Ret()
+	a.FrameReturn(false)
 }
 
 // ---- locations and operands ----

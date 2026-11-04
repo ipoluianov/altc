@@ -42,9 +42,13 @@ func (g *gen) compileFunction(ob *cc.Obj, target string) {
 		g.isa = saved
 		g.a.AVX = saved.Has(ISAAVX)
 	}()
-	if !g.irFunction(ob) {
+	g.a.CFIStartProc()
+	g.lineAt(ob.Tok)
+	g.usedIR = g.irFunction(ob)
+	if !g.usedIR {
 		g.function(ob)
 	}
+	g.a.CFIEndProc()
 }
 
 // targetFeatures lists the runtime checks of a clone target
@@ -72,7 +76,9 @@ func (g *gen) targetClones(ob *cc.Obj, sym *elf.Symbol, text, data, initArr *elf
 	ptrName := ob.AsmName + ".altc_ptr"
 
 	// the dispatcher
+	a.CFIStartProc()
 	a.JmpInd(MSym(ptrName, 0))
+	a.CFIEndProc()
 	sym.Size = int64(len(a.Code)) - sym.Value
 
 	// the versions
@@ -132,8 +138,8 @@ func (g *gen) targetClones(ob *cc.Obj, sym *elf.Symbol, text, data, initArr *elf
 	if g.listing != nil {
 		fmt.Fprintf(g.listing, "\n\t.type\t%s, @function\n%s:\n", rname, rname)
 	}
-	a.Push(RBP)
-	a.Mov(8, Q(RBP), Q(RSP))
+	a.CFIStartProc()
+	a.FramePrologue()
 	a.Call("__cpu_indicator_init")
 	done := a.NewLabel()
 	for _, v := range versions {
@@ -158,8 +164,8 @@ func (g *gen) targetClones(ob *cc.Obj, sym *elf.Symbol, text, data, initArr *elf
 		a.Bind(next)
 	}
 	a.Bind(done)
-	a.Leave()
-	a.Ret()
+	a.FrameReturn(false)
+	a.CFIEndProc()
 	rs.Size = int64(len(a.Code)) - rs.Value
 	g.addArrayEntry(initArr, rs)
 }

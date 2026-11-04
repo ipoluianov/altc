@@ -2,6 +2,7 @@ package x64
 
 import (
 	"math"
+	"sort"
 
 	"github.com/ipoluianov/altc/cc"
 )
@@ -749,15 +750,21 @@ func (g *gen) functionBody(fn *cc.Obj) {
 	offset = g.regFrame(offset)
 	stackSize := alignTo(offset, 16)
 
-	g.a.Push(RBP)
-	g.a.Mov(8, Q(RBP), Q(RSP))
+	g.a.FramePrologue()
 	if stackSize > 0 {
 		g.a.Alu(SUB, 8, Q(RSP), Imm(stackSize))
 	}
 	g.saveCalleeRegs()
 	g.saveVarRegs()
 	g.a.Mov(8, M(RBP, int32(fn.AllocaBottom.Offset)), Q(RSP))
-	for v, area := range g.overAligned {
+	// in a fixed order: the output must not depend on map iteration
+	overs := make([]*cc.Obj, 0, len(g.overAligned))
+	for v := range g.overAligned {
+		overs = append(overs, v)
+	}
+	sort.Slice(overs, func(i, j int) bool { return overs[i].Offset > overs[j].Offset })
+	for _, v := range overs {
+		area := g.overAligned[v]
 		al := max(v.Align, v.Ty.Align())
 		g.a.Lea(RAX, M(RBP, int32(area+al-1)))
 		g.a.Alu(AND, 8, Q(RAX), Imm(-al))
@@ -833,8 +840,7 @@ func (g *gen) functionBody(fn *cc.Obj) {
 	g.a.Bind(g.retLabel)
 	g.restoreVarRegs()
 	g.restoreCalleeRegs()
-	g.a.Leave()
-	g.a.Ret()
+	g.a.FrameReturn(false)
 	if g.depth != 0 {
 		g.fail(fn.Body, "internal error: unbalanced stack in %s (%d)", fn.Name, g.depth)
 	}
@@ -843,6 +849,9 @@ func (g *gen) functionBody(fn *cc.Obj) {
 // ---- statements ----
 
 func (g *gen) genStmt(n *cc.Node) {
+	if n.Kind != cc.NBlock {
+		g.lineAt(n.Tok)
+	}
 	switch n.Kind {
 	case cc.NIf:
 		els := g.a.NewLabel()
@@ -868,11 +877,13 @@ func (g *gen) genStmt(n *cc.Node) {
 		g.a.Bind(begin)
 		g.stackRestore(n.StackSave)
 		if n.Cond != nil {
+			g.lineAt(n.Cond.Tok)
 			g.genBranchFalse(n.Cond, brk)
 		}
 		g.genStmt(n.Then)
 		g.a.Bind(cont)
 		if n.Inc != nil {
+			g.lineAt(n.Inc.Tok)
 			g.genDiscard(n.Inc)
 		}
 		g.a.Jmp(begin)
@@ -887,6 +898,7 @@ func (g *gen) genStmt(n *cc.Node) {
 		g.stackRestore(n.StackSave)
 		g.genStmt(n.Then)
 		g.a.Bind(cont)
+		g.lineAt(n.Cond.Tok)
 		g.genBranchFalse(n.Cond, brk)
 		g.a.Jmp(begin)
 		g.a.Bind(brk)

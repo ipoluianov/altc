@@ -404,6 +404,14 @@ func (p *parser) newAdd(lhs, rhs *Node, tok *Token) *Node {
 	}
 	lt, rt := decayType(lhs.Ty), decayType(rhs.Ty)
 	if lt.IsNumeric() && rt.IsNumeric() {
+		// like gcc, even without optimization: a + -b is a - b and -a + b
+		// is b - a (which gives NaNs the sign gcc's results have)
+		if isFloatNeg(rhs) && lt.IsFlonum() {
+			return p.newBinary(NSub, lhs, rhs.LHS, tok)
+		}
+		if isFloatNeg(lhs) && rt.IsFlonum() {
+			return p.newBinary(NSub, rhs, lhs.LHS, tok)
+		}
 		return p.newBinary(NAdd, lhs, rhs, tok)
 	}
 	if lt.Kind == TyPtr && rt.Kind == TyPtr {
@@ -434,6 +442,10 @@ func (p *parser) newSub(lhs, rhs *Node, tok *Token) *Node {
 	}
 	lt, rt := decayType(lhs.Ty), decayType(rhs.Ty)
 	if lt.IsNumeric() && rt.IsNumeric() {
+		// like gcc: a - -b is a + b
+		if isFloatNeg(rhs) && lt.IsFlonum() {
+			return p.newBinary(NAdd, lhs, rhs.LHS, tok)
+		}
 		return p.newBinary(NSub, lhs, rhs, tok)
 	}
 	if lt.Kind == TyPtr && rt.IsInteger() {
@@ -1247,3 +1259,8 @@ func ldFromFloat(f float64) *big.Float {
 }
 
 var _ = strings.TrimSpace
+
+// isFloatNeg tells whether n negates a real floating-point value
+func isFloatNeg(n *Node) bool {
+	return n.Kind == NNeg && n.Ty.IsFlonum() && n.LHS.Ty != nil && n.LHS.Ty.IsFlonum()
+}

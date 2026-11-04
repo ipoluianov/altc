@@ -9,10 +9,18 @@ import (
 	"github.com/ipoluianov/altc/x64"
 )
 
-// testConfig applies ALTC_TEST_FLAGS (for example "-march=haswell") so
+// testConfig applies ALTC_TEST_FLAGS (for example "-march=haswell", "-O0 -g") so
 // that the whole suite can run with other machine options
 func testConfig(c *driver.Config) *driver.Config {
 	for _, f := range strings.Fields(os.Getenv("ALTC_TEST_FLAGS")) {
+		switch f {
+		case "-O0":
+			c.NoRegAlloc = true
+			continue
+		case "-g":
+			c.Debug = true
+			continue
+		}
 		if _, err := c.MachineFlag(f); err != nil {
 			panic(err)
 		}

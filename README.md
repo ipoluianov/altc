@@ -56,11 +56,29 @@ for more:
   startup (`R_X86_64_IRELATIVE`), so gcc's `target_clones` output links too.
 - AltC predefines `__GNUC__` 14, `__GNUC_MINOR__` 2 and the other macros
   of gcc 14.2, so code that checks for GNU C takes its GNU paths.
-- Loops over arrays (`c[i] = a[i] * k + b[i]`, integer `sum += a[i]`) are
-  vectorized automatically, with a run-time check that the arrays do not
-  overlap; a few scalar iterations first align the stored array to the
-  vector size, and loop heads start on 16-byte boundaries. Floating-point
-  reductions stay scalar (as in gcc without `-ffast-math`).
+- Loops over arrays (`c[i] = a[i] * k + b[i]`, `sum += a[i]`, `s -= a[i]`)
+  are vectorized automatically, with a run-time check that the arrays do
+  not overlap; a few scalar iterations first align the stored array to the
+  vector size, and loop heads start on 16-byte boundaries. Loops with
+  conditions inside (`c[i] = a[i] > 0 ? a[i] : 0`, `if (a[i] > k) s +=
+  a[i]`, `&&`, `||`, `if`/`else`) are if-converted: comparisons become
+  masks and the results are blended. Floating-point reductions (`+`, `-`,
+  `*`) are vectorized only with `-ffast-math` (or `-fassociative-math`,
+  `-Ofast`), which also defines `__FAST_MATH__`.
+- Unwind tables: every function gets call frame information in
+  `.eh_frame` (and the linker builds `.eh_frame_hdr`), so `backtrace()`,
+  gdb, `pthread_cancel` cleanups and C++ exceptions work through AltC
+  code. The assembler turns `.cfi_*` directives into `.eh_frame` byte for
+  byte like GNU as; programs mixing C++ and AltC objects link with
+  `-lstdc++` (libgcc_s is added when needed).
+- `-g`: DWARF 4 debug information — the line table, the functions, and at
+  `-O0` the parameters, locals, globals and their types (structures,
+  bit-fields, arrays, pointers), so gdb can set breakpoints, step, show
+  values and backtraces. With optimization the lines and functions are
+  described but not the local variables, nor inlined calls. `-g` does not
+  change the generated code. The linker keeps the `.debug_*` sections of
+  all objects (gcc's DWARF 5 too), the assembler understands `.file`,
+  `.loc`, `.uleb128` and `.sleb128`, and `-S -g` emits `.file`/`.loc`.
 
 ## Project folder
 
@@ -111,7 +129,8 @@ subfolder are on the include path. `altc.json` can set:
   `asm goto`, local register variables (`register long r asm("r10")`) and
   file-scope `asm`.
 
-Not supported yet: debug information and unwind tables, AVX-512, MMX
+Not supported yet: DWARF descriptions of inlined calls and of local
+variables of optimized code, AVX-512, MMX
 (`__m64`), `__builtin_cpu_is` with processor names (only `"intel"` and
 `"amd"` are known; the others give 0).
 
@@ -162,7 +181,10 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
   registers. The two mix freely within a file.
 - The result is typically close to gcc `-O2` on scalar code, and close to
   `-O3` on simple array loops. `-O0` uses the stack machine without
-  register allocation; other `-O` levels are accepted and ignored.
+  register allocation (functions with vector values still go through the
+  IR, which alone compiles them); other `-O` levels are accepted and
+  ignored. `ALTC_TEST_FLAGS` runs the test suite with other flags, such as
+  `-O0 -g` or `-O2 -mavx2`.
 
 ## Tests
 

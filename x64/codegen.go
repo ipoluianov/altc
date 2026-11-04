@@ -14,6 +14,7 @@ var argGP = []Reg{RDI, RSI, RDX, RCX, R8, R9}
 
 // gen is the code generator of one translation unit
 type gen struct {
+	secOf    map[*Asm]*elf.Section // the sections of the code and assembly text
 	a        *Asm
 	obj      *elf.Object
 	prog     *cc.Program
@@ -49,6 +50,11 @@ type gen struct {
 	regSaved   []Reg           // registers saved in the prologue
 	regSaveOff int64           // their save area
 	noRegAlloc bool            // keep every local in the frame
+	fastMath   bool            // floating-point operations may be reassociated
+	debug      bool            // DWARF debug information
+	dbgFuncs   []dbgFunc       // the functions described in .debug_info
+	asmFiles   map[int]string  // .file entries of assembly text
+	usedIR     bool            // the last function was compiled by the IR backend
 	isa        ISA             // instruction set extensions of the function being compiled
 	baseISA    ISA             // those of the unit (command line)
 
@@ -83,6 +89,8 @@ type Options struct {
 	Listing    bool // produce GNU assembler text
 	NoRegAlloc bool // keep every local variable in the frame
 	ISA        ISA  // enabled instruction set extensions
+	FastMath   bool // floating-point operations may be reassociated
+	Debug      bool // DWARF debug information (line tables, functions, variables)
 }
 
 // Generate compiles a parsed program to an object
@@ -95,6 +103,8 @@ func GenerateWith(prog *cc.Program, name string, opts Options) (*Result, error) 
 	wantListing := opts.Listing
 	g := &gen{
 		noRegAlloc: opts.NoRegAlloc,
+		fastMath:   opts.FastMath,
+		debug:      opts.Debug,
 		isa:        opts.ISA,
 		baseISA:    opts.ISA,
 		a:          &Asm{SymPrefix: "t", AVX: opts.ISA.Has(ISAAVX)},
@@ -353,6 +363,9 @@ func (g *gen) run() (err error) {
 		}
 		g.compileFunction(ob, ob.Target)
 		s.Size = int64(len(g.a.Code)) - start
+		if g.debug {
+			g.dbgFuncs = append(g.dbgFuncs, dbgFunc{ob: ob, start: int(start), end: len(g.a.Code), frame: g.noRegAlloc && !g.usedIR})
+		}
 		if ob.LabelAddrs {
 			// symbols for labels whose addresses are stored in static data
 			cc.Walk(ob.Body, func(n *cc.Node) {
@@ -396,6 +409,11 @@ func (g *gen) run() (err error) {
 			s.Type, s.IFunc = elf.SymFunc, true
 		}
 	}
+	if err := g.ehFrame(syms); err != nil {
+		return err
+	}
+	g.asmLines()
+	g.debugSections(text, syms)
 	// constant pool
 	for _, c := range g.constSec {
 		off := alignTo(int64(len(g.rodata.Data)), c.align)

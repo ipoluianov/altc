@@ -272,7 +272,7 @@ func (g *gen) regFrame(offset int64) int64 {
 
 func (g *gen) saveVarRegs() {
 	for i, r := range g.regSaved {
-		g.a.Mov(8, M(RBP, int32(g.regSaveOff)+int32(8*i)), Q(r))
+		g.a.SaveReg(r, int32(g.regSaveOff)+int32(8*i))
 	}
 }
 

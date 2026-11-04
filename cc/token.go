@@ -62,6 +62,13 @@ func (t *Token) Pos() string {
 	return fmt.Sprintf("%s:%d:%d", t.File.Name, t.Line, t.Col)
 }
 
+// SourcePos is the place in the source file the token stands for (the
+// outermost macro invocation for tokens of macro expansions)
+func (t *Token) SourcePos() (*File, int32) {
+	l := t.loc()
+	return l.File, l.Line
+}
+
 // loc returns the token whose position should be reported: the place in
 // the source file where the outermost macro was invoked
 func (t *Token) loc() *Token {

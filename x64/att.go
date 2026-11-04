@@ -28,6 +28,11 @@ type TextEnv struct {
 	Consts map[string]int64
 	// FileName, when set, prefixes errors with file:line (assembler sources)
 	FileName string
+	// CFI records the .cfi_* directives (frame rules) and the .loc line
+	// information on the section's Asm
+	CFI bool
+	// Files are the numbered .file entries of the line information
+	Files map[int]string
 }
 
 // TextLabel is a named label of assembly text
@@ -66,6 +71,20 @@ type textAsm struct {
 	trial    bool         // trial pass: record the jumps
 	branchN  int
 	branches []branchInfo
+
+	// LEB128 values of label differences not known when they are met:
+	// their sizes come from the trial passes too
+	lebSize map[int]int
+	lebN    int
+	lebs    []lebInfo
+}
+
+// lebInfo is a .uleb128/.sleb128 label difference of a trial pass
+type lebInfo struct {
+	ord        int
+	lbl, minus labelRef
+	v          int64
+	signed     bool
 }
 
 type secEntry struct {
@@ -79,8 +98,8 @@ func AssembleText(env *TextEnv, text string) error {
 	if env.Labels == nil {
 		env.Labels = map[string]*TextLabel{}
 	}
-	short := relaxBranches(env, text)
-	_, err := assemblePass(env, text, short, false)
+	short, lebSize := relaxBranches(env, text)
+	_, _, err := assemblePass(env, text, short, lebSize, false)
 	return err
 }
 
@@ -94,8 +113,11 @@ type branchInfo struct {
 }
 
 // relaxBranches chooses the jumps that can be short: start with all of
-// them short and lengthen those out of range until the layout is stable
-func relaxBranches(env *TextEnv, text string) map[int]bool {
+// them short and lengthen those out of range until the layout is stable;
+// the sizes of forward LEB128 label differences are settled alongside
+func relaxBranches(env *TextEnv, text string) (map[int]bool, map[int]int) {
+	lebSize := map[int]int{}
+	var lebs []lebInfo
 	trial := func(short map[int]bool) ([]branchInfo, bool) {
 		ext := &Asm{}
 		ext.NewLabel()
@@ -116,23 +138,41 @@ func relaxBranches(env *TextEnv, text string) map[int]bool {
 		for name := range env.Labels {
 			tenv.Labels[name] = &TextLabel{A: ext, L: 0, Defined: true}
 		}
-		infos, err := assemblePass(tenv, text, short, true)
+		infos, l, err := assemblePass(tenv, text, short, lebSize, true)
+		lebs = l
 		return infos, err == nil
 	}
+	// lebSettle updates the LEB128 sizes from the last trial layout
+	lebSettle := func() bool {
+		changed := false
+		for _, l := range lebs {
+			p1, p2 := l.lbl.a.labels[l.lbl.l], l.minus.a.labels[l.minus.l]
+			if p1 < 0 || p2 < 0 {
+				continue
+			}
+			n := lebLen(int64(p1-p2)+l.v, l.signed)
+			if lebSize[l.ord] != n {
+				lebSize[l.ord] = n
+				changed = true
+			}
+		}
+		return changed
+	}
 	infos, ok := trial(nil)
-	if !ok || len(infos) == 0 {
-		return nil
+	if !ok || len(infos) == 0 && len(lebs) == 0 {
+		return nil, nil
 	}
 	short := map[int]bool{}
 	for _, b := range infos {
 		short[b.ord] = true
 	}
+	lebSettle()
 	for iter := 0; iter < 32; iter++ {
 		infos, ok = trial(short)
 		if !ok {
-			return nil
+			return nil, lebSize
 		}
-		changed := false
+		changed := lebSettle()
 		for _, b := range infos {
 			if !short[b.ord] {
 				continue
@@ -144,18 +184,26 @@ func relaxBranches(env *TextEnv, text string) map[int]bool {
 			}
 		}
 		if !changed {
-			return short
+			return short, lebSize
 		}
 	}
-	return nil
+	return nil, lebSize
 }
 
-func assemblePass(env *TextEnv, text string, short map[int]bool, trial bool) ([]branchInfo, error) {
+// lebLen is the size of the LEB128 encoding of v
+func lebLen(v int64, signed bool) int {
+	if signed {
+		return len(appendSLEB(nil, v))
+	}
+	return len(appendULEB(nil, uint64(v)))
+}
+
+func assemblePass(env *TextEnv, text string, short map[int]bool, lebSize map[int]int, trial bool) ([]branchInfo, []lebInfo, error) {
 	t := &textAsm{env: env, numBack: map[string]labelRef{}, numFwd: map[string]labelRef{}, defNames: map[string]bool{},
-		short: short, trial: trial}
+		short: short, trial: trial, lebSize: lebSize}
 	a, err := env.Section(".text", "")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	t.a, t.secName = a, ".text"
 	t.prev = secEntry{t.secName, t.a}
@@ -204,15 +252,15 @@ func assemblePass(env *TextEnv, text string, short map[int]bool, trial bool) ([]
 				if file == "" {
 					file = env.FileName
 				}
-				return nil, fmt.Errorf("%s:%d: %v", file, st.line, err)
+				return nil, nil, fmt.Errorf("%s:%d: %v", file, st.line, err)
 			}
-			return nil, fmt.Errorf("%v (in '%s')", err, strings.TrimSpace(st.text))
+			return nil, nil, fmt.Errorf("%v (in '%s')", err, strings.TrimSpace(st.text))
 		}
 	}
 	for n := range t.numFwd {
-		return nil, fmt.Errorf("undefined local label '%sf'", n)
+		return nil, nil, fmt.Errorf("undefined local label '%sf'", n)
 	}
-	return t.branches, nil
+	return t.branches, t.lebs, nil
 }
 
 // asmStmt is a statement of assembly text with its position
@@ -2823,6 +2871,8 @@ func (t *textAsm) directive(name, rest string) error {
 		return t.dataDir(rest, 4)
 	case ".quad", ".8byte":
 		return t.dataDir(rest, 8)
+	case ".uleb128", ".sleb128":
+		return t.lebDir(rest, name == ".sleb128")
 	case ".ascii", ".asciz", ".string":
 		for _, part := range splitTop(rest) {
 			s, err := unquoteAsm(part)
@@ -2971,11 +3021,27 @@ func (t *textAsm) directive(name, rest string) error {
 			return t.env.Symbol(name, splitTop(rest))
 		}
 		return nil
-	case ".att_syntax", ".code64", ".file", ".loc", ".ident", ".cfi_startproc", ".cfi_endproc",
-		".cfi_def_cfa_offset", ".cfi_offset", ".cfi_def_cfa_register", ".cfi_def_cfa", ".cfi_adjust_cfa_offset",
-		".cfi_rel_offset", ".cfi_restore", ".cfi_remember_state", ".cfi_restore_state", ".cfi_signal_frame",
-		".cfi_undefined", ".cfi_same_value", ".cfi_register", ".cfi_escape", ".cfi_sections", ".cfi_personality",
-		".cfi_lsda", ".nops", ".symver", ".note", ".addrsig", ".addrsig_sym":
+	case ".cfi_startproc", ".cfi_endproc", ".cfi_def_cfa_offset", ".cfi_offset", ".cfi_def_cfa_register", ".cfi_def_cfa",
+		".cfi_adjust_cfa_offset", ".cfi_rel_offset", ".cfi_restore", ".cfi_remember_state", ".cfi_restore_state",
+		".cfi_signal_frame", ".cfi_undefined", ".cfi_same_value", ".cfi_register", ".cfi_escape", ".cfi_sections",
+		".cfi_personality", ".cfi_lsda", ".cfi_val_offset", ".cfi_label", ".cfi_return_column", ".cfi_window_save",
+		".cfi_val_encoded_addr", ".cfi_negate_ra_state":
+		// frame rules: recorded only for file-scope assembly (not in
+		// inline asm nor in the trial passes of jump relaxation)
+		if !t.env.CFI {
+			return nil
+		}
+		var args []string
+		if strings.TrimSpace(rest) != "" {
+			args = splitTop(rest)
+		}
+		return t.a.CFIDirective(name, args, t.constExpr)
+	case ".file", ".loc":
+		if !t.env.CFI {
+			return nil
+		}
+		return t.lineDirective(name, rest)
+	case ".att_syntax", ".code64", ".ident", ".nops", ".symver", ".note", ".addrsig", ".addrsig_sym":
 		if name == ".nops" {
 			n, err := t.constExpr(rest)
 			if err != nil {
@@ -3162,4 +3228,91 @@ func (s *secSim) apply(stmt string, flags map[string]string) {
 	case ".previous":
 		s.prev, s.cur = s.cur, s.prev
 	}
+}
+
+// lebDir emits .uleb128/.sleb128 values: constants, or differences of
+// labels (forward ones take the size settled by the trial passes and are
+// written when the layout is final)
+func (t *textAsm) lebDir(rest string, signed bool) error {
+	for _, e := range splitTop(rest) {
+		v, err := t.expr(e)
+		if err != nil {
+			return err
+		}
+		if v.isConst() {
+			if signed {
+				t.a.b(appendSLEB(nil, v.v)...)
+			} else {
+				t.a.b(appendULEB(nil, uint64(v.v))...)
+			}
+			continue
+		}
+		if v.lbl == nil || v.minus == nil || v.lbl.a != v.minus.a {
+			return fmt.Errorf("LEB128 value of '%s' is not a constant or a difference of labels in one section", strings.TrimSpace(e))
+		}
+		ord := t.lebN
+		t.lebN++
+		n := max(t.lebSize[ord], 1)
+		if t.trial {
+			t.lebs = append(t.lebs, lebInfo{ord: ord, lbl: *v.lbl, minus: *v.minus, v: v.v, signed: signed})
+		} else {
+			kind := byte(1)
+			if signed {
+				kind = 2
+			}
+			t.a.fixups = append(t.a.fixups, fixup{at: len(t.a.Code), size: n, diff: true, la: v.lbl.a, label: v.lbl.l, minus: v.minus.l, addend: v.v, leb: kind})
+		}
+		t.a.b(make([]byte, n)...)
+	}
+	return nil
+}
+
+// lineDirective handles .file N "name" and .loc N line [column] [options]
+func (t *textAsm) lineDirective(name, rest string) error {
+	rest = strings.TrimSpace(rest)
+	num, after := splitWord(rest)
+	n, err := strconv.Atoi(num)
+	if err != nil {
+		return nil // .file "name": the source file name only
+	}
+	if name == ".file" {
+		var parts []string
+		for s := strings.TrimSpace(after); strings.HasPrefix(s, "\""); s = strings.TrimSpace(s) {
+			end := 1
+			for end < len(s) && s[end] != '"' {
+				if s[end] == '\\' {
+					end++
+				}
+				end++
+			}
+			if end >= len(s) {
+				return fmt.Errorf("bad .file directive")
+			}
+			p, err := unquoteAsm(s[:end+1])
+			if err != nil {
+				return err
+			}
+			parts = append(parts, p)
+			s = s[end+1:]
+		}
+		if len(parts) == 0 {
+			return fmt.Errorf("bad .file directive")
+		}
+		path := parts[len(parts)-1]
+		if len(parts) > 1 && !strings.HasPrefix(path, "/") {
+			path = strings.TrimSuffix(parts[0], "/") + "/" + path
+		}
+		if t.env.Files == nil {
+			t.env.Files = map[int]string{}
+		}
+		t.env.Files[n] = path
+		return nil
+	}
+	ln, _ := splitWord(strings.TrimSpace(after))
+	line, err := strconv.Atoi(ln)
+	if err != nil {
+		return fmt.Errorf("bad .loc directive")
+	}
+	t.a.locs = append(t.a.locs, locRec{pos: len(t.a.Code), file: n, line: line})
+	return nil
 }

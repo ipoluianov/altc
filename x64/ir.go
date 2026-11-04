@@ -227,7 +227,8 @@ type irValue struct {
 	Call   *irCall
 	Block  *irBlock
 
-	fwd   *irValue // replacement of a removed value
+	tok   *cc.Token // the source position (debug line tables)
+	fwd   *irValue  // replacement of a removed value
 	uses  int
 	fused bool // a comparison that only sets flags for its branch
 	vol   bool // a volatile load
@@ -288,8 +289,10 @@ type irFunc struct {
 	RetType irType
 	VaSlot  *irSlot // register save area of a variadic function
 
-	isa         ISA  // instruction set extensions for the function
-	noVectorize bool // no loop vectorization
+	isa         ISA       // instruction set extensions for the function
+	noVectorize bool      // no loop vectorization
+	fastMath    bool      // floating-point reductions may be reassociated
+	curTok      *cc.Token // the statement being lowered (the position of new values)
 	nextID      int
 	nextBlk     int
 }
@@ -309,7 +312,7 @@ func (f *irFunc) newBlock() *irBlock {
 }
 
 func (f *irFunc) newValue(b *irBlock, op irOp, t irType, args ...*irValue) *irValue {
-	v := &irValue{ID: f.nextID, Op: op, Type: t, Args: args, Block: b}
+	v := &irValue{ID: f.nextID, Op: op, Type: t, Args: args, Block: b, tok: f.curTok}
 	f.nextID++
 	return v
 }

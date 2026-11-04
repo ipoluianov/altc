@@ -257,7 +257,15 @@ func gccMode(args []string) int {
 			return 1
 		case a == "-O0":
 			cfg.NoRegAlloc = true
-		case strings.HasPrefix(a, "-m") && a != "-m64":
+		case a == "-g0":
+			cfg.Debug = false
+		case a == "-g" || a == "-ggdb" || a == "-g1" || a == "-g2" || a == "-g3" || a == "-ggdb3" || strings.HasPrefix(a, "-gdwarf"):
+			cfg.Debug = true
+		case strings.HasPrefix(a, "-m") && a != "-m64", a == "-Ofast", strings.HasPrefix(a, "-f") && strings.HasSuffix(a, "-math"),
+			a == "-funsafe-math-optimizations", a == "-fno-unsafe-math-optimizations":
+			if a == "-Ofast" {
+				cfg.NoRegAlloc = false
+			}
 			if _, err := cfg.MachineFlag(a); err != nil {
 				fmt.Fprintf(os.Stderr, "altc: %v\n", err)
 				return 2

@@ -112,10 +112,7 @@ func compareWithGas(t *testing.T, gasObj string, obj *aelf.Object) {
 		}
 	}
 	for _, s := range f.Sections {
-		if s.Name == ".eh_frame" || s.Name == ".rela.eh_frame" {
-			continue // .cfi directives are not turned into unwind tables
-		}
-		if s.Type == elf.SHT_PROGBITS && s.Flags&elf.SHF_ALLOC != 0 && s.Size > 0 {
+		if (s.Type == elf.SHT_PROGBITS || s.Name == ".eh_frame") && s.Flags&elf.SHF_ALLOC != 0 && s.Size > 0 {
 			want, _ := s.Data()
 			if !bytes.Equal(ours[s.Name], want) {
 				t.Errorf("section %s differs from GNU as", s.Name)
@@ -125,7 +122,7 @@ func compareWithGas(t *testing.T, gasObj string, obj *aelf.Object) {
 			continue
 		}
 		target := f.Sections[s.Info]
-		if target.Flags&elf.SHF_ALLOC == 0 || target.Name == ".eh_frame" {
+		if target.Flags&elf.SHF_ALLOC == 0 {
 			continue
 		}
 		raw, _ := s.Data()

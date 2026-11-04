@@ -6,18 +6,26 @@ import (
 	"os"
 )
 
-// Loop vectorization. A loop whose body is one block, with a unit-step
-// induction variable, loads and stores of consecutive elements a[i] and
-// element-wise arithmetic, gets a vector copy processing W bytes per
-// iteration (16 with SSE, 32 with AVX/AVX2). The original loop then runs
-// the remaining iterations, at least one, so values used after the loop
-// still come from it. Integer reductions (sum += a[i], ^=, |=, &=) keep a
-// vector of partial results; floating-point reductions are left scalar
-// because reassociating them changes the result. Before the vector loop,
-// a run-time test checks that the stored arrays do not overlap the others.
-// A scalar copy of the loop first runs the iterations up to the point
-// where the first stored array (or the first loaded one) is aligned to the
-// vector size, so its vector accesses do not cross cache lines.
+// Loop vectorization. A loop with a unit-step induction variable, loads
+// and stores of consecutive elements a[i] and element-wise arithmetic gets
+// a vector copy processing W bytes per iteration (16 with SSE, 32 with
+// AVX/AVX2). The original loop then runs the remaining iterations, at
+// least one, so values used after the loop still come from it. Integer
+// reductions (sum += a[i], -=, ^=, |=, &=) keep a vector of partial
+// results; floating-point reductions (+, -, *) are vectorized only with
+// -ffast-math because reassociating them changes the result. Before the
+// vector loop, a run-time test checks that the stored arrays do not
+// overlap the others.
+//
+// The body may branch (if, ?:, && and || without side effects in the
+// branches): it is if-converted. Comparisons become vector masks, the
+// values joining at a phi are blended with the masks of the incoming
+// edges, and a reduction updated on one path adds the identity on the
+// others. Loads and stores must be in blocks run by every iteration.
+//
+// For a one-block loop, a scalar copy first runs the iterations up to the
+// point where the first stored array (or the first loaded one) is aligned
+// to the vector size, so its vector accesses do not cross cache lines.
 
 type vecAccess struct {
 	v     *irValue // the load or store
@@ -28,14 +36,21 @@ type vecAccess struct {
 }
 
 type vecReduction struct {
-	phi *irValue
-	upd *irValue // phi op x
-	x   *irValue
-	op  irOp
+	phi  *irValue
+	upd  *irValue // phi op x
+	x    *irValue
+	op   irOp
+	join *irValue // the phi choosing upd or phi when the update is conditional
+	edge int      // the incoming edge of join that carries upd (the others carry phi)
 }
 
 type vecLoop struct {
 	h, pre, exit *irBlock
+	latch        *irBlock          // the block branching back to h or out
+	blocks       []*irBlock        // the body in topological order, h first
+	inBody       map[*irBlock]bool // blocks of the body
+	uncond       map[*irBlock]bool // blocks run by every iteration
+	order        []*irValue        // body values in order (phis of inner blocks included)
 	iv, ivNext   *irValue
 	cond         *irValue
 	limit        *irValue // the bound the induction variable is compared with
@@ -45,6 +60,7 @@ type vecLoop struct {
 	stores       []vecAccess
 	reductions   []vecReduction
 	accesses     map[*irValue]vecAccess
+	masks        map[*irValue]bool // comparisons controlling branches of the body
 	skip         map[*irValue]bool // values not copied into the vector loop
 	hasInt       bool              // integer element operations (256 bits need AVX2)
 }
@@ -68,50 +84,218 @@ func (f *irFunc) vectorize() bool {
 	return changed
 }
 
-// inLoop tells whether v is computed inside the loop block
-func (lp *vecLoop) inLoop(v *irValue) bool { return v.Block == lp.h }
+// inLoop tells whether v is computed inside the loop body
+func (lp *vecLoop) inLoop(v *irValue) bool { return lp.inBody[v.Block] }
+
+// loopBody finds the blocks of the loop headed by h: an acyclic body from
+// h to the latch, which branches back to h or to the exit. It fails for
+// other exits, inner loops and edges back to h from other blocks.
+func (lp *vecLoop) loopBody(h *irBlock) bool {
+	const maxBlocks = 16
+	reached := map[*irBlock]bool{h: true}
+	stack := []*irBlock{h}
+	for len(stack) > 0 {
+		b := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if b == lp.latch {
+			continue
+		}
+		if b.Kind != bJump && b.Kind != bBranch || b.Kind == bBranch && b.Succs[0] == b.Succs[1] {
+			return false
+		}
+		for _, s := range b.Succs {
+			if s == h {
+				return false // a continue edge or an inner loop
+			}
+			if !reached[s] {
+				if len(reached) == maxBlocks {
+					return false
+				}
+				reached[s] = true
+				stack = append(stack, s)
+			}
+		}
+	}
+	if !reached[lp.latch] {
+		return false
+	}
+	// every block must lead to the latch (no other exit)
+	toLatch := map[*irBlock]bool{lp.latch: true}
+	for changed := true; changed; {
+		changed = false
+		for b := range reached {
+			if toLatch[b] || b == lp.latch {
+				continue
+			}
+			for _, s := range b.Succs {
+				if toLatch[s] {
+					toLatch[b], changed = true, true
+					break
+				}
+			}
+		}
+	}
+	for b := range reached {
+		if !toLatch[b] {
+			return false
+		}
+		if b != h {
+			for _, p := range b.Preds {
+				if !reached[p] {
+					return false // entered from outside
+				}
+			}
+		}
+	}
+	// topological order (Kahn), without the back edge
+	indeg := map[*irBlock]int{}
+	for b := range reached {
+		if b != h {
+			indeg[b] = len(b.Preds)
+		}
+	}
+	ready := []*irBlock{h}
+	for len(ready) > 0 {
+		b := ready[0]
+		ready = ready[1:]
+		lp.blocks = append(lp.blocks, b)
+		if b == lp.latch {
+			continue
+		}
+		for _, s := range b.Succs {
+			indeg[s]--
+			if indeg[s] == 0 {
+				ready = append(ready, s)
+			}
+		}
+	}
+	if len(lp.blocks) != len(reached) || lp.blocks[len(lp.blocks)-1] != lp.latch {
+		return false // a cycle inside the body
+	}
+	lp.inBody = reached
+	// the blocks run by every iteration: those dominating the latch
+	dom := map[*irBlock]map[*irBlock]bool{}
+	for _, b := range lp.blocks {
+		var d map[*irBlock]bool
+		if b != h {
+			for _, p := range b.Preds {
+				if d == nil {
+					d = map[*irBlock]bool{}
+					for x := range dom[p] {
+						d[x] = true
+					}
+					continue
+				}
+				for x := range d {
+					if !dom[p][x] {
+						delete(d, x)
+					}
+				}
+			}
+		}
+		if d == nil {
+			d = map[*irBlock]bool{}
+		}
+		d[b] = true
+		dom[b] = d
+	}
+	lp.uncond = dom[lp.latch]
+	for _, b := range lp.blocks {
+		if b != h {
+			lp.order = append(lp.order, b.Phis...)
+		}
+		lp.order = append(lp.order, b.Instrs...)
+	}
+	return true
+}
+
+// reductionUpdate matches phi op x for a reduction operation
+func (f *irFunc) reductionUpdate(phi, next *irValue) (*irValue, bool) {
+	switch next.Op {
+	case opAdd, opXor, opOr, opAnd, opSub, opFAdd, opFSub, opFMul:
+	default:
+		return nil, false
+	}
+	float := next.Type.isFloat()
+	if next.Type.isVec() || float != (next.Op == opFAdd || next.Op == opFSub || next.Op == opFMul) || float && !f.fastMath {
+		return nil, false
+	}
+	if next.Args[0] == phi {
+		return next.Args[1], next.Args[1] != phi
+	}
+	// phi - x only, not x - phi
+	if next.Args[1] != phi || next.Op == opSub || next.Op == opFSub {
+		return nil, false
+	}
+	return next.Args[0], true
+}
+
+// isCompare tells whether v is a comparison with a vector form
+func isCompare(op irOp) bool {
+	return op >= opEq && op <= opUGe || op >= opFEq && op <= opFGe
+}
 
 // vectorLoop checks that h is a vectorizable loop
 func (f *irFunc) vectorLoop(h *irBlock) *vecLoop {
-	if h.Kind != bBranch || len(h.Preds) != 2 || len(h.Succs) != 2 || h.Succs[0] != h {
+	if len(h.Preds) != 2 {
 		return nil
 	}
-	lp := &vecLoop{h: h, exit: h.Succs[1], accesses: map[*irValue]vecAccess{}, skip: map[*irValue]bool{}}
-	if lp.exit == h {
+	lp := &vecLoop{h: h, accesses: map[*irValue]vecAccess{}, skip: map[*irValue]bool{}, masks: map[*irValue]bool{}}
+	// the back edge comes from the latch, the other edge from the preheader
+	pi := -1
+	for i, p := range h.Preds {
+		if p.Kind == bBranch && p.Succs[0] == h && p.Succs[1] != h {
+			if pi >= 0 {
+				return nil
+			}
+			pi = 1 - i
+		}
+	}
+	if pi < 0 {
 		return nil
 	}
-	pi := 0
-	if h.Preds[0] == h {
-		pi = 1
-	}
-	lp.pre = h.Preds[pi]
-	if lp.pre == h {
+	lp.pre, lp.latch = h.Preds[pi], h.Preds[1-pi]
+	lp.exit = lp.latch.Succs[1]
+	if lp.pre == h || lp.pre == lp.latch || !lp.loopBody(h) || lp.inBody[lp.exit] || lp.inBody[lp.pre] {
 		return nil
 	}
 	// the induction variable and the reductions
 	for _, phi := range h.Phis {
-		init, next := phi.Args[pi], phi.Args[1-pi]
-		_ = init
-		if next.Op == opAdd && next.Args[0] == phi && next.Block == h {
-			if c, ok := constOf(next.Args[1]); ok && c == 1 && lp.iv == nil && !next.Type.inXMM() {
+		next := phi.Args[1-pi]
+		if !lp.inLoop(next) {
+			return nil
+		}
+		if next.Op == opAdd && next.Args[0] == phi {
+			if c, ok := constOf(next.Args[1]); ok && c == 1 && lp.iv == nil && !next.Type.inXMM() && lp.uncond[next.Block] {
 				lp.iv, lp.ivNext = phi, next
 				continue
 			}
 		}
-		switch next.Op {
-		case opAdd, opXor, opOr, opAnd:
-			if next.Block != h || next.Type.inXMM() {
-				return nil
-			}
-			x := next.Args[1]
-			if next.Args[0] != phi {
-				if next.Args[1] != phi {
-					return nil
-				}
-				x = next.Args[0]
-			}
+		if x, ok := f.reductionUpdate(phi, next); ok {
 			lp.reductions = append(lp.reductions, vecReduction{phi: phi, upd: next, x: x, op: next.Op})
 			continue
+		}
+		// a conditional update: join = phi(..., phi op x, ..., phi, ...)
+		if next.Op == opPhi && next.Block != h {
+			// one incoming edge carries the update, the others phi itself
+			e := -1
+			for i, a := range next.Args {
+				if a != phi {
+					if e >= 0 {
+						e = -2
+						break
+					}
+					e = i
+				}
+			}
+			if e >= 0 && lp.inLoop(next.Args[e]) {
+				u := next.Args[e]
+				if x, ok := f.reductionUpdate(phi, u); ok {
+					lp.reductions = append(lp.reductions, vecReduction{phi: phi, upd: u, x: x, op: u.Op, join: next, edge: e})
+					lp.skip[next] = true
+					continue
+				}
+			}
 		}
 		return nil
 	}
@@ -119,8 +303,8 @@ func (f *irFunc) vectorLoop(h *irBlock) *vecLoop {
 		return nil
 	}
 	// the exit test: ivNext < limit (or !=), true stays in the loop
-	c := h.Ctrl
-	if c.Block != h || len(c.Args) != 2 || c.Args[0] != lp.ivNext || lp.inLoop(c.Args[1]) {
+	c := lp.latch.Ctrl
+	if c == nil || c.Block != lp.latch || len(c.Args) != 2 || c.Args[0] != lp.ivNext || lp.inLoop(c.Args[1]) {
 		return nil
 	}
 	switch c.Op {
@@ -133,15 +317,44 @@ func (f *irFunc) vectorLoop(h *irBlock) *vecLoop {
 	for _, r := range lp.reductions {
 		lp.skip[r.upd] = true
 	}
+	// the conditions of the branches inside the body
+	for _, b := range lp.blocks {
+		if b == lp.latch || b.Kind != bBranch {
+			continue
+		}
+		if b.Ctrl == nil || b.Ctrl.Block != b || !isCompare(b.Ctrl.Op) {
+			return nil
+		}
+		lp.masks[b.Ctrl] = true
+	}
+	// comparisons are only used by their branch
+	for _, v := range lp.order {
+		for _, a := range v.Args {
+			if lp.masks[a] {
+				return nil
+			}
+		}
+	}
 
 	// the body
-	for _, v := range h.Instrs {
+	for _, v := range lp.order {
 		if lp.skip[v] {
 			continue
 		}
 		switch {
+		case v.Op == opPhi:
+			if len(v.Args) < 2 || len(v.Args) != len(v.Block.Preds) || !lp.setElem(v.Type) {
+				return nil
+			}
+			for _, a := range v.Args {
+				if !lp.vectorizable(a) {
+					return nil
+				}
+			}
 		case v.Op == opLoad || v.Op == opStore:
-			if v.Mem != nil {
+			// stores only where every iteration runs; conditional loads
+			// are checked below
+			if v.Mem != nil || v.Op == opStore && !lp.uncond[v.Block] {
 				return nil
 			}
 			addr := v.Args[0]
@@ -167,6 +380,14 @@ func (f *irFunc) vectorLoop(h *irBlock) *vecLoop {
 				}
 			}
 		case v.Op == opConst:
+		case lp.masks[v]:
+			t := v.Args[0].Type
+			if !lp.setElem(t) || !lp.vectorizable(v.Args[0]) || !lp.vectorizable(v.Args[1]) {
+				return nil
+			}
+			if t == iI64 && !f.isa.Has(ISASSE42) && !(v.Op == opEq || v.Op == opNe) || t == iI64 && !f.isa.Has(ISASSE41) {
+				return nil // pcmpgtq needs SSE4.2, pcmpeqq SSE4.1
+			}
 		case lp.addressPart(v):
 			lp.skip[v] = true
 		case v.Op.pure():
@@ -184,6 +405,24 @@ func (f *irFunc) vectorLoop(h *irBlock) *vecLoop {
 	}
 	for _, r := range lp.reductions {
 		if !lp.setElem(r.upd.Type) || !lp.vectorizable(r.x) {
+			return nil
+		}
+	}
+	// a conditional load is run for every element only when an
+	// unconditional access reads or writes the same elements: it cannot
+	// fault then
+	for _, l := range lp.loads {
+		if lp.uncond[l.v.Block] {
+			continue
+		}
+		safe := false
+		for _, o := range append(append([]vecAccess(nil), lp.loads...), lp.stores...) {
+			if lp.uncond[o.v.Block] && o.base == l.base && o.off == l.off && o.inv == l.inv && o.shift == l.shift {
+				safe = true
+				break
+			}
+		}
+		if !safe {
 			return nil
 		}
 	}
@@ -238,9 +477,12 @@ func (lp *vecLoop) vectorizable(v *irValue) bool {
 		return v.Type.size() == lp.esize && (v.Type == iI32 || v.Type == iI64 || v.Type.isFloat())
 	}
 	for _, r := range lp.reductions {
-		if v == r.phi || v == r.upd {
+		if v == r.phi || v == r.upd || v == r.join {
 			return false
 		}
+	}
+	if lp.masks[v] {
+		return false
 	}
 	return !lp.skip[v] || v.Op == opConst
 }
@@ -435,13 +677,14 @@ func vecMnemonic(v *irValue, isa ISA) string {
 // ---- building the vector loop ----
 
 type vecBuilder struct {
-	f   *irFunc
-	b   *irBlock
-	lp  *vecLoop
-	vt  irType
-	vf  int64
-	pre *irBlock // where invariants are broadcast
-	vm  map[*irValue]*irValue
+	f      *irFunc
+	b      *irBlock
+	lp     *vecLoop
+	vt     irType
+	vf     int64
+	pre    *irBlock // where invariants are broadcast
+	vm     map[*irValue]*irValue
+	bmasks map[*irBlock]*irValue // masks of the conditional blocks
 }
 
 func (vb *vecBuilder) add(b *irBlock, op irOp, t irType, args ...*irValue) *irValue {
@@ -581,17 +824,79 @@ func (vb *vecBuilder) vectorOp(v *irValue) *irValue {
 	return vb.vinsn(b, vb.vt, mn, vb.operand(v.Args[0]), vb.operand(v.Args[1]))
 }
 
+// combineOp is the operation joining partial results of a reduction:
+// differences are accumulated as negative sums
+func combineOp(op irOp) irOp {
+	switch op {
+	case opSub:
+		return opAdd
+	case opFSub:
+		return opFAdd
+	}
+	return op
+}
+
+// redMnemonic names the vector instruction of a reduction operation
+func (vb *vecBuilder) redMnemonic(op irOp) string {
+	k := vb.elemKind()
+	switch op {
+	case opAdd:
+		return "padd" + k
+	case opSub:
+		return "psub" + k
+	case opXor:
+		return "pxor"
+	case opOr:
+		return "por"
+	case opAnd:
+		return "pand"
+	case opFAdd:
+		return "add" + k
+	case opFSub:
+		return "sub" + k
+	case opFMul:
+		return "mul" + k
+	}
+	panic("vectorize: reduction operation")
+}
+
+// redIdentity is the initial vector of partial results
+func (vb *vecBuilder) redIdentity(op irOp) []byte {
+	d := make([]byte, vb.vt.size())
+	switch {
+	case op == opAnd:
+		for k := range d {
+			d[k] = 0xFF
+		}
+	case op == opFMul && vb.lp.elem == iF32:
+		d = splat(vb.vt, []byte{0, 0, 0x80, 0x3F})
+	case op == opFMul:
+		d = splat(vb.vt, []byte{0, 0, 0, 0, 0, 0, 0xF0, 0x3F})
+	}
+	return d
+}
+
 // reduceVector combines the lanes of a vector of partial results
 func (vb *vecBuilder) reduceVector(b *irBlock, acc *irValue, op irOp) *irValue {
-	mn := map[irOp]string{opAdd: "padd" + vb.elemKind(), opXor: "pxor", opOr: "por", opAnd: "pand"}[op]
+	mn := vb.redMnemonic(combineOp(op))
 	v := acc
 	if vb.vt == iV256 {
-		hi := vb.vinsnImm(b, iV128, "extracti128", 1, v)
+		ext := "extracti128"
+		if vb.lp.elem.isFloat() {
+			ext = "extractf128"
+		}
+		hi := vb.vinsnImm(b, iV128, ext, 1, v)
 		lo := vb.vinsn(b, iV128, "", v)
 		v = vb.vinsn(b, iV128, mn, lo, hi)
 	}
 	v = vb.vinsn(b, iV128, mn, v, vb.vinsnImm(b, iV128, "pshufd", 0x4E, v))
-	if vb.lp.elem == iI32 {
+	switch vb.lp.elem {
+	case iF32:
+		v = vb.vinsn(b, iV128, mn, v, vb.vinsnImm(b, iV128, "pshufd", 0xB1, v))
+		return vb.vinsn(b, iF32, "", v)
+	case iF64:
+		return vb.vinsn(b, iF64, "", v)
+	case iI32:
 		v = vb.vinsn(b, iV128, mn, v, vb.vinsnImm(b, iV128, "pshufd", 0xB1, v))
 		return vb.vinsn(b, iI32, "movd", v)
 	}
@@ -671,7 +976,7 @@ func (f *irFunc) buildVectorLoop(lp *vecLoop) {
 		pa = lp.stores
 	}
 	peel := vb.iconst(check, iI64, 0) // no arrays: nothing to align
-	if len(pa) > 0 {
+	if len(pa) > 0 && len(lp.blocks) == 1 {
 		neg := vb.add(check, opSub, iI64, peel, lo(pa[0], s64))
 		bytes := vb.add(check, opAnd, iI64, neg, vb.iconst(check, iI64, int64(w-1)))
 		peel = vb.add(check, opShr, iI64, bytes, vb.iconst(check, iI64, pa[0].shift))
@@ -707,7 +1012,17 @@ func (f *irFunc) buildVectorLoop(lp *vecLoop) {
 	// the peeled iterations
 	pguard := f.newBlock()
 	check.Succs = []*irBlock{pguard, rem}
-	pjoin := f.peelLoop(lp, vb, pguard, check, peel, vstart)
+	pjoin := pguard
+	var redInit []*irValue
+	if len(lp.blocks) == 1 {
+		pjoin = f.peelLoop(lp, vb, pguard, check, peel, vstart)
+		redInit = pjoin.Phis
+	} else {
+		pguard.Preds = []*irBlock{check}
+		for _, r := range lp.reductions {
+			redInit = append(redInit, r.phi.Args[pi])
+		}
+	}
 
 	// the vector preheader and loop
 	vpre.Preds = []*irBlock{pjoin}
@@ -728,8 +1043,16 @@ func (f *irFunc) buildVectorLoop(lp *vecLoop) {
 		vaccs = append(vaccs, phi)
 		vb.vm[r.phi] = phi
 	}
-	for _, v := range h.Instrs {
+	for _, v := range lp.order {
 		if lp.skip[v] || v.Op == opConst {
+			continue
+		}
+		switch {
+		case v.Op == opPhi:
+			vb.vm[v] = vb.blend(v)
+			continue
+		case lp.masks[v]:
+			vb.vm[v] = vb.compare(v)
 			continue
 		}
 		switch v.Op {
@@ -748,20 +1071,19 @@ func (f *irFunc) buildVectorLoop(lp *vecLoop) {
 	}
 	var vupd []*irValue
 	for i, r := range lp.reductions {
-		mn := map[irOp]string{opAdd: "padd" + vb.elemKind(), opXor: "pxor", opOr: "por", opAnd: "pand"}[r.op]
-		vupd = append(vupd, vb.vinsn(vbody, vt, mn, vaccs[i], vb.operand(r.x)))
+		x := vb.operand(r.x)
+		if r.join != nil {
+			// the identity on the paths that do not update
+			j := r.join.Block
+			x = vb.selectMask(vb.edgeMask(j.Preds[r.edge], j), x, vb.vconst(vpre, vb.redIdentity(r.op)))
+		}
+		vupd = append(vupd, vb.vinsn(vbody, vt, vb.redMnemonic(r.op), vaccs[i], x))
 	}
 	vnext := vb.add(vbody, opAdd, ivt, vi, vb.iconst(vbody, ivt, vf))
 	vbody.Ctrl = vb.add(vbody, opNe, iI32, vnext, vecEnd)
 	vi.Args = []*irValue{vstart, vnext}
 	for i, r := range lp.reductions {
-		init := make([]byte, vt.size())
-		if r.op == opAnd {
-			for k := range init {
-				init[k] = 0xFF
-			}
-		}
-		vaccs[i].Args = []*irValue{vb.vconst(vpre, init), vupd[i]}
+		vaccs[i].Args = []*irValue{vb.vconst(vpre, vb.redIdentity(r.op)), vupd[i]}
 	}
 
 	// middle: the reductions combined with the initial values
@@ -770,7 +1092,7 @@ func (f *irFunc) buildVectorLoop(lp *vecLoop) {
 	var reduced []*irValue
 	for i, r := range lp.reductions {
 		s := vb.reduceVector(middle, vupd[i], r.op)
-		reduced = append(reduced, vb.add(middle, r.op, r.phi.Type, pjoin.Phis[i], s))
+		reduced = append(reduced, vb.add(middle, combineOp(r.op), r.phi.Type, redInit[i], s))
 	}
 
 	// the remainder starts where the vector loop stopped
@@ -845,4 +1167,172 @@ func (f *irFunc) peelLoop(lp *vecLoop, vb *vecBuilder, guard, check *irBlock, pe
 		join.Phis = append(join.Phis, p)
 	}
 	return join
+}
+
+// ---- if-conversion ----
+
+// Masks are vectors of all-ones or all-zero elements; nil stands for all
+// ones (a block run by every iteration). The bitwise operations use the ps
+// forms, which AVX has for 256 bits without AVX2.
+
+func (vb *vecBuilder) mand(x, y *irValue) *irValue {
+	switch {
+	case x == nil:
+		return y
+	case y == nil:
+		return x
+	}
+	return vb.vinsn(vb.b, vb.vt, "andps", x, y)
+}
+
+// mandn is ~x & y
+func (vb *vecBuilder) mandn(x, y *irValue) *irValue {
+	if y == nil {
+		ones := make([]byte, vb.vt.size())
+		for i := range ones {
+			ones[i] = 0xFF
+		}
+		return vb.vinsn(vb.b, vb.vt, "xorps", x, vb.vconst(vb.pre, ones))
+	}
+	return vb.vinsn(vb.b, vb.vt, "andnps", x, y)
+}
+
+func (vb *vecBuilder) mor(x, y *irValue) *irValue {
+	if x == nil || y == nil {
+		return nil
+	}
+	return vb.vinsn(vb.b, vb.vt, "orps", x, y)
+}
+
+// selectMask is m ? x : y element-wise
+func (vb *vecBuilder) selectMask(m, x, y *irValue) *irValue {
+	switch {
+	case m == nil:
+		return x
+	case isZeroVec(y):
+		return vb.mand(m, x)
+	case isZeroVec(x):
+		return vb.mandn(m, y)
+	}
+	return vb.mor(vb.mand(m, x), vb.mandn(m, y))
+}
+
+func isZeroVec(v *irValue) bool {
+	if v.Op != opConst || v.Data == nil {
+		return false
+	}
+	for _, b := range v.Data {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// blockMask is the mask of the iterations running block b
+func (vb *vecBuilder) blockMask(b *irBlock) *irValue {
+	if vb.lp.uncond[b] {
+		return nil
+	}
+	if m, ok := vb.bmasks[b]; ok {
+		return m
+	}
+	var m *irValue
+	for i, p := range b.Preds {
+		e := vb.edgeMask(p, b)
+		if i == 0 {
+			m = e
+		} else {
+			m = vb.mor(m, e)
+		}
+	}
+	if vb.bmasks == nil {
+		vb.bmasks = map[*irBlock]*irValue{}
+	}
+	vb.bmasks[b] = m
+	return m
+}
+
+// edgeMask is the mask of the iterations going from p to b
+func (vb *vecBuilder) edgeMask(p, b *irBlock) *irValue {
+	m := vb.blockMask(p)
+	if p.Kind != bBranch {
+		return m
+	}
+	c := vb.vm[p.Ctrl]
+	if p.Succs[0] == b {
+		return vb.mand(m, c)
+	}
+	return vb.mandn(c, m)
+}
+
+// blend converts a phi of the body into selections by the edge masks
+func (vb *vecBuilder) blend(phi *irValue) *irValue {
+	b := phi.Block
+	n := len(phi.Args)
+	v := vb.operand(phi.Args[n-1])
+	for i := n - 2; i >= 0; i-- {
+		v = vb.selectMask(vb.edgeMask(b.Preds[i], b), vb.operand(phi.Args[i]), v)
+	}
+	return v
+}
+
+// compare builds the mask of a comparison
+func (vb *vecBuilder) compare(c *irValue) *irValue {
+	b := vb.b
+	t := c.Args[0].Type
+	x, y := vb.operand(c.Args[0]), vb.operand(c.Args[1])
+	if t.isFloat() {
+		k := "ps"
+		if t == iF64 {
+			k = "pd"
+		}
+		// cmpps predicates: eq 0, lt 1, le 2, neq (unordered true) 4
+		switch c.Op {
+		case opFEq:
+			return vb.vinsnImm(b, vb.vt, "cmp"+k, 0, x, y)
+		case opFNe:
+			return vb.vinsnImm(b, vb.vt, "cmp"+k, 4, x, y)
+		case opFLt:
+			return vb.vinsnImm(b, vb.vt, "cmp"+k, 1, x, y)
+		case opFLe:
+			return vb.vinsnImm(b, vb.vt, "cmp"+k, 2, x, y)
+		case opFGt:
+			return vb.vinsnImm(b, vb.vt, "cmp"+k, 1, y, x)
+		case opFGe:
+			return vb.vinsnImm(b, vb.vt, "cmp"+k, 2, y, x)
+		}
+		panic("vectorize: comparison")
+	}
+	k := "d"
+	if t == iI64 {
+		k = "q"
+	}
+	switch c.Op {
+	case opEq:
+		return vb.vinsn(b, vb.vt, "pcmpeq"+k, x, y)
+	case opNe:
+		return vb.mandn(vb.vinsn(b, vb.vt, "pcmpeq"+k, x, y), nil)
+	}
+	switch c.Op {
+	case opULt, opULe, opUGt, opUGe:
+		// flip the sign bits: unsigned order becomes signed order
+		sign := make([]byte, t.size())
+		sign[len(sign)-1] = 0x80
+		sv := vb.vconst(vb.pre, splat(vb.vt, sign))
+		x = vb.vinsn(b, vb.vt, "pxor", x, sv)
+		y = vb.vinsn(b, vb.vt, "pxor", y, sv)
+	}
+	gt := func(p, q *irValue) *irValue { return vb.vinsn(b, vb.vt, "pcmpgt"+k, p, q) }
+	switch c.Op {
+	case opGt, opUGt:
+		return gt(x, y)
+	case opLt, opULt:
+		return gt(y, x)
+	case opLe, opULe:
+		return vb.mandn(gt(x, y), nil)
+	case opGe, opUGe:
+		return vb.mandn(gt(y, x), nil)
+	}
+	panic("vectorize: comparison")
 }

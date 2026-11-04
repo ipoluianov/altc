@@ -463,6 +463,7 @@ const (
 	ptPhdr       = 6
 	ptTLS        = 7
 	ptGnuStack   = 0x6474e551
+	ptGnuEHFrame = 0x6474e550
 	ptGnuRelro   = 0x6474e552
 )
 
@@ -654,6 +655,18 @@ func (l *Linker) layoutAndWrite() []byte {
 	place(relaSec)
 	ro := add(outSec{name: ".rodata", kind: SecROData, align: 16, flags: shfAlloc, typ: shtProgbits, secs: inputs[SecROData]})
 	placeInputs(ro)
+	// call frame information: the FDE search table, then the frames
+	// (ended by a zero terminator)
+	var ehHdr, ehFrame *outSec
+	if nFDE := countFDEs(inputs[SecEHFrame]); nFDE > 0 {
+		ehHdr = add(outSec{name: ".eh_frame_hdr", align: 4, flags: shfAlloc, typ: shtProgbits})
+		ehHdr.size = int64(12 + 8*nFDE)
+		place(ehHdr)
+		term := &Section{Name: ".eh_frame", Kind: SecEHFrame, Align: 4, Data: make([]byte, 4)}
+		ehFrame = add(outSec{name: ".eh_frame", kind: SecEHFrame, align: 8, flags: shfAlloc, typ: shtProgbits,
+			secs: append(inputs[SecEHFrame], term)})
+		placeInputs(ehFrame)
+	}
 	roEnd := pos
 
 	// RX segment
@@ -807,6 +820,15 @@ func (l *Linker) layoutAndWrite() []byte {
 		return nil
 	}
 
+	if ehHdr != nil {
+		hdr, err := ehFrameHdr(img, ehHdr.addr, ehFrame.secs)
+		if err != nil {
+			l.errorf("%v", err)
+			return nil
+		}
+		copy(img[ehHdr.off:], hdr)
+	}
+
 	// .dynsym
 	symtabData := dynsym.Bytes()
 	for _, imp := range l.impList {
@@ -901,6 +923,9 @@ func (l *Linker) layoutAndWrite() []byte {
 	if l.tlsEnd != 0 {
 		phdrs = append(phdrs, phdr{ptTLS, 4, tdata.off, tdata.addr, tdata.size, l.tlsEnd - l.tlsStart, l.tlsAlign})
 	}
+	if ehHdr != nil {
+		phdrs = append(phdrs, phdr{ptGnuEHFrame, 4, ehHdr.off, ehHdr.addr, ehHdr.size, ehHdr.size, 4})
+	}
 	for len(phdrs) < nPhdr {
 		phdrs = append(phdrs, phdr{typ: 0}) // PT_NULL
 	}
@@ -959,6 +984,46 @@ func (l *Linker) layoutAndWrite() []byte {
 	}
 	out := img
 	if !l.StripSyms {
+		// debug information: the .debug_* sections of the objects, joined by
+		// name; their addresses are offsets in the output section
+		type dbgPart struct {
+			o   *Object
+			sec *Section
+		}
+		var dbgNames []string
+		dbgParts := map[string][]dbgPart{}
+		for _, o := range l.Objects {
+			for _, s := range o.Sections {
+				if s.Kind == SecOther && strings.HasPrefix(s.Name, ".debug_") {
+					if _, ok := dbgParts[s.Name]; !ok {
+						dbgNames = append(dbgNames, s.Name)
+					}
+					dbgParts[s.Name] = append(dbgParts[s.Name], dbgPart{o, s})
+				}
+			}
+		}
+		dbgData := map[string][]byte{}
+		for _, name := range dbgNames {
+			var data []byte
+			for _, p := range dbgParts[name] {
+				for int64(len(data))%max(p.sec.Align, 1) != 0 {
+					data = append(data, 0)
+				}
+				p.sec.Addr = int64(len(data))
+				data = append(data, p.sec.Data...)
+			}
+			dbgData[name] = data
+		}
+		for _, name := range dbgNames {
+			data := dbgData[name]
+			for _, p := range dbgParts[name] {
+				for _, r := range p.sec.Relocs {
+					l.applyDebugReloc(data, p.o, p.sec, r)
+				}
+			}
+			shdrs = append(shdrs, shdr{name: shstr.add(name), typ: shtProgbits, off: int64(len(out)), size: int64(len(data)), align: 1})
+			out = append(out, data...)
+		}
 		strt := newStrtab()
 		var syms bytes.Buffer
 		syms.Write(make([]byte, 24))
@@ -1210,5 +1275,34 @@ func (l *Linker) applyReloc(img []byte, o *Object, sec *Section, r Reloc) {
 		le.PutUint64(img[at:], uint64(s.Size+A))
 	default:
 		l.errorf("%s: unsupported relocation type %d against `%s'", o.Name, r.Type, s.Name)
+	}
+}
+
+// applyDebugReloc patches the debug information section data: addresses of
+// the code and data, and offsets in other debug sections
+func (l *Linker) applyDebugReloc(data []byte, o *Object, sec *Section, r Reloc) {
+	le := binary.LittleEndian
+	s := l.resolve(r.Sym)
+	var S int64
+	if s.Section != nil && s.Section.Kind == SecOther {
+		S = s.Section.Addr + s.Value
+	} else {
+		S = l.symAddr(s)
+	}
+	at := sec.Addr + r.Offset
+	v := S + r.Addend
+	switch r.Type {
+	case R_X86_64_64:
+		le.PutUint64(data[at:], uint64(v))
+	case R_X86_64_32, R_X86_64_32S:
+		le.PutUint32(data[at:], uint32(v))
+	case R_X86_64_DTPOFF32:
+		le.PutUint32(data[at:], uint32(v-l.tlsStart))
+	case R_X86_64_DTPOFF64:
+		le.PutUint64(data[at:], uint64(v-l.tlsStart))
+	case R_X86_64_16:
+		le.PutUint16(data[at:], uint16(v))
+	case R_X86_64_8:
+		data[at] = byte(v)
 	}
 }

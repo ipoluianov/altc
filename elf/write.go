@@ -46,6 +46,8 @@ func WriteObject(o *Object) []byte {
 			h.typ, h.flags, h.entsz = shtFiniArray, shfAlloc|shfWrite, 8
 		case SecPreinitArray:
 			h.typ, h.flags, h.entsz = shtPreinit, shfAlloc|shfWrite, 8
+		case SecEHFrame:
+			h.typ, h.flags = 0x70000001, shfAlloc // SHT_X86_64_UNWIND
 		default:
 			h.typ = shtProgbits
 		}

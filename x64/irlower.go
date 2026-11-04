@@ -539,6 +539,9 @@ func (b *irBuilder) stmt(n *cc.Node) {
 	if n == nil {
 		return
 	}
+	if n.Kind != cc.NBlock {
+		b.f.curTok = n.Tok
+	}
 	switch n.Kind {
 	case cc.NIf:
 		then, els, end := b.f.newBlock(), b.f.newBlock(), b.f.newBlock()
@@ -574,6 +577,8 @@ func (b *irBuilder) stmt(n *cc.Node) {
 			b.seal(cont)
 			b.cur = cont
 			if n.Inc != nil {
+				b.f.curTok = n.Inc.Tok
+				b.f.curTok = n.Inc.Tok
 				b.expr(n.Inc)
 			}
 			b.cond(n.Cond, head, brk)
@@ -597,6 +602,7 @@ func (b *irBuilder) stmt(n *cc.Node) {
 		b.seal(cont)
 		b.cur = cont
 		if n.Inc != nil {
+			b.f.curTok = n.Inc.Tok
 			b.expr(n.Inc)
 		}
 		b.jump(head)
@@ -784,6 +790,7 @@ func sameVar(a, b *cc.Node) bool {
 
 // cond lowers a condition as control flow
 func (b *irBuilder) cond(n *cc.Node, t, f *irBlock) {
+	b.f.curTok = n.Tok
 	if x, lo, hi, ok := rangeCheck(n); ok {
 		v := b.expr(x)
 		d := b.add(opSub, v.Type, v, b.iconst(v.Type, lo))

@@ -65,15 +65,22 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
     __builtin_cpu_supports, loop vectorization.
 14. GCC interop: __GNUC__ 14.2, libgcc's processor model (__cpu_model),
     IFUNC symbols and the ifunc attribute (R_X86_64_IRELATIVE).
-15. Later: long double/atomics in the IR, float reductions (-ffast-math)
-    and multi-block loops in the vectorizer, AVX-512, DWARF and unwind
-    tables (`.cfi_*`), `-static`.
+15. Vectorizer: -ffast-math float reductions, subtraction reductions,
+    if-conversion of loops with branches (masks and blends).
+16. Unwinding and debugging: .eh_frame from the code generator and from
+    .cfi_* directives (identical to GNU as), .eh_frame_hdr and
+    PT_GNU_EH_FRAME in the linker, DWARF 4 line tables, functions,
+    variables and types (-g), .debug_* sections kept by the linker,
+    .loc/.file/.uleb128/.sleb128 in the assembler.
+17. Later: long double/atomics in the IR, DWARF for inlined calls and
+    for locals of optimized code (location lists), AVX-512, `-static`.
 
 ## CLI
 
 ```
 altc build [dir]           build a project (current dir by default)
 altc run [dir] [-- args]   build and run
-altc file.c ... -o prog    gcc-like: -c -S -E -I -D -U -L -l -std= -o -w -O0
+altc file.c ... -o prog    gcc-like: -c -S -E -I -D -U -L -l -std= -o -w -O0 -g
+                           -march= -m<ext> -ffast-math
 altc ide [dir]             open the IDE (same as no arguments)
 ```

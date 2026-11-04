@@ -98,6 +98,10 @@ func (e *irEmitter) xsrc(x *irValue, scratch Reg, memOK bool) string {
 	if memOK && !x.Op.remat() && x.loc.kind == locStack {
 		return e.locMem(x.loc).String()
 	}
+	if memOK && x.Op == opConst && x.Type.isVec() && !allZero(x.Data) {
+		// straight from the constant pool (aligned to the vector size)
+		return e.vconstMem(x).String()
+	}
 	if x.Type.isVec() {
 		e.vmaterialize(x, scratch)
 	} else {

@@ -55,7 +55,8 @@ const (
 	SecInitArray
 	SecFiniArray
 	SecPreinitArray
-	SecOther // not loaded (comments, notes, debug info...)
+	SecOther   // not loaded (comments, notes, debug info...)
+	SecEHFrame // .eh_frame: call frame information for the unwinder
 )
 
 // Section is a chunk of code or data of one object file

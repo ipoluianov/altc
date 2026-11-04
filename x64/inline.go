@@ -97,7 +97,7 @@ func (g *gen) saveCalleeRegs() {
 		return
 	}
 	for i, r := range calleeSaved {
-		g.a.Mov(8, M(RBP, int32(g.asmSaveOff)+int32(8*i)), Q(r))
+		g.a.SaveReg(r, int32(g.asmSaveOff)+int32(8*i))
 	}
 }
 
@@ -1088,10 +1088,11 @@ func (g *gen) topLevelAsm() error {
 		return nil
 	}
 	g.topLabels = map[string]*TextLabel{}
-	env := &TextEnv{Section: g.asmSectionFor, Labels: g.topLabels, Listing: g.listing, Symbol: g.symbolDirective}
+	env := &TextEnv{Section: g.asmSectionFor, Labels: g.topLabels, Listing: g.listing, Symbol: g.symbolDirective, CFI: true}
 	if len(g.prog.AsmToks) == 0 {
 		env.FileName = g.obj.Name // an assembler source file
 	}
+	defer func() { g.asmFiles = env.Files }()
 	for i, text := range g.prog.TopAsm {
 		if err := AssembleText(env, text); err != nil {
 			if env.FileName != "" {
@@ -1111,6 +1112,7 @@ func (g *gen) topLevelAsm() error {
 // the label symbols; it returns relocations to convert with the code's
 func (g *gen) finishAsm(text *elf.Section, syms map[string]*elf.Symbol) ([]pendingRelocs, error) {
 	secOf := map[*Asm]*elf.Section{g.a: text}
+	g.secOf = secOf
 	var pend []pendingRelocs
 	for _, s := range g.asmSecs {
 		if err := s.a.Finish(); err != nil {
@@ -1118,6 +1120,9 @@ func (g *gen) finishAsm(text *elf.Section, syms map[string]*elf.Symbol) ([]pendi
 		}
 		kind := elf.SecData
 		switch {
+		case !strings.Contains(s.flags, "a") && (strings.HasPrefix(s.name, ".debug") || strings.HasPrefix(s.name, ".comment") ||
+			strings.HasPrefix(s.name, ".note") || strings.HasPrefix(s.name, ".gnu.lto")):
+			kind = elf.SecOther // not loaded: debug information, comments, notes
 		case strings.HasPrefix(s.name, ".text") || strings.Contains(s.flags, "x"):
 			kind = elf.SecText
 		case strings.HasPrefix(s.name, ".rodata"):

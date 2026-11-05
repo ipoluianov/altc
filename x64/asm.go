@@ -904,6 +904,17 @@ func (a *Asm) ShiftCL(op ShiftOp, size int, dst Operand) {
 	a.enc(opsize16(size), size == 8, []byte{opc}, int(op), dst, 0, false)
 }
 
+// ShxdCL emits shldq %cl, src, dst (left) or shrdq %cl, src, dst: dst is
+// shifted by %cl, filling the vacated bits from src
+func (a *Asm) ShxdCL(left bool, dst, src Reg) {
+	name, op := "shrdq", byte(0xAD)
+	if left {
+		name, op = "shldq", 0xA5
+	}
+	a.list(name, Q(dst), Q(src), B(RCX))
+	a.enc(nil, true, []byte{0x0F, op}, src.num(), Q(dst), 0, false)
+}
+
 // ShiftImm shifts dst by a constant
 func (a *Asm) ShiftImm(op ShiftOp, size int, dst Operand, n int) {
 	a.list(shiftNames[op]+sfx[size], dst, Imm(n))

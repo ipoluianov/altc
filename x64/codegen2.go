@@ -905,8 +905,13 @@ func (g *gen) genStmt(n *cc.Node) {
 		g.stackRestore(n.StackSave)
 	case cc.NSwitch:
 		g.genExpr(n.Cond)
+		wide := is128(n.Cond.Ty)
 		for _, c := range n.Cases {
 			l := g.label(c.Label)
+			if wide {
+				g.case128(c.Begin, c.End, l)
+				continue
+			}
 			if c.Begin == c.End {
 				if fitsI32(c.Begin) {
 					g.a.Alu(CMP, 8, Q(RAX), Imm(c.Begin))
@@ -985,6 +990,26 @@ func (g *gen) genStmt(n *cc.Node) {
 	default:
 		g.genDiscard(n)
 	}
+}
+
+// case128 jumps to l when the 128-bit value in rdx:rax is in [lo, hi]
+// (the case values are 64-bit constants extended)
+func (g *gen) case128(lo, hi int64, l Label) {
+	next := g.a.NewLabel()
+	// rsi:rdi = value - lo (the constants are loaded first: a zero is an xor)
+	g.a.MovImm(R8, lo)
+	g.a.MovImm(R9, lo>>63)
+	g.a.Mov(8, Q(RDI), Q(RAX))
+	g.a.Mov(8, Q(RSI), Q(RDX))
+	g.a.Alu(SUB, 8, Q(RDI), Q(R8))
+	g.a.Alu(SBB, 8, Q(RSI), Q(R9))
+	// in range when the difference is at most hi - lo (unsigned)
+	g.a.Test(8, Q(RSI), Q(RSI))
+	g.a.Jcc(CondNE, next)
+	g.a.MovImm(R8, hi-lo)
+	g.a.Alu(CMP, 8, Q(RDI), Q(R8))
+	g.a.Jcc(CondBE, l)
+	g.a.Bind(next)
 }
 
 // stackSave remembers the stack pointer and the alloca bottom before VLAs

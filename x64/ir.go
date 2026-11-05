@@ -29,6 +29,7 @@ const (
 	iF64
 	iV128 // a 128-bit vector (any element type)
 	iV256 // a 256-bit vector (needs AVX)
+	iI128 // a 128-bit integer: only opPair values while lowering (see ir128.go)
 )
 
 func (t irType) isFloat() bool { return t == iF32 || t == iF64 }
@@ -46,12 +47,14 @@ func (t irType) size() int {
 		return 16
 	case iV256:
 		return 32
+	case iI128:
+		return 16
 	}
 	return 4
 }
 
 func (t irType) String() string {
-	return [...]string{"void", "i32", "i64", "f32", "f64", "v128", "v256"}[t]
+	return [...]string{"void", "i32", "i64", "f32", "f64", "v128", "v256", "i128"}[t]
 }
 
 type irOp uint8
@@ -134,11 +137,16 @@ const (
 	opCall    // Args: arguments, then the callee when indirect
 	opFence
 	opTrap
-	opAsm        // inline assembly: Args are its operand values and addresses
-	opVInsn      // vector instruction Sym on Args (AuxInt: immediate when Signed)
-	opVBroadcast // scalar to all elements; Sym: element kind (b w d q ps pd)
-	opX87        // long double operation AuxInt (x87Kind) on 16-byte memory operands (see irx87.go)
-	opAtomic     // locked read-modify-write AuxInt (atomicKind) returning the old value (see iratomic.go)
+	opAsm          // inline assembly: Args are its operand values and addresses
+	opVInsn        // vector instruction Sym on Args (AuxInt: immediate when Signed)
+	opVBroadcast   // scalar to all elements; Sym: element kind (b w d q ps pd)
+	opX87          // long double operation AuxInt (x87Kind) on 16-byte memory operands (see irx87.go)
+	opAtomic       // locked read-modify-write AuxInt (atomicKind) returning the old value (see iratomic.go)
+	opPair         // a 128-bit integer (Args: low, high halves) while lowering; never emitted
+	op128          // a half or a comparison of 128-bit integer operations AuxInt (i128Kind, see ir128.go)
+	opAlloca       // Args[0] bytes of stack (rounded to 16): the address
+	opStackSave    // the stack pointer
+	opStackRestore // sets the stack pointer to Args[0]
 	opNumOps
 )
 
@@ -151,11 +159,13 @@ var opNames = [...]string{
 	"sext8", "sext16", "zext8", "zext16", "sext32", "zext32", "trunc",
 	"cvti2f", "cvtu2f", "cvtf2i", "cvtf2u", "fext", "ftrunc", "fabs", "fbits", "builtin",
 	"load", "store", "memzero", "memcpy", "call", "fence", "trap", "asm", "vinsn", "vbroadcast", "x87", "atomic",
+	"pair", "i128", "alloca", "stacksave", "stackrestore",
 }
 
 // pure operations depend only on their arguments
 func (op irOp) pure() bool {
-	return op >= opConst && op <= opBuiltin && op != opParam && op != opPhi || op == opVInsn || op == opVBroadcast
+	return op >= opConst && op <= opBuiltin && op != opParam && op != opPhi || op == opVInsn || op == opVBroadcast ||
+		op == opPair || op == op128
 }
 
 // traps tells whether an operation may fault (it is not hoisted)
@@ -173,6 +183,12 @@ func (op irOp) commutative() bool {
 
 func (op irOp) isCompare() bool {
 	return op >= opEq && op <= opUGe || op >= opFEq && op <= opFGe
+}
+
+// setsFlags tells whether v is a comparison that can leave its result in
+// the flags for a branch
+func (v *irValue) setsFlags() bool {
+	return v.Op.isCompare() || v.Op == op128 && i128Kind(v.AuxInt).isCompare()
 }
 
 // remat values are recomputed where they are used instead of living in a

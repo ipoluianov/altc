@@ -32,6 +32,7 @@ type dbgSite struct {
 type dbgDef struct {
 	v    *cc.Obj
 	val  *irValue
+	half int      // a 128-bit variable: 1 for the low half, 2 for the high half
 	site *dbgSite // nil: a variable of the function itself
 	// where the assignment is in the program: in blk after anchor (nil:
 	// at the start of blk). Optimizations may compute the value earlier
@@ -79,11 +80,15 @@ func (b *irBuilder) recordDef(v *cc.Obj, val *irValue) {
 	if b.dbgVars == nil {
 		return
 	}
+	half := 0
+	if h, ok := b.halfOf[v]; ok {
+		v, half = h.v, h.half
+	}
 	s := b.f.curSite
 	if s != nil && !s.vars[v] || s == nil && !b.dbgVars[v] {
 		return
 	}
-	d := dbgDef{v: v, val: val, site: s}
+	d := dbgDef{v: v, val: val, half: half, site: s}
 	if val.Op == opPhi {
 		d.blk = val.Block
 	} else if b.cur != nil {
@@ -175,6 +180,7 @@ func (e *irEmitter) debugInfo() *irDebug {
 	type key struct {
 		v    *cc.Obj
 		site *dbgSite
+		half int
 	}
 	byVar := map[key][]cand{}
 	var order []key
@@ -191,7 +197,7 @@ func (e *irEmitter) debugInfo() *irDebug {
 	binds := make([]int, len(f.dbgDefs))
 	byKey := map[key][]int{}
 	for i, df := range f.dbgDefs {
-		k := key{df.v, df.site}
+		k := key{df.v, df.site, df.half}
 		binds[i] = e.bindPos(df, inOrder, live)
 		if _, ok := byKey[k]; !ok {
 			order = append(order, k)
@@ -240,6 +246,8 @@ func (e *irEmitter) debugInfo() *irDebug {
 			}
 		}
 	}
+	halfLists := map[key][2][]dbgPiece{}
+	var halfOrder []key
 	for _, k := range order {
 		cs := byVar[k]
 		// cut the code into intervals at every boundary; each takes the
@@ -271,13 +279,71 @@ func (e *irEmitter) debugInfo() *irDebug {
 			}
 			list = append(list, dbgPiece{lo, hi, ex})
 		}
-		if k.site == nil {
-			d.vars = append(d.vars, dbgVarLoc{v: k.v, list: list})
-		} else if k.site.locs != nil {
-			k.site.locs = append(k.site.locs, dbgVarLoc{v: k.v, list: list})
+		if k.half != 0 {
+			// a half of a 128-bit variable: combined below
+			w := key{k.v, k.site, 0}
+			if _, ok := halfLists[w]; !ok {
+				halfOrder = append(halfOrder, w)
+			}
+			hl := halfLists[w]
+			hl[k.half-1] = list
+			halfLists[w] = hl
+			continue
 		}
+		d.addVar(k.site, dbgVarLoc{v: k.v, list: list})
+	}
+	for _, w := range halfOrder {
+		d.addVar(w.site, dbgVarLoc{v: w.v, list: pieces128(halfLists[w])})
 	}
 	return d
+}
+
+func (d *irDebug) addVar(site *dbgSite, l dbgVarLoc) {
+	if site == nil {
+		d.vars = append(d.vars, l)
+	} else if site.locs != nil {
+		site.locs = append(site.locs, l)
+	}
+}
+
+// pieces128 combines the location lists of the halves of a 128-bit
+// variable: DW_OP_piece 8 after each (an empty piece: that half is not
+// known there)
+func pieces128(h [2][]dbgPiece) []dbgPiece {
+	var cuts []int
+	for _, l := range h {
+		for _, p := range l {
+			cuts = append(cuts, p.lo, p.hi)
+		}
+	}
+	sort.Ints(cuts)
+	at := func(l []dbgPiece, lo, hi int) []byte {
+		for _, p := range l {
+			if p.lo <= lo && hi <= p.hi {
+				return p.expr
+			}
+		}
+		return nil
+	}
+	var list []dbgPiece
+	for i := 0; i+1 < len(cuts); i++ {
+		lo, hi := cuts[i], cuts[i+1]
+		if lo == hi {
+			continue
+		}
+		a, b := at(h[0], lo, hi), at(h[1], lo, hi)
+		if a == nil && b == nil {
+			continue
+		}
+		ex := append(append(append([]byte(nil), a...), 0x93, 8), b...) // DW_OP_piece 8
+		ex = append(ex, 0x93, 8)
+		if n := len(list); n > 0 && list[n-1].hi == lo && string(list[n-1].expr) == string(ex) {
+			list[n-1].hi = hi
+			continue
+		}
+		list = append(list, dbgPiece{lo, hi, ex})
+	}
+	return list
 }
 
 // dbgConst describes a constant value (nil for other values)

@@ -431,3 +431,167 @@ func constVarValue(o *Obj) (int64, bool) {
 	}
 	return truncInt(int64(u), t), true
 }
+
+// evalWide evaluates an integer constant expression without address
+// constants exactly, wrapping every intermediate value to the width and
+// signedness of its type like the target does. It is used for the
+// initializers of 128-bit integers, which eval2 computes in 64 bits. ok is
+// false for an expression it does not handle (eval2 reports the errors).
+func (p *parser) evalWide(n *Node) (*big.Int, bool) {
+	addType(n)
+	v, ok := p.evalWide0(n)
+	if !ok {
+		return nil, false
+	}
+	return wrapBig(v, n.Ty), true
+}
+
+func (p *parser) evalWide0(n *Node) (*big.Int, bool) {
+	if n.Ty.IsFlonum() {
+		return nil, false
+	}
+	bin := func() (*big.Int, *big.Int, bool) {
+		a, ok1 := p.evalWide(n.LHS)
+		b, ok2 := p.evalWide(n.RHS)
+		return a, b, ok1 && ok2
+	}
+	truth := func(x *Node) (bool, bool) {
+		v, ok := p.evalWide(x)
+		return ok && v.Sign() != 0, ok
+	}
+	z := new(big.Int)
+	switch n.Kind {
+	case NNum:
+		return big.NewInt(n.Val), true
+	case NVar:
+		if n.Var.ConstExpr != nil {
+			return p.evalWide(n.Var.ConstExpr)
+		}
+		if v, ok := constVarValue(n.Var); ok && p.staticInit {
+			return big.NewInt(v), true
+		}
+	case NCast:
+		if !n.Ty.IsInteger() {
+			return nil, false
+		}
+		if n.LHS.Ty.IsFlonum() {
+			var f *big.Float
+			if n.LHS.Ty.Kind == TyLongDouble {
+				f = p.evalLD(n.LHS)
+			} else {
+				f = big.NewFloat(p.evalDouble(n.LHS))
+			}
+			if f.IsInf() {
+				return nil, false
+			}
+			if n.Ty.Kind == TyBool {
+				return big.NewInt(b2i(f.Sign() != 0)), true
+			}
+			i, _ := f.Int(nil) // truncated toward zero
+			return i, true
+		}
+		if !n.LHS.Ty.IsInteger() {
+			return nil, false
+		}
+		v, ok := p.evalWide(n.LHS)
+		if ok && n.Ty.Kind == TyBool {
+			return big.NewInt(b2i(v.Sign() != 0)), true
+		}
+		return v, ok
+	case NNeg:
+		v, ok := p.evalWide(n.LHS)
+		if !ok {
+			return nil, false
+		}
+		return z.Neg(v), true
+	case NBitNot:
+		v, ok := p.evalWide(n.LHS)
+		if !ok {
+			return nil, false
+		}
+		return z.Not(v), true
+	case NNot:
+		t, ok := truth(n.LHS)
+		return big.NewInt(b2i(!t)), ok
+	case NLogAnd, NLogOr:
+		a, ok := truth(n.LHS)
+		if !ok {
+			return nil, false
+		}
+		if a == (n.Kind == NLogOr) {
+			return big.NewInt(b2i(a)), true
+		}
+		b, ok := truth(n.RHS)
+		return big.NewInt(b2i(b)), ok
+	case NCond:
+		c, ok := truth(n.Cond)
+		if !ok {
+			return nil, false
+		}
+		if c {
+			return p.evalWide(n.Then)
+		}
+		return p.evalWide(n.Els)
+	case NComma:
+		return p.evalWide(n.RHS)
+	case NAdd, NSub, NMul, NDiv, NMod, NBitAnd, NBitOr, NBitXor, NShl, NShr, NEq, NNe, NLt, NLe:
+		if !n.LHS.Ty.IsInteger() || !n.RHS.Ty.IsInteger() {
+			return nil, false
+		}
+		a, b, ok := bin()
+		if !ok {
+			return nil, false
+		}
+		switch n.Kind {
+		case NAdd:
+			return z.Add(a, b), true
+		case NSub:
+			return z.Sub(a, b), true
+		case NMul:
+			return z.Mul(a, b), true
+		case NDiv, NMod:
+			if b.Sign() == 0 {
+				return nil, false
+			}
+			if n.Kind == NDiv {
+				return z.Quo(a, b), true // truncated, like C
+			}
+			return z.Rem(a, b), true
+		case NBitAnd:
+			return z.And(a, b), true
+		case NBitOr:
+			return z.Or(a, b), true
+		case NBitXor:
+			return z.Xor(a, b), true
+		case NShl, NShr:
+			if b.Sign() < 0 || b.Cmp(big.NewInt(int64(n.Ty.Size()*8))) >= 0 {
+				return nil, false
+			}
+			if n.Kind == NShl {
+				return z.Lsh(a, uint(b.Int64())), true
+			}
+			return z.Rsh(a, uint(b.Int64())), true // a is wrapped: arithmetic for signed values
+		}
+		c := a.Cmp(b)
+		r := map[NodeKind]bool{NEq: c == 0, NNe: c != 0, NLt: c < 0, NLe: c <= 0}[n.Kind]
+		return big.NewInt(b2i(r)), true
+	}
+	return nil, false
+}
+
+// wrapBig reduces v to the values of the integer type t
+func wrapBig(v *big.Int, t *Type) *big.Int {
+	if t.Kind == TyBool {
+		return big.NewInt(b2i(v.Sign() != 0))
+	}
+	bits := uint(64)
+	if t.IsInteger() {
+		bits = uint(t.Size() * 8)
+	}
+	mod := new(big.Int).Lsh(big.NewInt(1), bits)
+	r := new(big.Int).Mod(v, mod) // 0 <= r < 2^bits
+	if !t.IsUnsigned() && t.IsInteger() && r.Bit(int(bits)-1) == 1 {
+		r.Sub(r, mod)
+	}
+	return r
+}

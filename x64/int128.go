@@ -172,13 +172,17 @@ func (g *gen) cast128(from, to *cc.Type) bool {
 		return true
 	case t128 && (from.IsInteger() || from.Kind == cc.TyPtr):
 		g.extend128(from)
+	case t128 && from.Kind == cc.TyLongDouble:
+		// long double -> 128 via the runtime, exactly
+		if to.IsUnsigned() {
+			g.callWithLD("__fixunsxfti")
+		} else {
+			g.callWithLD("__fixxfti")
+		}
 	case t128 && from.IsFlonum():
-		// float/double/long double -> 128 via the runtime
-		switch from.Kind {
-		case cc.TyFloat:
+		// float/double -> 128 via the runtime
+		if from.Kind == cc.TyFloat {
 			g.a.CvtFF(true, XMM0, X(XMM0))
-		case cc.TyLongDouble:
-			g.cast(from, cc.TypeDouble)
 		}
 		if to.IsUnsigned() {
 			g.callAligned("__fixunsdfti")
@@ -191,6 +195,15 @@ func (g *gen) cast128(from, to *cc.Type) bool {
 		g.a.Movzx(4, RAX, 1, B(RAX))
 	case f128 && (to.IsInteger() || to.Kind == cc.TyPtr):
 		g.intToInt(getTypeID(to))
+	case f128 && to.Kind == cc.TyLongDouble:
+		// the result comes back in st(0)
+		g.a.Mov(8, Q(RDI), Q(RAX))
+		g.a.Mov(8, Q(RSI), Q(RDX))
+		if from.IsUnsigned() {
+			g.callAligned("__floatuntixf")
+		} else {
+			g.callAligned("__floattixf")
+		}
 	case f128 && to.IsFlonum():
 		g.a.Mov(8, Q(RDI), Q(RAX))
 		g.a.Mov(8, Q(RSI), Q(RDX))
@@ -199,12 +212,24 @@ func (g *gen) cast128(from, to *cc.Type) bool {
 		} else {
 			g.callAligned("__floattidf")
 		}
-		switch to.Kind {
-		case cc.TyFloat:
+		if to.Kind == cc.TyFloat {
 			g.a.CvtFF(false, XMM0, X(XMM0))
-		case cc.TyLongDouble:
-			g.cast(cc.TypeDouble, to)
 		}
 	}
 	return true
+}
+
+// callWithLD calls a runtime function taking the long double in st(0)
+// (popped) as its only argument: 16 bytes on the stack
+func (g *gen) callWithLD(name string) {
+	size := int64(16)
+	if g.depth%2 != 0 {
+		size += 8 // keep the call 16-byte aligned
+	}
+	g.spillXMM()
+	g.a.Alu(SUB, 8, Q(RSP), Imm(size))
+	g.a.Fstp(10, M(RSP, 0))
+	g.a.Call(name)
+	g.a.Alu(ADD, 8, Q(RSP), Imm(size))
+	g.reloadXMM()
 }

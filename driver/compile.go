@@ -350,20 +350,39 @@ void __stack_chk_fail_local(void) { __stack_chk_fail(); }
 /* 128-bit integer helpers (the libgcc names) */
 typedef unsigned __int128 __altc_u128;
 typedef __int128 __altc_i128;
-static __altc_u128 __altc_udivmod(__altc_u128 a, __altc_u128 b, __altc_u128 *rem) {
-	if (b == 0) { volatile int z = 0; return 1 / z; }
-	if ((a >> 64) == 0 && (b >> 64) == 0) {
-		unsigned long x = (unsigned long)a, y = (unsigned long)b;
-		if (rem) *rem = x % y;
-		return x / y;
-	}
-	__altc_u128 q = 0, r = 0;
-	for (int i = 127; i >= 0; i--) {
-		r = (r << 1) | ((a >> i) & 1);
-		if (r >= b) { r -= b; q |= (__altc_u128)1 << i; }
-	}
-	if (rem) *rem = r;
+/* hi:lo / d with hi < d: one divq */
+static unsigned long __altc_divq(unsigned long hi, unsigned long lo, unsigned long d, unsigned long *r) {
+	unsigned long q, rr;
+	__asm__("divq %4" : "=a"(q), "=d"(rr) : "a"(lo), "d"(hi), "r"(d));
+	*r = rr;
 	return q;
+}
+static __altc_u128 __altc_udivmod(__altc_u128 a, __altc_u128 b, __altc_u128 *rem) {
+	unsigned long ahi = (unsigned long)(a >> 64), alo = (unsigned long)a;
+	unsigned long bhi = (unsigned long)(b >> 64), blo = (unsigned long)b, r;
+	if (bhi == 0) {
+		if (blo == 0) { volatile int z = 0; return 1 / z; }
+		/* at most two divisions: the high word first */
+		unsigned long qhi = 0;
+		if (ahi >= blo) { qhi = ahi / blo; ahi %= blo; }
+		unsigned long qlo = __altc_divq(ahi, alo, blo, &r);
+		if (rem) *rem = r;
+		return ((__altc_u128)qhi << 64) | qlo;
+	}
+	if (a < b) { if (rem) *rem = a; return 0; }
+	/* a divisor of 65 bits or more: the quotient fits in 64 bits. Divide
+	   by the normalized top word (Hacker's Delight, divlu); the estimate is
+	   exact or one too small */
+	int n = __builtin_clzll(bhi);
+	unsigned long v1 = (unsigned long)((b << n) >> 64);
+	__altc_u128 u1 = a >> 1;
+	unsigned long q1 = __altc_divq((unsigned long)(u1 >> 64), (unsigned long)u1, v1, &r);
+	unsigned long q0 = (unsigned long)(((__altc_u128)q1 << n) >> 63); /* in double width */
+	if (q0 != 0) q0--;
+	__altc_u128 rr = a - (__altc_u128)q0 * b;
+	if (rr >= b) { q0++; rr -= b; }
+	if (rem) *rem = rr;
+	return q0;
 }
 __altc_u128 __udivti3(__altc_u128 a, __altc_u128 b) { return __altc_udivmod(a, b, 0); }
 __altc_u128 __umodti3(__altc_u128 a, __altc_u128 b) { __altc_u128 r; __altc_udivmod(a, b, &r); return r; }
@@ -657,7 +676,15 @@ func runtimeObjects() ([]*elf.Object, error) {
 			}
 		}
 	})
-	return runtimeObjs, runtimeErr
+	if runtimeErr != nil {
+		return nil, runtimeErr
+	}
+	// a copy for each link: the linker writes addresses into its inputs
+	objs := make([]*elf.Object, len(runtimeObjs))
+	for i, o := range runtimeObjs {
+		objs[i] = o.Clone()
+	}
+	return objs, nil
 }
 
 // ---- libraries ----

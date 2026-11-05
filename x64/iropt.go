@@ -492,6 +492,10 @@ func (f *irFunc) foldValue(v *irValue) {
 	if v.fwd != nil || !v.Op.pure() || v.Op == opConst || len(v.Args) == 0 {
 		return
 	}
+	if v.Op == op128 {
+		f.fold128(v)
+		return
+	}
 	a := v.Args[0]
 	ca, aok := constOf(a)
 	if len(v.Args) == 1 {

@@ -182,3 +182,45 @@ func PutLE(b []byte, v uint64, n int) {
 		b[i] = byte(v >> (8 * i))
 	}
 }
+
+// Clone makes a deep copy of the object. The linker records addresses in
+// the sections and symbols it links, so an object linked more than once
+// (the compiler runtime, in every link of a process such as the IDE or the
+// tests, possibly at the same time) is cloned for each link.
+func (o *Object) Clone() *Object {
+	c := &Object{Name: o.Name, symMap: map[string]*Symbol{}}
+	secs := map[*Section]*Section{}
+	for _, s := range o.Sections {
+		n := *s
+		if s.Data != nil {
+			n.Data = append([]byte(nil), s.Data...)
+		}
+		secs[s] = &n
+		c.Sections = append(c.Sections, &n)
+	}
+	syms := map[*Symbol]*Symbol{}
+	for _, s := range o.Symbols {
+		n := *s
+		if s.Section != nil {
+			if ns, ok := secs[s.Section]; ok {
+				n.Section = ns
+			}
+		}
+		syms[s] = &n
+		c.Symbols = append(c.Symbols, &n)
+	}
+	for name, s := range o.symMap {
+		c.symMap[name] = syms[s]
+	}
+	for _, s := range c.Sections {
+		rs := make([]Reloc, len(s.Relocs))
+		for i, r := range s.Relocs {
+			if ns, ok := syms[r.Sym]; ok {
+				r.Sym = ns
+			}
+			rs[i] = r
+		}
+		s.Relocs = rs
+	}
+	return c
+}

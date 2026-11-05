@@ -222,7 +222,7 @@ int main(void) {
     printf("cas %d %d\n", prev, v);
     printf("flags %d %d %d %d\n", is_zero(0), is_zero(5), below(1, 2), below(3, 2));
     printf("fsqrt %.6f\n", fsqrt(2.0));
-    printf("fpatan %.6Lf\n", fpatan(1.0L, 1.0L));
+    printf("fpatan %.6Lf %.6Lf\n", fpatan(1.0L, 1.0L), fpatan(3.0L, -1.0L));
     printf("sse %.2f %.2f\n", sse_add(1.5, 2.25), sse_max(3.0f, -1.0f));
     printf("named %d\n", named(50, 8));
     printf("loop %d\n", loop_sum(10));

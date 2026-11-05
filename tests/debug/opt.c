@@ -18,8 +18,17 @@ __attribute__((noinline)) int work(int n, int *a) {
     return sum;
 }
 
+__attribute__((noinline)) unsigned long wide(unsigned long x);
+
 int main(void) {
     int a[5] = {1, 2, 3, 4, 5};
-    int r = work(5, a);
+    int r = work(5, a) + (int)wide(5) - 320;
     return r == 60 ? 0 : 1;
+}
+
+// a 128-bit variable: its halves in two places
+__attribute__((noinline)) unsigned long wide(unsigned long x) {
+    unsigned __int128 big = (unsigned __int128)x << 70;
+    printf("%lu\n", (unsigned long)(big >> 70));
+    return (unsigned long)(big >> 64);
 }

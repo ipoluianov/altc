@@ -83,6 +83,10 @@ type irEmitter struct {
 	next     *irBlock
 	flags    flagCond // condition of a fused comparison
 	ymm      bool     // the function uses 256-bit registers: vzeroupper before calls and returns
+	outArea  int64    // the outgoing argument area at the bottom of the frame
+	peek     *irValue // the next instruction that emits code (in the same block)
+	carryFor *irValue // an op128 high half whose low half just left the carry in the flags
+	mulLow   *irValue // an opMul whose product is in rax (after the mul of an opMulHi)
 }
 
 type flagKind uint8
@@ -144,7 +148,8 @@ func (e *irEmitter) emit() {
 			}
 		}
 	}
-	frame := alignTo(off, 16) + alignTo(outgoing, 16)
+	e.outArea = alignTo(outgoing, 16)
+	frame := alignTo(off, 16) + e.outArea
 	for _, p := range f.Params {
 		if p != nil && p.Type == iV256 {
 			e.ymm = true
@@ -231,7 +236,14 @@ func (e *irEmitter) emit() {
 		if dbg {
 			e.events = append(e.events, dbgEvent{b.start, len(a.Code)})
 		}
-		for _, v := range b.Instrs {
+		for i, v := range b.Instrs {
+			e.peek = nil
+			for _, w := range b.Instrs[i+1:] {
+				if !w.Op.remat() {
+					e.peek = w
+					break
+				}
+			}
 			lm := a.lineMark()
 			if v.tok != nil {
 				e.g.lineAt(v.tok)
@@ -501,7 +513,20 @@ func (e *irEmitter) value(v *irValue) {
 			a.Alu(ADD, 8, Q(d), Mem{FS: true, Base: NoReg, Index: NoReg})
 		}
 		e.finish(v, d)
-	case opAdd, opSub, opMul, opAnd, opOr, opXor:
+	case opAdd, opSub:
+		if w := e.peek; carryPair(v, w) {
+			// the low half of a 128-bit sum: the high half adds the carry
+			e.intBinaryFlags(v)
+			e.carryFor = w
+			return
+		}
+		e.intBinary(v)
+	case opMul, opAnd, opOr, opXor:
+		if v == e.mulLow {
+			e.mulLow = nil
+			e.finish(v, RAX)
+			return
+		}
 		e.intBinary(v)
 	case opShl, opShr, opSar:
 		e.shift(v)
@@ -522,6 +547,11 @@ func (e *irEmitter) value(v *irValue) {
 			a.Unary(IMUL, 8, src)
 		} else {
 			a.Unary(MUL, 8, src)
+			// the low half of the same product follows: it is in rax
+			if w := e.peek; w != nil && w.Op == opMul && w.Type == iI64 &&
+				(w.Args[0] == v.Args[0] && w.Args[1] == v.Args[1] || w.Args[0] == v.Args[1] && w.Args[1] == v.Args[0]) {
+				e.mulLow = w
+			}
 		}
 		e.finish(v, RDX)
 	case opNeg, opNot:
@@ -534,6 +564,9 @@ func (e *irEmitter) value(v *irValue) {
 		}
 		a.Unary(op, sz, Sized(d, sz))
 		e.finish(v, d)
+		if w := e.peek; v.Op == opNeg && carryPair(v, w) {
+			e.carryFor = w // neg sets the borrow of 0 - x
+		}
 	case opEq, opNe, opLt, opLe, opGt, opGe, opULt, opULe, opUGt, opUGe:
 		c := e.intCompare(v)
 		if v.fused {
@@ -636,6 +669,29 @@ func (e *irEmitter) value(v *irValue) {
 		e.x87(v)
 	case opAtomic:
 		e.atomic(v)
+	case op128:
+		e.op128(v)
+	case opAlloca:
+		// below the frame, under the outgoing arguments (which move down)
+		e.materialize(v.Args[0], RAX)
+		a.Alu(ADD, 8, Q(RAX), Imm(15))
+		a.Alu(AND, 8, Q(RAX), Imm(-16))
+		a.Alu(SUB, 8, Q(RSP), Q(RAX))
+		if v.needsLoc() {
+			d := e.dst(v, R11)
+			a.Lea(d, M(RSP, int32(e.outArea)))
+			e.finish(v, d)
+		}
+	case opStackSave:
+		if v.needsLoc() {
+			d := e.dst(v, R11)
+			a.Mov(8, Q(d), Q(RSP))
+			e.finish(v, d)
+		}
+	case opStackRestore:
+		a.Mov(8, Q(RSP), Q(e.ireg(v.Args[0], R11)))
+	case opPair:
+		panic("a 128-bit pair is left in the IR")
 	default:
 		panic(fmt.Sprintf("cannot emit %s", opNames[v.Op]))
 	}
@@ -681,6 +737,46 @@ func (e *irEmitter) intBinary(v *irValue) {
 		}
 	}
 	e.finish(v, d)
+}
+
+// intBinaryFlags emits an add or sub that leaves its carry in the flags
+// (no lea)
+func (e *irEmitter) intBinaryFlags(v *irValue) {
+	a := e.a
+	x, y := v.Args[0], v.Args[1]
+	d := e.dst(v, R11)
+	if v.Op == opAdd && e.inReg(y, d) && !e.inReg(x, d) {
+		x, y = y, x
+	}
+	if e.inReg(y, d) && x != y {
+		d = R11
+	}
+	e.materialize(x, d)
+	op := ADD
+	if v.Op == opSub {
+		op = SUB
+	}
+	a.Alu(op, 8, Q(d), e.iop(y, 8, R10, true))
+	e.finish(v, d)
+}
+
+// carryPair tells whether v computes the low half of the 128-bit sum,
+// difference or negation whose high half is w
+func carryPair(v, w *irValue) bool {
+	if w == nil || w.Op != op128 || v.Type != iI64 {
+		return false
+	}
+	k := i128Kind(w.AuxInt)
+	switch {
+	case v.Op == opAdd && k == i128AddHi:
+		return v.Args[0] == w.Args[0] && v.Args[1] == w.Args[2] || v.Args[0] == w.Args[2] && v.Args[1] == w.Args[0]
+	case v.Op == opSub && k == i128SubHi:
+		return v.Args[0] == w.Args[0] && v.Args[1] == w.Args[2]
+	case v.Op == opNeg && k == i128SubHi:
+		c, ok := constOf(w.Args[0])
+		return ok && c == 0 && w.Args[2] == v.Args[0]
+	}
+	return false
 }
 
 func (e *irEmitter) shift(v *irValue) {

@@ -107,6 +107,13 @@ func (l *Linker) addObject(o *Object) {
 		if s.Bind == BindLocal || !s.Defined() {
 			continue
 		}
+		if s.Type == SymCommon {
+			// merged and placed in .bss below: a copy, so that the input
+			// object stays reusable (the runtime objects are shared by all
+			// the links of a process)
+			c := *s
+			s = &c
+		}
 		old, ok := l.globals[s.Name]
 		if !ok {
 			l.globals[s.Name] = s

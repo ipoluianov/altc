@@ -79,7 +79,10 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
 19. DWARF for optimized code: location lists of SSA variables (bound to
     the assignment points), constants, inlined subroutines with their
     variables (.debug_loc, .debug_ranges).
-20. Later: AVX-512, __int128 and VLAs in the IR.
+20. __int128 (pairs of 64-bit halves) and VLAs/alloca in the IR; exact
+    128-bit constant initializers.
+21. Later: AVX-512 (needs a machine or emulator that can run it to test
+    the generated code), _Complex in the IR.
 
 ## CLI
 

@@ -126,9 +126,10 @@ func TestDebugOptimized(t *testing.T) {
 	if err := os.WriteFile(exe, img, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmds := []string{"break opt.c:15", "run", "info args", "info locals", "c", "info locals", "delete", "break sq", "c", "bt", "next", "info locals"}
+	cmds := []string{"break opt.c:15", "run", "info args", "info locals", "c", "info locals", "delete", "break sq", "c", "bt", "next", "info locals",
+		"delete", "break opt.c:32", "c", "info locals"}
 	want := []string{"work (n=5, a=", "sum = 2", "scale = 1.5", "i = 0", "sum = 7", "scale = 1.875", "i = 1",
-		"sq (x=3) at", "work (n=5, a=", "y = 9"}
+		"sq (x=3) at", "work (n=5, a=", "y = 9", "big = 5902958103587056517120"}
 	var args []string
 	for _, c := range cmds {
 		args = append(args, "-ex", c)

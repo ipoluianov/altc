@@ -197,9 +197,18 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
   Atomic builtins and `_Atomic` operations become locked instructions
   (`lock xadd`, `lock cmpxchg` loops, `xchg`); stores to `_Atomic`
   objects are followed by `mfence`, like gcc.
-- Functions the IR does not cover (`__int128`, structs returned in x87
-  registers, `_Complex`, asm goto, VLAs, K&R definitions, computed goto,
-  `setjmp`) use the older
+- `__int128` values are pairs of 64-bit halves in the IR (two SSA
+  variables per variable, two registers per argument): `add`/`adc`,
+  `sub`/`sbb`, one `mul` for a full 64x64 product, `shld`/`shrd` with
+  `cmov` for variable shifts, `cmp`/`sbb` comparisons fused with branches;
+  division and float conversions call the libgcc functions. In `-g` output
+  the halves of a variable are described as two DWARF pieces. VLAs and
+  `alloca` move the stack pointer below the frame (the outgoing argument
+  area moves with it); VLA scopes save and restore it, also on `goto` out
+  of them and on every loop iteration.
+- Functions the IR does not cover (structs returned in x87 registers,
+  `_Complex`, asm goto, K&R definitions, computed goto, `setjmp`) use the
+  older
   stack-machine generator, which keeps the most used locals in callee-saved
   registers. The two mix freely within a file.
 - The result is typically close to gcc `-O2` on scalar code, and close to

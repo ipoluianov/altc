@@ -52,19 +52,26 @@ func (g *gen) checkInlinable(fn *cc.Obj) bool {
 	if fn.Body == nil || fn.NoInline || fn.IsWeak || fn.LabelAddrs || ft.Variadic || ft.OldStyle && len(fn.Params) > 0 {
 		return false
 	}
-	if ft.Ret.IsRecord() || ft.Ret.Kind == cc.TyLongDouble || is128(ft.Ret) {
+	if ft.Ret.IsRecord() || ft.Ret.Kind == cc.TyLongDouble {
 		return false
 	}
 	for _, p := range fn.Params {
-		if p.Ty.IsRecord() || p.Ty.Kind == cc.TyLongDouble || is128(p.Ty) {
+		if p.Ty.IsRecord() || p.Ty.Kind == cc.TyLongDouble {
 			return false
 		}
 	}
 	if asmDefinesLabels(fn) {
 		return false
 	}
-	nodes := 0
-	cc.Walk(fn.Body, func(n *cc.Node) { nodes++ })
+	// stack allocations would pile up in the caller (gcc does not inline them either)
+	nodes, alloca := 0, false
+	cc.Walk(fn.Body, func(n *cc.Node) {
+		nodes++
+		alloca = alloca || n.Kind == cc.NAlloca
+	})
+	if alloca {
+		return false
+	}
 	if nodes > inlineMaxNodes && !fn.AlwaysInline {
 		return false
 	}

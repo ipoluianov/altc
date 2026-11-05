@@ -20,6 +20,7 @@ const (
 	asmNone  asmMode = iota // an immediate operand
 	asmValue                // the value is stored in the slot
 	asmAddr                 // the address is stored at slot+16
+	asmCopy                 // a long double input: the 16 bytes at the address go to the slot
 )
 
 type irAsmOp struct {
@@ -74,6 +75,9 @@ func (b *irBuilder) asmStmt(n *cc.Node) {
 			case o.kind == akMem && o.match < 0 && isAddressable(e) && !(e.Kind == cc.NVar && b.promoted[e.Var]):
 				ao.mode, ao.arg = asmAddr, len(args)
 				args = append(args, b.addr(e))
+			case isLD(e.Ty):
+				ao.mode, ao.arg = asmCopy, len(args)
+				args = append(args, b.expr(e)) // the address of the value
 			default:
 				var x *irValue
 				if isAddrType(e.Ty) {
@@ -154,6 +158,16 @@ func (e *irEmitter) asm(v *irValue) {
 				a.Mov(8, m, Q(R11))
 			default:
 				a.Mov(8, m, Q(e.ireg(x, R11)))
+			}
+			if o.kind == akMem {
+				o.mem = m
+			}
+		case asmCopy:
+			m := M(RBP, off)
+			src := e.ireg(v.Args[ao.arg], RAX)
+			for k := int64(0); k < 16; k += 8 {
+				a.Mov(8, Q(R11), mdisp(M(src, 0), k))
+				a.Mov(8, mdisp(m, k), Q(R11))
 			}
 			if o.kind == akMem {
 				o.mem = m

@@ -24,9 +24,9 @@ func irTypeOf(t *cc.Type) irType {
 		return iF64
 	case t.Kind == cc.TyVector:
 		return vecIRType(t)
-	case t.Kind == cc.TyLongDouble, t.Kind == cc.TyComplex, t.Kind == cc.TyVLA:
+	case t.Kind == cc.TyLongDouble, t.Kind == cc.TyComplex:
 		unsupported("type %d", t.Kind)
-	case t.Kind == cc.TyPtr, t.Kind == cc.TyNullptr, t.Kind == cc.TyArray, t.Kind == cc.TyFunc,
+	case t.Kind == cc.TyPtr, t.Kind == cc.TyNullptr, t.Kind == cc.TyArray, t.Kind == cc.TyVLA, t.Kind == cc.TyFunc,
 		t.Kind == cc.TyStruct, t.Kind == cc.TyUnion:
 		return iI64
 	case t.IsInteger():
@@ -35,6 +35,8 @@ func irTypeOf(t *cc.Type) irType {
 			return iI32
 		case 8:
 			return iI64
+		case 16:
+			return iI128
 		}
 		unsupported("integer of %d bytes", t.Size())
 	case t.Kind == cc.TyVoid:
@@ -46,7 +48,7 @@ func irTypeOf(t *cc.Type) irType {
 
 // isAddrType tells whether expressions of type t evaluate to an address
 func isAddrType(t *cc.Type) bool {
-	return t.Kind == cc.TyArray || t.Kind == cc.TyFunc || t.Kind == cc.TyStruct || t.Kind == cc.TyUnion
+	return t.Kind == cc.TyArray || t.Kind == cc.TyVLA || t.Kind == cc.TyFunc || t.Kind == cc.TyStruct || t.Kind == cc.TyUnion
 }
 
 func unsignedType(t *cc.Type) bool {
@@ -76,6 +78,9 @@ type irBuilder struct {
 	pending  map[*irBlock][]phiPending
 	varType  map[*cc.Obj]irType
 
+	halves128 map[*cc.Obj][2]*cc.Obj // the half variables of 128-bit SSA variables
+	halfOf    map[*cc.Obj]halfVar    // and back (for the debug information)
+
 	analyzed map[*cc.Obj]bool // functions whose locals were classified
 	dbgVars  map[*cc.Obj]bool // the named variables described in the debug information (-g)
 	inl      *inlineCtx       // the innermost function being inlined
@@ -87,6 +92,7 @@ type irBuilder struct {
 	retInMem  bool      // the result goes through a hidden pointer
 	retPtr    *irValue  // that pointer
 	retChunks []irChunk // a struct result returned in registers
+	ret128    bool      // a 128-bit result
 }
 
 // irChunk is an eightbyte of a struct passed in a register
@@ -157,7 +163,8 @@ func (g *gen) lowerFunction(fn *cc.Obj) (f *irFunc, err error) {
 		g: g, fn: fn, f: &irFunc{Name: fn.Name},
 		promoted: map[*cc.Obj]bool{}, slots: map[*cc.Obj]*irSlot{},
 		labels: map[string]*irBlock{}, pending: map[*irBlock][]phiPending{},
-		varType: map[*cc.Obj]irType{}, analyzed: map[*cc.Obj]bool{},
+		varType: map[*cc.Obj]irType{}, analyzed: map[*cc.Obj]bool{}, halves128: map[*cc.Obj][2]*cc.Obj{},
+		halfOf: map[*cc.Obj]halfVar{},
 	}
 	if g.debug {
 		b.dbgVars = dbgVarSet(fn)
@@ -185,8 +192,10 @@ func (b *irBuilder) build() {
 	case ret.Kind == cc.TyLongDouble:
 		b.f.RetX87 = true
 		b.f.RetType = iI64
-	case retInX87(ret) || retInX87Pair(ret) || is128(ret):
-		unsupported("x87 or 128-bit return")
+	case retInX87(ret) || retInX87Pair(ret):
+		unsupported("x87 return")
+	case is128(ret):
+		b.ret128 = true // in rax:rdx
 	case ret.IsRecord():
 		if _, _, ok := irStructRegs(ret); ok {
 			b.retChunks = chunksOf(ret)
@@ -215,7 +224,29 @@ func (b *irBuilder) build() {
 	for _, p := range fn.Params {
 		t := p.Ty
 		if is128(t) {
-			unsupported("x87 or 128-bit parameter")
+			// two registers, or 16 aligned bytes on the stack
+			var lo, hi *irValue
+			if gp+2 <= 6 {
+				lo = b.param(irParamLoc{Reg: argGP[gp], Type: iI64})
+				hi = b.param(irParamLoc{Reg: argGP[gp+1], Type: iI64})
+				gp += 2
+			} else {
+				stackOff = alignTo(stackOff, 16)
+				if !b.promoted[p] {
+					b.slots[p] = &irSlot{Size: 16, Align: 16, Offset: stackOff, Fixed: true, Name: p.Name}
+					stackOff += 16
+					continue
+				}
+				lo = b.param(irParamLoc{Reg: NoReg, Stack: stackOff, Type: iI64})
+				hi = b.param(irParamLoc{Reg: NoReg, Stack: stackOff + 8, Type: iI64})
+				stackOff += 16
+			}
+			if b.promoted[p] {
+				b.writeVar(p, b.pair(lo, hi))
+			} else {
+				b.store128(b.slotAddr(p), b.pair(lo, hi))
+			}
+			continue
 		}
 		if isLD(t) {
 			// in memory, 16-byte aligned: the variable's home
@@ -336,12 +367,29 @@ func (b *irBuilder) analyzeLocals(fn *cc.Obj) {
 			addrOf(n.LHS)
 		}
 	})
+	// a VLA is its address (taking it gives the same pointer), and the
+	// saved stack pointers of VLA scopes are values too
+	cc.Walk(fn.Body, func(n *cc.Node) {
+		if n.StackSave != nil {
+			b.promoted[n.StackSave] = true
+			b.varType[n.StackSave] = iI64
+		}
+	})
+	for _, v := range fn.Locals {
+		if v.Ty.Kind == cc.TyVLA {
+			if v.Align > 16 {
+				unsupported("over-aligned VLA")
+			}
+			b.promoted[v] = true
+			b.varType[v] = iI64
+		}
+	}
 	for _, v := range fn.Locals {
 		t := v.Ty
-		if taken[v] || v.RegName != "" || t.Volatile || t.Atomic || v.Align > 16 && !t.IsVector() {
+		if t.Kind == cc.TyVLA || taken[v] || v.RegName != "" || t.Volatile || t.Atomic || v.Align > 16 && !t.IsVector() {
 			continue
 		}
-		if t.Kind == cc.TyPtr || t.Kind == cc.TyNullptr || t.IsInteger() && t.Size() <= 8 || t.Kind == cc.TyFloat || t.Kind == cc.TyDouble || t.IsVector() {
+		if t.Kind == cc.TyPtr || t.Kind == cc.TyNullptr || t.IsInteger() && (t.Size() <= 8 || is128(t)) || t.Kind == cc.TyFloat || t.Kind == cc.TyDouble || t.IsVector() {
 			b.promoted[v] = true
 			b.varType[v] = irTypeOf(t)
 		}
@@ -358,6 +406,15 @@ func (b *irBuilder) ensure() {
 }
 
 func (b *irBuilder) add(op irOp, t irType, args ...*irValue) *irValue {
+	// 128-bit values are taken apart before any operation
+	if t == iI128 {
+		unsupported("128-bit %s", opNames[op])
+	}
+	for _, a := range args {
+		if a.Type == iI128 {
+			unsupported("128-bit operand of %s", opNames[op])
+		}
+	}
 	b.ensure()
 	v := b.f.newValue(b.cur, op, t, args...)
 	b.cur.Instrs = append(b.cur.Instrs, v)
@@ -365,6 +422,9 @@ func (b *irBuilder) add(op irOp, t irType, args ...*irValue) *irValue {
 }
 
 func (b *irBuilder) iconst(t irType, c int64) *irValue {
+	if t == iI128 {
+		return b.const128(c, c>>63)
+	}
 	if t == iI32 {
 		c = int64(int32(c))
 	}
@@ -425,12 +485,23 @@ func (b *irBuilder) labelBlock(name string) *irBlock {
 
 func (b *irBuilder) writeVar(v *cc.Obj, val *irValue) {
 	b.ensure()
+	if b.varType[v] == iI128 {
+		h := b.halfVars(v)
+		lo, hi := halves(val)
+		b.writeVar(h[0], lo)
+		b.writeVar(h[1], hi)
+		return
+	}
 	b.cur.defs[v] = val
 	b.recordDef(v, val)
 }
 
 func (b *irBuilder) readVar(v *cc.Obj) *irValue {
 	b.ensure()
+	if b.varType[v] == iI128 {
+		h := b.halfVars(v)
+		return b.pair(b.readVarIn(h[0], b.cur), b.readVarIn(h[1], b.cur))
+	}
 	return b.readVarIn(v, b.cur)
 }
 
@@ -548,6 +619,9 @@ func (b *irBuilder) slotAddr(v *cc.Obj) *irValue {
 }
 
 func (b *irBuilder) load(addr *irValue, t *cc.Type) *irValue {
+	if is128(t) {
+		return b.load128(addr, t)
+	}
 	it := irTypeOf(t)
 	v := b.add(opLoad, it, addr)
 	v.AuxInt = cSize(t)
@@ -557,6 +631,10 @@ func (b *irBuilder) load(addr *irValue, t *cc.Type) *irValue {
 }
 
 func (b *irBuilder) store(addr, val *irValue, t *cc.Type) {
+	if is128(t) {
+		b.store128(addr, val)
+		return
+	}
 	v := b.add(opStore, iNone, val, addr)
 	v.AuxInt = cSize(t)
 }
@@ -585,11 +663,10 @@ func (b *irBuilder) stmt(n *cc.Node) {
 		b.seal(end)
 		b.cur = end
 	case cc.NFor:
-		if n.StackSave != nil {
-			unsupported("VLA scope")
-		}
 		b.stmt(n.Init)
-		if n.Cond != nil && duplicable(n.Cond) {
+		// VLAs of the body are released on every iteration and after the loop
+		b.stackSave(n.StackSave)
+		if n.Cond != nil && duplicable(n.Cond) && n.StackSave == nil {
 			// rotated: if (cond) do { body; inc } while (cond)
 			pre := b.f.newBlock()
 			pre.isPreHead = true
@@ -616,6 +693,7 @@ func (b *irBuilder) stmt(n *cc.Node) {
 			return
 		}
 		head := b.loopEntry()
+		b.stackRestore(n.StackSave)
 		brk, cont := b.labelBlock(n.BrkLabel), b.labelBlock(n.ContLabel)
 		body := b.f.newBlock()
 		if n.Cond != nil {
@@ -637,11 +715,11 @@ func (b *irBuilder) stmt(n *cc.Node) {
 		b.seal(head)
 		b.seal(brk)
 		b.cur = brk
+		b.stackRestore(n.StackSave)
 	case cc.NDo:
-		if n.StackSave != nil {
-			unsupported("VLA scope")
-		}
+		b.stackSave(n.StackSave)
 		head := b.loopEntry()
+		b.stackRestore(n.StackSave)
 		brk, cont := b.labelBlock(n.BrkLabel), b.labelBlock(n.ContLabel)
 		b.stmt(n.Then)
 		b.jump(cont)
@@ -651,6 +729,7 @@ func (b *irBuilder) stmt(n *cc.Node) {
 		b.seal(head)
 		b.seal(brk)
 		b.cur = brk
+		b.stackRestore(n.StackSave)
 	case cc.NSwitch:
 		b.switchStmt(n)
 	case cc.NCase:
@@ -659,16 +738,13 @@ func (b *irBuilder) stmt(n *cc.Node) {
 		b.cur = lb
 		b.stmt(n.LHS)
 	case cc.NBlock:
-		if n.StackSave != nil {
-			unsupported("VLA scope")
-		}
+		b.stackSave(n.StackSave)
 		for _, s := range n.Body {
 			b.stmt(s)
 		}
+		b.stackRestore(n.StackSave)
 	case cc.NGoto:
-		if n.StackSave != nil {
-			unsupported("goto out of VLA scope")
-		}
+		b.stackRestore(n.StackSave)
 		b.jump(b.labelBlock(n.UniqueLabel))
 	case cc.NLabel:
 		lb := b.labelBlock(n.UniqueLabel)
@@ -694,6 +770,14 @@ func (b *irBuilder) stmt(n *cc.Node) {
 				c.AuxInt = b.fn.Ty.Ret.Size()
 			}
 			b.ret(b.retPtr)
+			return
+		case b.ret128:
+			if v != nil {
+				lo, hi := halves(v)
+				b.ensure()
+				b.cur.RetVals = []*irValue{lo, hi}
+			}
+			b.ret(nil)
 			return
 		case b.retChunks != nil:
 			if v == nil {
@@ -728,6 +812,21 @@ func (b *irBuilder) stmt(n *cc.Node) {
 
 // loopEntry ends the current block with a jump through a preheader to a
 // new (unsealed) loop header and continues in the header
+// stackSave remembers the stack pointer before the VLAs of a scope
+func (b *irBuilder) stackSave(v *cc.Obj) {
+	if v != nil {
+		b.writeVar(v, b.add(opStackSave, iI64))
+	}
+}
+
+// stackRestore releases the VLAs allocated since stackSave (nothing to do
+// in unreachable code)
+func (b *irBuilder) stackRestore(v *cc.Obj) {
+	if v != nil && b.cur != nil {
+		b.add(opStackRestore, iNone, b.readVar(v))
+	}
+}
+
 func (b *irBuilder) loopEntry() *irBlock {
 	pre := b.f.newBlock()
 	pre.isPreHead = true
@@ -749,9 +848,16 @@ func (b *irBuilder) switchStmt(n *cc.Node) {
 		target := b.labelBlock(c.Label)
 		targets = append(targets, target)
 		var cmp *irValue
-		if c.Begin == c.End {
+		switch {
+		case v.Type == iI128 && c.Begin == c.End:
+			lo, hi := halves(v)
+			d := b.add(opOr, iI64, b.add(opXor, iI64, lo, b.iconst(iI64, c.Begin)), b.add(opXor, iI64, hi, b.iconst(iI64, c.Begin>>63)))
+			cmp = b.add(opEq, iI32, d, b.iconst(iI64, 0))
+		case v.Type == iI128:
+			unsupported("128-bit case range")
+		case c.Begin == c.End:
 			cmp = b.add(opEq, iI32, v, b.iconst(v.Type, c.Begin))
-		} else {
+		default:
 			d := b.add(opSub, v.Type, v, b.iconst(v.Type, c.Begin))
 			cmp = b.add(opULe, iI32, d, b.iconst(v.Type, c.End-c.Begin))
 		}
@@ -848,6 +954,9 @@ func (b *irBuilder) cond(n *cc.Node, t, f *irBlock) {
 	if isLD(n.Ty) {
 		v = b.ldTruth(v)
 	}
+	if is128(n.Ty) {
+		v = b.truth128(v)
+	}
 	b.branch(b.truth(v), t, f)
 }
 
@@ -856,7 +965,7 @@ func (b *irBuilder) truth(v *irValue) *irValue {
 	if v.Type.isVec() {
 		unsupported("vector used as a condition")
 	}
-	if v.Op.isCompare() {
+	if v.setsFlags() {
 		return v
 	}
 	if v.Type.isFloat() {
@@ -878,6 +987,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		t := irTypeOf(n.Ty)
 		if t.isFloat() {
 			return b.fconst(t, n.FVal)
+		}
+		if t == iI128 {
+			return b.const128(n.Val, n.Val>>63) // constants are 64-bit values extended
 		}
 		return b.iconst(t, normInt(n.Val, n.Ty))
 	case cc.NVar:
@@ -924,6 +1036,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		if isAddrType(n.Ty) {
 			return v
 		}
+		if is128(n.Ty) || is128(n.LHS.Ty) {
+			return b.convert128(v, n.LHS.Ty, n.Ty)
+		}
 		if isLD(n.LHS.Ty) {
 			return b.fromLD(v, n.Ty)
 		}
@@ -937,6 +1052,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		v := b.expr(n.LHS)
 		if isLD(n.LHS.Ty) {
 			return b.x87Compare(x87Eq, v, b.ldZero())
+		}
+		if is128(n.LHS.Ty) {
+			return b.add(opEq, iI32, b.truth128(v), b.iconst(iI32, 0))
 		}
 		if v.Type.isFloat() {
 			return b.add(opFEq, iI32, v, b.fconst(v.Type, 0))
@@ -955,12 +1073,18 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		if isLD(n.Ty) {
 			return b.x87(x87Neg, v)
 		}
+		if is128(n.Ty) {
+			return b.neg128(v)
+		}
 		if v.Type.isFloat() {
 			return b.add(opFNeg, v.Type, v)
 		}
 		return b.add(opNeg, v.Type, v)
 	case cc.NBitNot:
 		v := b.expr(n.LHS)
+		if is128(n.Ty) {
+			return b.not128(v)
+		}
 		return b.add(opNot, v.Type, v)
 	case cc.NFuncall:
 		return b.call(n)
@@ -986,6 +1110,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 	case cc.NFence:
 		b.add(opFence, iNone)
 		return nil
+	case cc.NAlloca:
+		size := b.expr(n.LHS)
+		return b.add(opAlloca, iI64, size)
 	case cc.NCas:
 		return b.casExpr(n)
 	case cc.NExch:
@@ -1025,6 +1152,9 @@ func (b *irBuilder) addr(n *cc.Node) *irValue {
 	switch n.Kind {
 	case cc.NVar:
 		v := n.Var
+		if v.Ty.Kind == cc.TyVLA && b.promoted[v] {
+			return b.readVar(v)
+		}
 		if b.promoted[v] {
 			unsupported("address of a register variable")
 		}
@@ -1074,6 +1204,11 @@ func (b *irBuilder) addr(n *cc.Node) *irValue {
 
 func (b *irBuilder) assign(n *cc.Node) *irValue {
 	lhs := n.LHS
+	if lhs.Kind == cc.NVLAPtr && b.promoted[lhs.Var] {
+		v := b.expr(n.RHS)
+		b.writeVar(lhs.Var, v)
+		return v
+	}
 	if lhs.Kind == cc.NVar && b.promoted[lhs.Var] {
 		v := b.expr(n.RHS)
 		b.writeVar(lhs.Var, v)
@@ -1164,6 +1299,9 @@ func (b *irBuilder) binary(n *cc.Node) *irValue {
 	y := b.expr(n.RHS)
 	if x == nil || y == nil {
 		unsupported("void operand")
+	}
+	if is128(lt) || is128(n.RHS.Ty) {
+		return b.binary128(n, x, y)
 	}
 	if isLD(lt) || isLD(n.RHS.Ty) {
 		if !isLD(lt) || !isLD(n.RHS.Ty) {
@@ -1282,6 +1420,9 @@ func (b *irBuilder) convert(v *irValue, from, to *cc.Type) *irValue {
 	if v == nil {
 		unsupported("void value")
 	}
+	if is128(from) || is128(to) {
+		return b.convert128(v, from, to)
+	}
 	if to.Kind == cc.TyBool {
 		if from.Kind == cc.TyBool {
 			return v
@@ -1366,8 +1507,8 @@ func (b *irBuilder) intConvert(v *irValue, fs int64, fu bool, ts int64, tu bool)
 
 func (b *irBuilder) call(n *cc.Node) *irValue {
 	rt := n.Ty
-	if retInX87(rt) || retInX87Pair(rt) || is128(rt) {
-		unsupported("x87 or 128-bit call result")
+	if retInX87(rt) || retInX87Pair(rt) {
+		unsupported("x87 call result")
 	}
 	ft := n.FuncTy
 	direct := ""
@@ -1397,6 +1538,11 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 		buf = b.newSlot(16, 16)
 		call.RetX87 = buf
 	}
+	if is128(rt) {
+		buf = b.newSlot(16, 16)
+		call.RetSlot = buf
+		call.RetChunks = []irChunk{{off: 0, size: 8, t: iI64}, {off: 8, size: 8, t: iI64}}
+	}
 	if rt.IsRecord() {
 		buf = b.newSlot(rt.Size(), max(rt.Align(), 8))
 		if _, _, ok := irStructRegs(rt); ok {
@@ -1410,7 +1556,18 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 	for _, a := range n.Args {
 		t := a.Ty
 		if is128(t) {
-			unsupported("x87 or 128-bit argument")
+			lo, hi := halves(b.expr(a))
+			if gp+2 <= 6 {
+				push(lo, callLoc{Reg: argGP[gp]})
+				push(hi, callLoc{Reg: argGP[gp+1]})
+				gp += 2
+			} else {
+				stack = alignTo(stack, 16)
+				push(lo, callLoc{Reg: NoReg, Stack: stack})
+				push(hi, callLoc{Reg: NoReg, Stack: stack + 8})
+				stack += 16
+			}
+			continue
 		}
 		if isLD(t) {
 			stack = alignTo(stack, 16)
@@ -1474,11 +1631,14 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 		args = append(args, b.expr(fnode))
 	}
 	t := iNone
-	if !rt.IsRecord() && !isLD(rt) {
+	if !rt.IsRecord() && !isLD(rt) && !is128(rt) {
 		t = irTypeOf(rt)
 	}
 	c := b.add(opCall, t, args...)
 	c.Call = call
+	if is128(rt) {
+		return b.load128(b.slotRef(buf), rt)
+	}
 	if buf != nil {
 		return b.slotRef(buf)
 	}
@@ -1652,9 +1812,6 @@ func (b *irBuilder) storeBitfield(lhs, rhs *cc.Node) *irValue {
 // n.Ty.Base, taking it from the register save area while registers last
 func (b *irBuilder) vaArg(n *cc.Node) *irValue {
 	t := n.Ty.Base
-	if is128(t) {
-		unsupported("va_arg of x87 or 128-bit type")
-	}
 	ap := b.expr(n.LHS)
 	result := b.newTemp(iI64)
 	regs, mem, end := b.f.newBlock(), b.f.newBlock(), b.f.newBlock()
@@ -1676,6 +1833,8 @@ func (b *irBuilder) vaArg(n *cc.Node) *irValue {
 		}
 	case isSSE(t):
 		nf = 1
+	case is128(t):
+		ng = 2
 	default:
 		ng = 1
 	}
@@ -1714,7 +1873,7 @@ func (b *irBuilder) vaArg(n *cc.Node) *irValue {
 			if nf > 0 {
 				b.writeVar(result, next(4, 16))
 			} else {
-				b.writeVar(result, next(0, 8))
+				b.writeVar(result, next(0, int64(8*ng)))
 			}
 		} else {
 			tmp := b.newSlot(alignTo(t.Size(), 8), max(t.Align(), 8))

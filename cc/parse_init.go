@@ -790,6 +790,16 @@ func (p *parser) writeGvarData(o *Obj, init *initializer, ty *Type, buf []byte, 
 		}
 		return
 	}
+	if ty.Size() == 16 && ty.IsInteger() {
+		// exactly, in 128 bits
+		if w, ok := p.evalWide(newCast(e, ty)); ok {
+			u := new(big.Int).Mod(w, new(big.Int).Lsh(big.NewInt(1), 128))
+			lo := new(big.Int).And(u, new(big.Int).SetUint64(^uint64(0)))
+			p.writeBuf(buf[offset:], lo.Uint64(), 8)
+			p.writeBuf(buf[offset+8:], new(big.Int).Rsh(u, 64).Uint64(), 8)
+			return
+		}
+	}
 	label := ""
 	v := p.eval2(e, &label)
 	if label == "" {

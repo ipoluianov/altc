@@ -140,6 +140,17 @@ func (f *irFunc) splitCriticalEdges() {
 	}
 }
 
+// lastCode is the last instruction of b that emits code (constants and
+// addresses are materialized where they are used)
+func lastCode(b *irBlock) *irValue {
+	for i := len(b.Instrs) - 1; i >= 0; i-- {
+		if v := b.Instrs[i]; !v.Op.remat() {
+			return v
+		}
+	}
+	return nil
+}
+
 // allocate assigns locations to the values of f
 func (f *irFunc) allocate() *irAlloc {
 	f.splitCriticalEdges()
@@ -151,7 +162,7 @@ func (f *irFunc) allocate() *irAlloc {
 			continue
 		}
 		c := b.Ctrl
-		if c.Op.isCompare() && c.Block == b && c.uses == 1 && len(b.Instrs) > 0 && b.Instrs[len(b.Instrs)-1] == c {
+		if c.setsFlags() && c.Block == b && c.uses == 1 && lastCode(b) == c {
 			c.fused = true
 		}
 	}

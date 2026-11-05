@@ -25,6 +25,7 @@ altc -S file.c           # GNU assembler listing
 altc -E file.c           # preprocessed output
 altc -c start.S          # assembler sources: .s, or .S with the C preprocessor
 altc -march=native f.c   # use the extensions of this processor (AVX2...)
+altc -static f.c -o f    # self-contained executable (libc.a, no dynamic loader)
 ```
 
 ## Processor extensions and SIMD
@@ -74,9 +75,13 @@ for more:
 - `-g`: DWARF 4 debug information — the line table, the functions, and at
   `-O0` the parameters, locals, globals and their types (structures,
   bit-fields, arrays, pointers), so gdb can set breakpoints, step, show
-  values and backtraces. With optimization the lines and functions are
-  described but not the local variables, nor inlined calls. `-g` does not
-  change the generated code. The linker keeps the `.debug_*` sections of
+  values and backtraces. Optimized code is described too: parameters and
+  locals get location lists (registers, spill slots or constants over the
+  code where they hold the variable's value, from the register
+  allocator's live ranges, starting where the assignment is in the
+  program), and inlined calls are `DW_TAG_inlined_subroutine`s with their
+  own variables, so `bt` shows them and `break` on an inlined function
+  stops in every copy. `-g` does not change the generated code. The linker keeps the `.debug_*` sections of
   all objects (gcc's DWARF 5 too), the assembler understands `.file`,
   `.loc`, `.uleb128` and `.sleb128`, and `-S -g` emits `.file`/`.loc`.
 
@@ -97,6 +102,7 @@ subfolder are on the include path. `altc.json` can set:
   "libs": ["z"],
   "libDirs": ["/opt/lib"],
   "cflags": ["-w"],
+  "static": false,
   "output": "bin/app",
   "args": ["--verbose"]
 }
@@ -129,8 +135,7 @@ subfolder are on the include path. `altc.json` can set:
   `asm goto`, local register variables (`register long r asm("r10")`) and
   file-scope `asm`.
 
-Not supported yet: DWARF descriptions of inlined calls and of local
-variables of optimized code, AVX-512, MMX
+Not supported yet: AVX-512, MMX
 (`__m64`), `__builtin_cpu_is` with processor names (only `"intel"` and
 `"amd"` are known; the others give 0).
 
@@ -163,7 +168,18 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
   itself. What glibc keeps in `libc_nonshared.a` (`atexit`...) and the
   libgcc helpers for `__int128` come from a small runtime compiled on the
   fly.
-- Objects from gcc (`-fno-pic` or PIE) and static archives can be linked in.
+- `-static` (or `"static": true` in `altc.json`) links like `gcc -static`:
+  `crt1.o`, `crti.o`, `crtbeginT.o`, the objects, `libc.a`, `libm.a`,
+  `libgcc.a`, `libgcc_eh.a`, `crtend.o`, `crtn.o` (the `libc6-dev` and
+  gcc packages). The linker then writes no `.interp`/`.dynamic`; IFUNCs
+  (glibc's `memcpy`, `strlen`...) get `R_X86_64_IRELATIVE` entries in
+  `.rela.iplt` that libc applies at startup. C++ (`-lstdc++`) and
+  `pthread_cancel` work statically too.
+- Objects from gcc (`-fno-pic`, PIE or `-fPIC`) and static archives can be
+  linked in. General and local dynamic TLS accesses of `-fPIC` code are
+  relaxed to local exec (or initial exec for a variable of a shared
+  library), as GNU ld does. Weak undefined references do not pull archive
+  members.
 - Functions are compiled through an SSA intermediate representation
   (`x64/ir*.go`): lowering builds SSA directly from the AST (locals whose
   address is never taken become values), then constant folding and
@@ -175,8 +191,15 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
   (uses weighted by loop depth) over live ranges with holes; phis are
   coalesced with their operands; values living across calls get
   callee-saved registers or stack slots.
-- Functions the IR does not cover (`long double`, `__int128`, asm goto,
-  VLAs, atomics, K&R definitions, computed goto, `setjmp`) use the older
+- `long double` values live in memory in the IR: an expression evaluates
+  to the address of its 80-bit value, and each operation is a short x87
+  sequence on memory operands (the x87 stack is empty between values).
+  Atomic builtins and `_Atomic` operations become locked instructions
+  (`lock xadd`, `lock cmpxchg` loops, `xchg`); stores to `_Atomic`
+  objects are followed by `mfence`, like gcc.
+- Functions the IR does not cover (`__int128`, structs returned in x87
+  registers, `_Complex`, asm goto, VLAs, K&R definitions, computed goto,
+  `setjmp`) use the older
   stack-machine generator, which keeps the most used locals in callee-saved
   registers. The two mix freely within a file.
 - The result is typically close to gcc `-O2` on scalar code, and close to

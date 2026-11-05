@@ -137,6 +137,8 @@ const (
 	opAsm        // inline assembly: Args are its operand values and addresses
 	opVInsn      // vector instruction Sym on Args (AuxInt: immediate when Signed)
 	opVBroadcast // scalar to all elements; Sym: element kind (b w d q ps pd)
+	opX87        // long double operation AuxInt (x87Kind) on 16-byte memory operands (see irx87.go)
+	opAtomic     // locked read-modify-write AuxInt (atomicKind) returning the old value (see iratomic.go)
 	opNumOps
 )
 
@@ -148,7 +150,7 @@ var opNames = [...]string{
 	"feq", "fne", "flt", "fle", "fgt", "fge",
 	"sext8", "sext16", "zext8", "zext16", "sext32", "zext32", "trunc",
 	"cvti2f", "cvtu2f", "cvtf2i", "cvtf2u", "fext", "ftrunc", "fabs", "fbits", "builtin",
-	"load", "store", "memzero", "memcpy", "call", "fence", "trap", "asm", "vinsn", "vbroadcast",
+	"load", "store", "memzero", "memcpy", "call", "fence", "trap", "asm", "vinsn", "vbroadcast", "x87", "atomic",
 }
 
 // pure operations depend only on their arguments
@@ -201,6 +203,7 @@ type irCall struct {
 	StackSize int64 // bytes of stack arguments
 	RetSlot   *irSlot
 	RetChunks []irChunk // a struct result in registers, stored to RetSlot
+	RetX87    *irSlot   // a long double result: st(0) is stored there
 }
 
 // callLoc is where an argument goes: a register, or the stack (a struct
@@ -228,6 +231,7 @@ type irValue struct {
 	Block  *irBlock
 
 	tok   *cc.Token // the source position (debug line tables)
+	site  *dbgSite  // the inlined call the value comes from (with -g)
 	fwd   *irValue  // replacement of a removed value
 	uses  int
 	fused bool // a comparison that only sets flags for its branch
@@ -268,6 +272,11 @@ type irBlock struct {
 	start     int // positions in the linear order
 	end       int
 	isPreHead bool
+
+	// where the code of a removed block went (debug information): the
+	// block it was merged into, after dbgAfter (nil: at its start)
+	dbgFwd   *irBlock
+	dbgAfter *irValue
 }
 
 // irSlot is a frame area: a local in memory or a spill slot. Incoming
@@ -288,11 +297,15 @@ type irFunc struct {
 	PLocs   []irParamLoc
 	RetType irType
 	VaSlot  *irSlot // register save area of a variadic function
+	RetX87  bool    // returns a long double: the returned value is its address, loaded into st(0)
 
-	isa         ISA       // instruction set extensions for the function
-	noVectorize bool      // no loop vectorization
-	fastMath    bool      // floating-point reductions may be reassociated
-	curTok      *cc.Token // the statement being lowered (the position of new values)
+	isa         ISA                 // instruction set extensions for the function
+	noVectorize bool                // no loop vectorization
+	fastMath    bool                // floating-point reductions may be reassociated
+	curTok      *cc.Token           // the statement being lowered (the position of new values)
+	curSite     *dbgSite            // the inlined call being lowered (-g)
+	dbgDefs     []dbgDef            // values assigned to named variables (-g)
+	dbgMem      map[*cc.Obj]*irSlot // named variables kept in frame slots (-g)
 	nextID      int
 	nextBlk     int
 }
@@ -312,7 +325,7 @@ func (f *irFunc) newBlock() *irBlock {
 }
 
 func (f *irFunc) newValue(b *irBlock, op irOp, t irType, args ...*irValue) *irValue {
-	v := &irValue{ID: f.nextID, Op: op, Type: t, Args: args, Block: b, tok: f.curTok}
+	v := &irValue{ID: f.nextID, Op: op, Type: t, Args: args, Block: b, tok: f.curTok, site: f.curSite}
 	f.nextID++
 	return v
 }
@@ -356,6 +369,10 @@ func (v *irValue) longString() string {
 		}
 	case opParam, opLoad, opMemzero, opMemcpy:
 		fmt.Fprintf(&sb, " [%d]", v.AuxInt)
+	case opX87:
+		fmt.Fprintf(&sb, " %s", x87Names[v.AuxInt])
+	case opAtomic:
+		fmt.Fprintf(&sb, " %s", atomicNames[v.AuxInt])
 	case opGlobal, opGlobalGOT:
 		fmt.Fprintf(&sb, " %s", v.Sym)
 	case opSlot:

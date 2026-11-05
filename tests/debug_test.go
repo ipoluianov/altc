@@ -31,7 +31,7 @@ func TestDebugInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := func(t *testing.T, objs ...*elf.Object) string {
-		img, diags := driver.Link(&driver.LinkInput{Objects: objs})
+		img, diags := driver.Link(&driver.LinkInput{Objects: objs, Static: strings.HasSuffix(t.Name(), "static")})
 		if img == nil {
 			t.Fatal(diags)
 		}
@@ -71,6 +71,9 @@ func TestDebugInfo(t *testing.T) {
 	t.Run("altc", func(t *testing.T) {
 		check(t, link(t, compile(t, src, data, &driver.Config{Std: "gnu17", NoWarnings: true, NoRegAlloc: true, Debug: true})), true)
 	})
+	t.Run("altc_static", func(t *testing.T) {
+		check(t, link(t, compile(t, src, data, &driver.Config{Std: "gnu17", NoWarnings: true, NoRegAlloc: true, Debug: true})), true)
+	})
 	t.Run("gcc_asm", func(t *testing.T) {
 		s := filepath.Join(tmp, "point.s")
 		if out, err := exec.Command(gcc, "-g", "-O0", "-S", "-o", s, src).CombinedOutput(); err != nil {
@@ -96,4 +99,47 @@ func TestDebugInfo(t *testing.T) {
 		os.WriteFile(exe, img, 0o755)
 		check(t, exe, true)
 	})
+}
+
+// TestDebugOptimized runs gdb on optimized code (-O2 -g): parameters and
+// locals in registers (location lists), and an inlined call in the
+// backtrace with its argument
+func TestDebugOptimized(t *testing.T) {
+	gdb, err := exec.LookPath("gdb")
+	if err != nil {
+		t.Skip("gdb not found")
+	}
+	src, _ := filepath.Abs("debug/opt.c")
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := driver.CompileSource(src, data, &driver.Config{Std: "gnu17", NoWarnings: true, Debug: true})
+	if u.Obj == nil {
+		t.Fatal(u.Diagnostics)
+	}
+	img, diags := driver.Link(&driver.LinkInput{Objects: []*elf.Object{u.Obj}})
+	if img == nil {
+		t.Fatal(diags)
+	}
+	exe := filepath.Join(t.TempDir(), "opt")
+	if err := os.WriteFile(exe, img, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmds := []string{"break opt.c:15", "run", "info args", "info locals", "c", "info locals", "delete", "break sq", "c", "bt", "next", "info locals"}
+	want := []string{"work (n=5, a=", "sum = 2", "scale = 1.5", "i = 0", "sum = 7", "scale = 1.875", "i = 1",
+		"sq (x=3) at", "work (n=5, a=", "y = 9"}
+	var args []string
+	for _, c := range cmds {
+		args = append(args, "-ex", c)
+	}
+	out, _ := exec.Command(gdb, append(append([]string{"-batch", "-nx"}, args...), exe)...).CombinedOutput()
+	pos := 0
+	for _, w := range want {
+		i := strings.Index(string(out[pos:]), w)
+		if i < 0 {
+			t.Fatalf("gdb output lacks %q (in order):\n%s", w, out)
+		}
+		pos += i
+	}
 }

@@ -231,7 +231,7 @@ func TestABIInterop(t *testing.T) {
 			}
 			want, _ := run(t, ref, dir)
 			for _, mode := range []string{"altc-caller", "altc-callee", "altc-both"} {
-				in := &driver.LinkInput{}
+				in := linkInput()
 				switch mode {
 				case "altc-caller":
 					in.Objects = append(in.Objects, altcObj("caller"))

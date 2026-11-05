@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -125,7 +126,7 @@ func (p *Project) Build(ctx context.Context, opt BuildOptions) *BuildResult {
 	if ctx.Err() != nil {
 		return fail("build cancelled")
 	}
-	in := &LinkInput{}
+	in := &LinkInput{Static: p.Static || slices.Contains(p.CFlags, "-static")}
 	for _, u := range units {
 		res.Diagnostics = append(res.Diagnostics, u.Diagnostics...)
 		if u.Obj != nil {

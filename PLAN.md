@@ -72,8 +72,14 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
     PT_GNU_EH_FRAME in the linker, DWARF 4 line tables, functions,
     variables and types (-g), .debug_* sections kept by the linker,
     .loc/.file/.uleb128/.sleb128 in the assembler.
-17. Later: long double/atomics in the IR, DWARF for inlined calls and
-    for locals of optimized code (location lists), AVX-512, `-static`.
+17. Static linking (`-static`): crt objects, libc.a/libgcc.a/libgcc_eh.a,
+    .rela.iplt for IFUNCs, .init/.fini ordering, __start_/__stop_ section
+    symbols, STB_GNU_UNIQUE; TLS GD/LD relaxation for -fPIC objects.
+18. long double (x87 values in memory) and atomics in the IR.
+19. DWARF for optimized code: location lists of SSA variables (bound to
+    the assignment points), constants, inlined subroutines with their
+    variables (.debug_loc, .debug_ranges).
+20. Later: AVX-512, __int128 and VLAs in the IR.
 
 ## CLI
 
@@ -81,6 +87,6 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
 altc build [dir]           build a project (current dir by default)
 altc run [dir] [-- args]   build and run
 altc file.c ... -o prog    gcc-like: -c -S -E -I -D -U -L -l -std= -o -w -O0 -g
-                           -march= -m<ext> -ffast-math
+                           -march= -m<ext> -ffast-math -static
 altc ide [dir]             open the IDE (same as no arguments)
 ```

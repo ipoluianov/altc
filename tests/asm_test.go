@@ -76,7 +76,7 @@ func TestAssembleGCCOutput(t *testing.T) {
 			compareWithGas(t, gasObj, u.Obj)
 
 			want, wantCode := run(t, ref, tmp)
-			img, diags := driver.Link(&driver.LinkInput{Objects: []*aelf.Object{u.Obj}})
+			img, diags := driver.Link(linkInput(u.Obj))
 			if img == nil {
 				for _, d := range diags {
 					t.Error(d)

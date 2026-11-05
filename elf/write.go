@@ -61,6 +61,20 @@ func WriteObject(o *Object) []byte {
 	syms.Write(make([]byte, 24))
 	symIdx := map[*Symbol]int{}
 	n := 1
+	// undefined thread-local variables are STT_TLS (GNU ld rejects a TLS
+	// definition matched with a non-TLS reference)
+	tlsRef := map[*Symbol]bool{}
+	for _, sec := range o.Sections {
+		for _, r := range sec.Relocs {
+			switch r.Type {
+			case R_X86_64_TPOFF32, R_X86_64_TPOFF64, R_X86_64_GOTTPOFF, R_X86_64_TLSGD, R_X86_64_TLSLD,
+				R_X86_64_DTPOFF32, R_X86_64_DTPOFF64, R_X86_64_GOTPC32_TLSDESC:
+				if !r.Sym.Defined() && r.Sym.Type == SymNoType {
+					tlsRef[r.Sym] = true
+				}
+			}
+		}
+	}
 	writeSym := func(s *Symbol) {
 		e := make([]byte, 24)
 		name := s.Name
@@ -76,6 +90,10 @@ func WriteObject(o *Object) []byte {
 			typ = 1
 		case SymTLS:
 			typ = 6
+		case SymNoType:
+			if tlsRef[s] {
+				typ = 6
+			}
 		case SymSection:
 			typ = 3
 		}

@@ -177,7 +177,12 @@ func (p *parser) toAssign(op NodeKind, lhs, rhs *Node, tok *Token) *Node {
 		ty := lhs.Ty.Unqual()
 		var val *Node
 		if ty.Kind == TyPtr {
+			// in units of the pointed-to type (the builtins work on bytes)
 			val = newCast(rhs, tyLong)
+			if sz := ty.Base.Size(); sz > 1 {
+				val = p.newBinary(NMul, val, newCast(newNum(sz, tok), tyLong), tok)
+				addType(val)
+			}
 		} else {
 			val = newCast(rhs, ty)
 		}

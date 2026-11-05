@@ -19,9 +19,11 @@ type Linker struct {
 	Archives   []*Archive
 	Lazy       []*Object // objects linked only when they define a needed symbol (runtime support)
 	SharedLibs []*SharedLib
-	Interp     string // dynamic loader path
-	Entry      string // entry symbol; "_start" by default (generated when missing)
-	StripSyms  bool   // do not write .symtab
+	Interp     string    // dynamic loader path
+	Entry      string    // entry symbol; "_start" by default (generated when missing)
+	StripSyms  bool      // do not write .symtab
+	Static     bool      // static executable: no dynamic loader, IFUNCs relocated by libc (.rela.iplt)
+	Tail       []*Object // objects placed after everything pulled from archives (crtend.o, crtn.o)
 
 	globals map[string]*Symbol // name -> definition (or import)
 	imports map[*Symbol]*imported
@@ -35,6 +37,7 @@ type Linker struct {
 	shIndex   map[string]int
 	got       map[*Symbol]int // GOT slot of a symbol (address)
 	gotTP     map[*Symbol]int // GOT slot holding a TLS offset
+	iplt      map[*Symbol]int // GOT slot of the PLT entry of a local IFUNC (R_X86_64_IRELATIVE)
 	gotSize   int
 	plt       map[*Symbol]int
 	pltSize   int
@@ -130,13 +133,15 @@ func (l *Linker) addObject(o *Object) {
 	}
 }
 
-// undefinedNames lists the names referenced but not defined anywhere yet
-func (l *Linker) undefinedNames() []string {
+// undefinedNames lists the names referenced but not defined anywhere yet;
+// strong limits them to those with a non-weak reference (only these pull
+// archive members, like GNU ld)
+func (l *Linker) undefinedNames(strong bool) []string {
 	seen := map[string]bool{}
 	var names []string
-	for _, o := range l.Objects {
+	for _, o := range append(l.Objects, l.Tail...) {
 		for _, s := range o.Symbols {
-			if s.Bind == BindLocal || s.Defined() || seen[s.Name] {
+			if s.Bind == BindLocal || s.Defined() || seen[s.Name] || strong && s.Bind == BindWeak {
 				continue
 			}
 			if _, ok := l.globals[s.Name]; ok {
@@ -152,7 +157,7 @@ func (l *Linker) undefinedNames() []string {
 
 // Link produces the executable image
 func (l *Linker) Link() ([]byte, error) {
-	if l.Interp == "" {
+	if l.Interp == "" && !l.Static {
 		l.Interp = "/lib64/ld-linux-x86-64.so.2"
 	}
 	if l.Entry == "" {
@@ -160,7 +165,7 @@ func (l *Linker) Link() ([]byte, error) {
 	}
 	l.globals = map[string]*Symbol{}
 	l.imports = map[*Symbol]*imported{}
-	for _, o := range l.Objects {
+	for _, o := range append(l.Objects, l.Tail...) {
 		l.addObject(o)
 	}
 	if _, ok := l.globals[l.Entry]; !ok && l.Entry == "_start" {
@@ -171,7 +176,7 @@ func (l *Linker) Link() ([]byte, error) {
 	// pull archive members until nothing changes
 	for changed := true; changed; {
 		changed = false
-		for _, name := range l.undefinedNames() {
+		for _, name := range l.undefinedNames(true) {
 			for i, lo := range l.Lazy {
 				if lo == nil {
 					continue
@@ -201,9 +206,12 @@ func (l *Linker) Link() ([]byte, error) {
 			}
 		}
 	}
+	l.Objects = append(l.Objects, l.Tail...)
+	l.Tail = nil
 	// the rest comes from shared libraries
 	usedLib := map[*SharedLib]bool{}
-	for _, name := range l.undefinedNames() {
+	var lateUndef []string
+	for _, name := range l.undefinedNames(false) {
 		found := false
 		for _, lib := range l.SharedLibs {
 			if ds, ok := lib.Syms[name]; ok {
@@ -226,6 +234,10 @@ func (l *Linker) Link() ([]byte, error) {
 			if l.linkerDefined(name) {
 				continue
 			}
+			if name == "__tls_get_addr" {
+				lateUndef = append(lateUndef, name) // may go away with TLS relaxation
+				continue
+			}
 			l.errorf("undefined reference to `%s' (in %s)", name, strings.Join(strong, ", "))
 		}
 	}
@@ -235,6 +247,12 @@ func (l *Linker) Link() ([]byte, error) {
 	for _, lib := range l.SharedLibs {
 		if usedLib[lib] {
 			l.needed = append(l.needed, lib)
+		}
+	}
+	l.relaxTLS()
+	for _, name := range lateUndef {
+		if strong := l.strongRefs(name); len(strong) > 0 {
+			l.errorf("undefined reference to `%s' (in %s)", name, strings.Join(strong, ", "))
 		}
 	}
 	l.scanRelocs()
@@ -274,10 +292,42 @@ var linkerSyms = map[string]bool{
 	"_GLOBAL_OFFSET_TABLE_": true, "_DYNAMIC": true, "__init_array_start": true, "__init_array_end": true,
 	"__fini_array_start": true, "__fini_array_end": true, "__preinit_array_start": true, "__preinit_array_end": true,
 	"_end": true, "end": true, "_edata": true, "edata": true, "__bss_start": true, "_etext": true, "etext": true,
-	"__executable_start": true, "__ehdr_start": true,
+	"__executable_start": true, "__ehdr_start": true, "__rela_iplt_start": true, "__rela_iplt_end": true,
 }
 
-func (l *Linker) linkerDefined(name string) bool { return linkerSyms[name] }
+func (l *Linker) linkerDefined(name string) bool {
+	if linkerSyms[name] {
+		return true
+	}
+	if sec, ok := strings.CutPrefix(name, "__start_"); ok {
+		return l.hasSection(sec)
+	}
+	if sec, ok := strings.CutPrefix(name, "__stop_"); ok {
+		return l.hasSection(sec)
+	}
+	return false
+}
+
+func (l *Linker) hasSection(name string) bool {
+	for _, o := range l.Objects {
+		for _, s := range o.Sections {
+			if s.Name == name && s.Kind != SecOther {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCIdent tells whether a section name can be named by __start_/__stop_ symbols
+func isCIdent(s string) bool {
+	for i, c := range s {
+		if !(c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || i > 0 && c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return s != ""
+}
 
 // isDynFunc tells whether the symbol is a function imported from a shared library
 func (l *Linker) imp(s *Symbol) *imported { return l.imports[s] }
@@ -285,6 +335,7 @@ func (l *Linker) imp(s *Symbol) *imported { return l.imports[s] }
 func (l *Linker) scanRelocs() {
 	l.got = map[*Symbol]int{}
 	l.gotTP = map[*Symbol]int{}
+	l.iplt = map[*Symbol]int{}
 	l.plt = map[*Symbol]int{}
 	for _, o := range l.Objects {
 		for _, sec := range o.Sections {
@@ -297,14 +348,22 @@ func (l *Linker) scanRelocs() {
 				if imp == nil && s.IFunc && s.Section != nil {
 					// a local IFUNC: every reference goes through a PLT entry
 					// whose GOT slot the dynamic loader fills by calling the
-					// resolver (R_X86_64_IRELATIVE)
-					if _, ok := l.got[s]; !ok {
-						l.got[s] = l.gotSize
+					// resolver (R_X86_64_IRELATIVE); the PLT entry is the
+					// address of the function, also in its ordinary GOT slot
+					if _, ok := l.iplt[s]; !ok {
+						l.iplt[s] = l.gotSize
 						l.gotSize += 8
 					}
 					if _, ok := l.plt[s]; !ok {
 						l.plt[s] = l.pltSize
 						l.pltSize += 16
+					}
+					switch r.Type {
+					case R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX, R_X86_64_GOT32:
+						if _, ok := l.got[s]; !ok {
+							l.got[s] = l.gotSize
+							l.gotSize += 8
+						}
 					}
 					continue
 				}
@@ -353,7 +412,9 @@ func (l *Linker) scanRelocs() {
 						}
 					}
 				case R_X86_64_TLSGD, R_X86_64_TLSLD, R_X86_64_DTPOFF32, R_X86_64_GOTPC32_TLSDESC, R_X86_64_TLSDESC_CALL:
-					l.errorf("%s: TLS model of relocation type %d is not supported (compile with -fno-pic)", o.Name, r.Type)
+					// TLSGD/TLSLD were relaxed by relaxTLS; what is left is
+					// the TLS descriptor dialect (-mtls-dialect=gnu2)
+					l.errorf("%s: TLS model of relocation type %d is not supported (compile with -mtls-dialect=gnu)", o.Name, r.Type)
 				}
 			}
 		}
@@ -548,6 +609,45 @@ func (l *Linker) layoutAndWrite() []byte {
 			}
 		}
 	}
+	// .init pieces (crti.o prologue ... crtn.o epilogue) start the code and
+	// .fini pieces end it, each contiguous
+	textRank := func(s *Section) int {
+		switch s.Name {
+		case ".init":
+			return 0
+		case ".fini":
+			return 2
+		}
+		return 1
+	}
+	sort.SliceStable(inputs[SecText], func(i, j int) bool { return textRank(inputs[SecText][i]) < textRank(inputs[SecText][j]) })
+	// sections named like C identifiers are kept together for their
+	// __start_NAME/__stop_NAME symbols
+	type namedRange struct{ first, last *Section }
+	named := map[string]*namedRange{}
+	for k, list := range inputs {
+		var plain []*Section
+		var order []string
+		byName := map[string][]*Section{}
+		for _, sec := range list {
+			if isCIdent(sec.Name) {
+				if byName[sec.Name] == nil {
+					order = append(order, sec.Name)
+				}
+				byName[sec.Name] = append(byName[sec.Name], sec)
+			} else {
+				plain = append(plain, sec)
+			}
+		}
+		for _, n := range order {
+			g := byName[n]
+			plain = append(plain, g...)
+			if _, ok := named[n]; !ok {
+				named[n] = &namedRange{g[0], g[len(g)-1]}
+			}
+		}
+		inputs[k] = plain
+	}
 	// prioritized init/fini entries first, in priority order (like SORT_BY_INIT_PRIORITY)
 	for _, k := range []SectionKind{SecInitArray, SecFiniArray, SecPreinitArray} {
 		sort.SliceStable(inputs[k], func(i, j int) bool { return initPriority(inputs[k][i].Name) < initPriority(inputs[k][j].Name) })
@@ -637,20 +737,29 @@ func (l *Linker) layoutAndWrite() []byte {
 	}
 	// precompute the dynamic relocation count to size .rela.dyn
 	l.out = nil
-	interp := add(outSec{name: ".interp", align: 1, flags: shfAlloc, typ: shtProgbits, data: append([]byte(l.Interp), 0)})
-	interp.size = int64(len(interp.data))
-	place(interp)
-	hashSec := add(outSec{name: ".hash", align: 8, flags: shfAlloc, typ: shtHash, data: hash, entsz: 4})
-	hashSec.size = int64(len(hash))
-	place(hashSec)
-	dynsymSec := add(outSec{name: ".dynsym", align: 8, flags: shfAlloc, typ: shtDynsym, entsz: 24, info: 1})
-	dynsymSec.size = int64(24 * nsyms)
-	place(dynsymSec)
-	dynstrSec := add(outSec{name: ".dynstr", align: 1, flags: shfAlloc, typ: shtStrtab})
-	dynstrSec.size = int64(dynstr.buf.Len())
-	place(dynstrSec)
+	var interp, hashSec, dynsymSec, dynstrSec *outSec
+	if !l.Static {
+		interp = add(outSec{name: ".interp", align: 1, flags: shfAlloc, typ: shtProgbits, data: append([]byte(l.Interp), 0)})
+		interp.size = int64(len(interp.data))
+		place(interp)
+		hashSec = add(outSec{name: ".hash", align: 8, flags: shfAlloc, typ: shtHash, data: hash, entsz: 4})
+		hashSec.size = int64(len(hash))
+		place(hashSec)
+		dynsymSec = add(outSec{name: ".dynsym", align: 8, flags: shfAlloc, typ: shtDynsym, entsz: 24, info: 1})
+		dynsymSec.size = int64(24 * nsyms)
+		place(dynsymSec)
+		dynstrSec = add(outSec{name: ".dynstr", align: 1, flags: shfAlloc, typ: shtStrtab})
+		dynstrSec.size = int64(dynstr.buf.Len())
+		place(dynstrSec)
+	}
 	nRela := l.countDynRelocs()
-	relaSec := add(outSec{name: ".rela.dyn", align: 8, flags: shfAlloc, typ: shtRela, entsz: 24})
+	relaName := ".rela.dyn"
+	if l.Static {
+		// IRELATIVE relocations applied by the static libc at startup
+		// (between __rela_iplt_start and __rela_iplt_end)
+		relaName = ".rela.iplt"
+	}
+	relaSec := add(outSec{name: relaName, align: 8, flags: shfAlloc, typ: shtRela, entsz: 24})
 	relaSec.size = int64(24 * nRela)
 	place(relaSec)
 	ro := add(outSec{name: ".rodata", kind: SecROData, align: 16, flags: shfAlloc, typ: shtProgbits, secs: inputs[SecROData]})
@@ -692,9 +801,11 @@ func (l *Linker) layoutAndWrite() []byte {
 		if g.kind == SecData {
 			// .dynamic and .got come before .data
 			l.out = l.out[:len(l.out)-1]
-			dyn := add(outSec{name: ".dynamic", align: 8, flags: shfAlloc | shfWrite, typ: shtDynamic, entsz: 16})
-			dyn.size = int64(16 * l.dynamicCount())
-			place(dyn)
+			if !l.Static {
+				dyn := add(outSec{name: ".dynamic", align: 8, flags: shfAlloc | shfWrite, typ: shtDynamic, entsz: 16})
+				dyn.size = int64(16 * l.dynamicCount())
+				place(dyn)
+			}
 			got := add(outSec{name: ".got", align: 8, flags: shfAlloc | shfWrite, typ: shtProgbits, entsz: 8})
 			got.size = int64(l.gotSize)
 			place(got)
@@ -747,13 +858,24 @@ func (l *Linker) layoutAndWrite() []byte {
 	ia, fa, pa := l.outByName(".init_array"), l.outByName(".fini_array"), l.outByName(".preinit_array")
 	gotSec, dynSec := l.outByName(".got"), l.outByName(".dynamic")
 	l.sectionSyms = map[string]int64{
-		"_GLOBAL_OFFSET_TABLE_": gotSec.addr, "_DYNAMIC": dynSec.addr,
-		"__init_array_start": ia.addr, "__init_array_end": ia.addr + ia.size,
+		"_GLOBAL_OFFSET_TABLE_": gotSec.addr,
+		"__init_array_start":    ia.addr, "__init_array_end": ia.addr + ia.size,
 		"__fini_array_start": fa.addr, "__fini_array_end": fa.addr + fa.size,
 		"__preinit_array_start": pa.addr, "__preinit_array_end": pa.addr + pa.size,
 		"_end": rwMemEnd, "end": rwMemEnd, "_edata": baseAddr + rwFileEnd, "edata": baseAddr + rwFileEnd,
 		"__bss_start": bss.addr, "_etext": baseAddr + rxEnd, "etext": baseAddr + rxEnd,
 		"__executable_start": baseAddr, "__ehdr_start": baseAddr,
+	}
+	if dynSec != nil {
+		l.sectionSyms["_DYNAMIC"] = dynSec.addr
+	}
+	if l.Static {
+		l.sectionSyms["__rela_iplt_start"] = relaSec.addr
+		l.sectionSyms["__rela_iplt_end"] = relaSec.addr + relaSec.size
+	}
+	for n, r := range named {
+		l.sectionSyms["__start_"+n] = r.first.Addr
+		l.sectionSyms["__stop_"+n] = r.last.Addr + r.last.Len()
 	}
 
 	// ---- build the image ----
@@ -761,6 +883,13 @@ func (l *Linker) layoutAndWrite() []byte {
 	for _, o := range l.out {
 		if o.typ == shtNobits {
 			continue
+		}
+		if o.kind == SecText {
+			// padding between functions is nops (gaps may be executed
+			// between .init pieces)
+			for i := o.off; i < o.off+o.size; i++ {
+				img[i] = 0x90
+			}
 		}
 		for _, s := range o.secs {
 			copy(img[s.Addr-baseAddr:], s.Data)
@@ -771,7 +900,11 @@ func (l *Linker) layoutAndWrite() []byte {
 		at := pltSec.off + int64(off)
 		p := img[at:]
 		p[0], p[1] = 0xff, 0x25
-		gotAddr := gotSec.addr + int64(l.got[s])
+		slot, ok := l.iplt[s]
+		if !ok {
+			slot = l.got[s]
+		}
+		gotAddr := gotSec.addr + int64(slot)
 		le.PutUint32(p[2:], uint32(gotAddr-(pltSec.addr+int64(off)+6)))
 		for i := 6; i < 16; i++ {
 			p[i] = 0xcc
@@ -784,11 +917,10 @@ func (l *Linker) layoutAndWrite() []byte {
 			l.dynRelocs = append(l.dynRelocs, dynReloc{off: at, typ: R_X86_64_GLOB_DAT, imp: imp})
 			continue
 		}
-		if s.IFunc && l.imp(s) == nil && s.Section != nil {
-			l.dynRelocs = append(l.dynRelocs, dynReloc{off: at, typ: R_X86_64_IRELATIVE, addend: s.Section.Addr + s.Value})
-			continue
-		}
 		le.PutUint64(img[at-baseAddr:], uint64(l.symAddr(s)))
+	}
+	for s, off := range l.iplt {
+		l.dynRelocs = append(l.dynRelocs, dynReloc{off: gotSec.addr + int64(off), typ: R_X86_64_IRELATIVE, addend: s.Section.Addr + s.Value})
 	}
 	for s, off := range l.gotTP {
 		at := gotSec.addr + int64(off)
@@ -829,33 +961,43 @@ func (l *Linker) layoutAndWrite() []byte {
 		copy(img[ehHdr.off:], hdr)
 	}
 
+	if l.Static {
+		for _, r := range l.dynRelocs {
+			if r.typ != R_X86_64_IRELATIVE {
+				l.errorf("internal error: dynamic relocation %d in a static executable", r.typ)
+				return nil
+			}
+		}
+	}
 	// .dynsym
 	symtabData := dynsym.Bytes()
-	for _, imp := range l.impList {
-		e := make([]byte, 24)
-		le.PutUint32(e[0:], uint32(dynstr.add(imp.sym.Name)))
-		typ := byte(0) // STT_NOTYPE
-		switch imp.dyn.Type {
-		case SymFunc:
-			typ = 2
-		case SymObject:
-			typ = 1
-		case SymTLS:
-			typ = 6
+	if !l.Static {
+		for _, imp := range l.impList {
+			e := make([]byte, 24)
+			le.PutUint32(e[0:], uint32(dynstr.add(imp.sym.Name)))
+			typ := byte(0) // STT_NOTYPE
+			switch imp.dyn.Type {
+			case SymFunc:
+				typ = 2
+			case SymObject:
+				typ = 1
+			case SymTLS:
+				typ = 6
+			}
+			e[4] = 1<<4 | typ // STB_GLOBAL
+			if imp.copyAddr != 0 {
+				// the copy in .bss is the definition everybody uses
+				le.PutUint16(e[6:], uint16(l.shIndexOf(".bss")))
+				le.PutUint64(e[8:], uint64(imp.copyAddr))
+				le.PutUint64(e[16:], uint64(imp.dyn.Size))
+			}
+			symtabData = append(symtabData, e...)
 		}
-		e[4] = 1<<4 | typ // STB_GLOBAL
-		if imp.copyAddr != 0 {
-			// the copy in .bss is the definition everybody uses
-			le.PutUint16(e[6:], uint16(l.shIndexOf(".bss")))
-			le.PutUint64(e[8:], uint64(imp.copyAddr))
-			le.PutUint64(e[16:], uint64(imp.dyn.Size))
-		}
-		symtabData = append(symtabData, e...)
+		copy(img[dynsymSec.off:], symtabData)
+		copy(img[dynstrSec.off:], dynstr.buf.Bytes())
+		copy(img[interp.off:], interp.data)
+		copy(img[hashSec.off:], hash)
 	}
-	copy(img[dynsymSec.off:], symtabData)
-	copy(img[dynstrSec.off:], dynstr.buf.Bytes())
-	copy(img[interp.off:], interp.data)
-	copy(img[hashSec.off:], hash)
 	// .rela.dyn
 	sort.Slice(l.dynRelocs, func(i, j int) bool { return l.dynRelocs[i].off < l.dynRelocs[j].off })
 	for i, r := range l.dynRelocs {
@@ -868,37 +1010,39 @@ func (l *Linker) layoutAndWrite() []byte {
 		le.PutUint64(e[8:], uint64(si)<<32|uint64(r.typ))
 		le.PutUint64(e[16:], uint64(r.addend))
 	}
-	// .dynamic
-	var dyn []uint64
-	for _, lib := range l.needed {
-		dyn = append(dyn, 1, uint64(dynstr.add(lib.Soname))) // DT_NEEDED
-	}
-	dyn = append(dyn,
-		4, uint64(hashSec.addr), // DT_HASH
-		5, uint64(dynstrSec.addr), // DT_STRTAB
-		6, uint64(dynsymSec.addr), // DT_SYMTAB
-		10, uint64(dynstr.buf.Len()), // DT_STRSZ
-		11, 24, // DT_SYMENT
-		7, uint64(relaSec.addr), // DT_RELA
-		8, uint64(relaSec.size), // DT_RELASZ
-		9, 24, // DT_RELAENT
-	)
-	if ia.size > 0 {
-		dyn = append(dyn, 25, uint64(ia.addr), 27, uint64(ia.size))
-	}
-	if fa.size > 0 {
-		dyn = append(dyn, 26, uint64(fa.addr), 28, uint64(fa.size))
-	}
-	if pa.size > 0 {
-		dyn = append(dyn, 32, uint64(pa.addr), 33, uint64(pa.size))
-	}
-	dyn = append(dyn,
-		30, 8, // DT_FLAGS = DF_BIND_NOW
-		0x6ffffffb, 1, // DT_FLAGS_1 = DF_1_NOW
-		21, 0, // DT_DEBUG
-		0, 0) // DT_NULL
-	for i, v := range dyn {
-		le.PutUint64(img[dynSec.off+int64(8*i):], v)
+	if !l.Static {
+		// .dynamic
+		var dyn []uint64
+		for _, lib := range l.needed {
+			dyn = append(dyn, 1, uint64(dynstr.add(lib.Soname))) // DT_NEEDED
+		}
+		dyn = append(dyn,
+			4, uint64(hashSec.addr), // DT_HASH
+			5, uint64(dynstrSec.addr), // DT_STRTAB
+			6, uint64(dynsymSec.addr), // DT_SYMTAB
+			10, uint64(dynstr.buf.Len()), // DT_STRSZ
+			11, 24, // DT_SYMENT
+			7, uint64(relaSec.addr), // DT_RELA
+			8, uint64(relaSec.size), // DT_RELASZ
+			9, 24, // DT_RELAENT
+		)
+		if ia.size > 0 {
+			dyn = append(dyn, 25, uint64(ia.addr), 27, uint64(ia.size))
+		}
+		if fa.size > 0 {
+			dyn = append(dyn, 26, uint64(fa.addr), 28, uint64(fa.size))
+		}
+		if pa.size > 0 {
+			dyn = append(dyn, 32, uint64(pa.addr), 33, uint64(pa.size))
+		}
+		dyn = append(dyn,
+			30, 8, // DT_FLAGS = DF_BIND_NOW
+			0x6ffffffb, 1, // DT_FLAGS_1 = DF_1_NOW
+			21, 0, // DT_DEBUG
+			0, 0) // DT_NULL
+		for i, v := range dyn {
+			le.PutUint64(img[dynSec.off+int64(8*i):], v)
+		}
 	}
 
 	// ---- program headers ----
@@ -911,15 +1055,20 @@ func (l *Linker) layoutAndWrite() []byte {
 		typ, flags                       uint32
 		off, vaddr, filesz, memsz, align int64
 	}
-	phdrs := []phdr{
-		{ptPhdr, 4, 64, baseAddr + 64, 56 * int64(nPhdr), 56 * int64(nPhdr), 8},
-		{ptInterp, 4, interp.off, interp.addr, interp.size, interp.size, 1},
-		{ptLoad, 4, 0, baseAddr, roEnd, roEnd, pageSize},
-		{ptLoad, 5, rxStart, baseAddr + rxStart, rxEnd - rxStart, rxEnd - rxStart, pageSize},
-		{ptLoad, 6, rwStart, baseAddr + rwStart, rwFileEnd - rwStart, rwMemEnd - (baseAddr + rwStart), pageSize},
-		{ptDynamic, 6, dynSec.off, dynSec.addr, dynSec.size, dynSec.size, 8},
-		{ptGnuStack, 6, 0, 0, 0, 0, 16},
+	var phdrs []phdr
+	if !l.Static {
+		phdrs = append(phdrs,
+			phdr{ptPhdr, 4, 64, baseAddr + 64, 56 * int64(nPhdr), 56 * int64(nPhdr), 8},
+			phdr{ptInterp, 4, interp.off, interp.addr, interp.size, interp.size, 1})
 	}
+	phdrs = append(phdrs,
+		phdr{ptLoad, 4, 0, baseAddr, roEnd, roEnd, pageSize},
+		phdr{ptLoad, 5, rxStart, baseAddr + rxStart, rxEnd - rxStart, rxEnd - rxStart, pageSize},
+		phdr{ptLoad, 6, rwStart, baseAddr + rwStart, rwFileEnd - rwStart, rwMemEnd - (baseAddr + rwStart), pageSize})
+	if dynSec != nil {
+		phdrs = append(phdrs, phdr{ptDynamic, 6, dynSec.off, dynSec.addr, dynSec.size, dynSec.size, 8})
+	}
+	phdrs = append(phdrs, phdr{ptGnuStack, 6, 0, 0, 0, 0, 16})
 	if l.tlsEnd != 0 {
 		phdrs = append(phdrs, phdr{ptTLS, 4, tdata.off, tdata.addr, tdata.size, l.tlsEnd - l.tlsStart, l.tlsAlign})
 	}
@@ -1169,10 +1318,11 @@ func (l *Linker) dynamicCount() int {
 func (l *Linker) countDynRelocs() int {
 	n := 0
 	for s := range l.got {
-		if imp := l.imp(s); imp != nil && !imp.needCopy || imp == nil && s.IFunc && s.Section != nil {
+		if imp := l.imp(s); imp != nil && !imp.needCopy {
 			n++
 		}
 	}
+	n += len(l.iplt)
 	for s := range l.gotTP {
 		if l.imp(s) != nil {
 			n++

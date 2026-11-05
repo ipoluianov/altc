@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,26 +65,33 @@ func TestUnwindThroughAltC(t *testing.T) {
 				if got, code := run(t, exe, tmp); got != c.want || code != 0 {
 					t.Errorf("linked by %s: exit %d\n%s", c.gccCmd, code, got)
 				}
-				// linked by AltC
-				in := &driver.LinkInput{Objects: []*elf.Object{u.Obj}}
-				if err := in.AddFile(gobj); err != nil {
-					t.Fatal(err)
-				}
-				for _, l := range c.libs {
-					if err := in.AddLib(l, driver.DefaultLibDirs); err != nil {
-						t.Skip(err)
+				// linked by AltC, dynamically and statically
+				for _, static := range []bool{false, true} {
+					in := &driver.LinkInput{Objects: []*elf.Object{u.Obj}, Static: static}
+					if err := in.AddFile(gobj); err != nil {
+						t.Fatal(err)
 					}
-				}
-				img, diags := driver.Link(in)
-				if img == nil {
-					t.Fatal(diags)
-				}
-				exe2 := filepath.Join(tmp, c.name+".altc")
-				if err := os.WriteFile(exe2, img, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if got, code := run(t, exe2, tmp); got != c.want || code != 0 {
-					t.Errorf("linked by AltC: exit %d\n%s", code, got)
+					skip := false
+					for _, l := range c.libs {
+						if err := in.AddLib(l, driver.DefaultLibDirs); err != nil {
+							t.Log(err)
+							skip = true
+						}
+					}
+					if skip {
+						continue
+					}
+					img, diags := driver.Link(in)
+					if img == nil {
+						t.Fatalf("static=%v: %v", static, diags)
+					}
+					exe2 := filepath.Join(tmp, fmt.Sprintf("%s.altc.%v", c.name, static))
+					if err := os.WriteFile(exe2, img, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if got, code := run(t, exe2, tmp); got != c.want || code != 0 {
+						t.Errorf("linked by AltC (static=%v): exit %d\n%s", static, code, got)
+					}
 				}
 			})
 		}

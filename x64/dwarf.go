@@ -22,7 +22,8 @@ type lineRec struct {
 type dbgFunc struct {
 	ob         *cc.Obj
 	start, end int
-	frame      bool // its locals are in the frame at their offsets (no register allocation)
+	frame      bool     // its locals are in the frame at their offsets (no register allocation)
+	ir         *irDebug // locations of the variables of an IR-compiled function
 }
 
 // SetLine records that the code from here on comes from line of file
@@ -83,6 +84,7 @@ const (
 	dwTagSubprogram      = 0x2e
 	dwTagVariable        = 0x34
 	dwTagVolatileType    = 0x35
+	dwTagInlinedSub      = 0x1d
 
 	dwFormAddr      = 0x01
 	dwFormData1     = 0x0b
@@ -122,6 +124,11 @@ const (
 	dwAtType         = 0x49
 	dwAtCount        = 0x37
 	dwAtTypeEncoding = 0x3e
+	dwAtInline       = 0x20
+	dwAtAbstractOrig = 0x31
+	dwAtRanges       = 0x55
+	dwAtCallFile     = 0x58
+	dwAtCallLine     = 0x59
 )
 
 // debugSections builds .debug_abbrev, .debug_info and .debug_line
@@ -205,6 +212,23 @@ func (g *gen) debugSections(text *elf.Section, syms map[string]*elf.Symbol) {
 	d.buf = append(d.buf, 0) // end of the unit's children
 	le.PutUint32(d.buf, uint32(len(d.buf)-4))
 	d.resolveRefs()
+	for _, x := range []struct {
+		name string
+		data []byte
+		refs []int
+	}{{".debug_loc", d.loc, d.locRefs}, {".debug_ranges", d.ranges, d.rangeRefs}} {
+		if len(x.refs) == 0 {
+			continue
+		}
+		sec := o.AddSection(x.name, elf.SecOther, 1)
+		sec.Data = x.data
+		sym := secSym(sec)
+		for _, at := range x.refs {
+			infoSec.Relocs = append(infoSec.Relocs, elf.Reloc{Offset: int64(at), Type: 10, Sym: sym,
+				Addend: int64(le.Uint32(d.buf[at:]))}) // R_X86_64_32
+			le.PutUint32(d.buf[at:], 0)
+		}
+	}
 	infoSec.Data = d.buf
 	abbrevSec.Data = dwarfAbbrevs()
 }
@@ -235,6 +259,13 @@ const (
 	abbrevFuncType
 	abbrevFuncTypeParam
 	abbrevUnspecified
+	abbrevVariableLoc // location lists
+	abbrevParamLoc
+	abbrevVariableNoLoc // optimized out
+	abbrevParamNoLoc
+	abbrevInlined // inlined calls
+	abbrevInlinedLeaf
+	abbrevAbstract // the abstract instance of an inlined function
 )
 
 func dwarfAbbrevs() []byte {
@@ -284,6 +315,16 @@ func dwarfAbbrevs() []byte {
 	add(abbrevFuncType, dwTagSubroutineType, true, dwAtPrototyped, dwFormFlag, dwAtType, dwFormRef4)
 	add(abbrevFuncTypeParam, dwTagFormalParameter, false, dwAtType, dwFormRef4)
 	add(abbrevUnspecified, 0x3b, false, dwAtName, dwFormString) // DW_TAG_unspecified_type
+	varAttrs := []int{dwAtName, dwFormString, dwAtDeclFile, dwFormUdata, dwAtDeclLine, dwFormUdata, dwAtType, dwFormRef4}
+	add(abbrevVariableLoc, dwTagVariable, false, append(varAttrs, dwAtLocation, dwFormSecOffset)...)
+	add(abbrevParamLoc, dwTagFormalParameter, false, append(varAttrs, dwAtLocation, dwFormSecOffset)...)
+	add(abbrevVariableNoLoc, dwTagVariable, false, varAttrs...)
+	add(abbrevParamNoLoc, dwTagFormalParameter, false, varAttrs...)
+	inl := []int{dwAtAbstractOrig, dwFormRef4, dwAtRanges, dwFormSecOffset, dwAtCallFile, dwFormUdata, dwAtCallLine, dwFormUdata}
+	add(abbrevInlined, dwTagInlinedSub, true, inl...)
+	add(abbrevInlinedLeaf, dwTagInlinedSub, false, inl...)
+	add(abbrevAbstract, dwTagSubprogram, false, dwAtName, dwFormString, dwAtDeclFile, dwFormUdata, dwAtDeclLine, dwFormUdata,
+		dwAtPrototyped, dwFormFlag, dwAtType, dwFormRef4, dwAtInline, dwFormData1)
 	return append(b, 0)
 }
 
@@ -301,6 +342,13 @@ type dwarfInfo struct {
 	pkeys   map[string]bool
 	refs    []dwRef
 	recIDs  map[*cc.Record]int
+
+	loc       []byte // .debug_loc
+	ranges    []byte // .debug_ranges
+	locRefs   []int  // offsets in buf of 4-byte references into .debug_loc
+	rangeRefs []int  // ... into .debug_ranges
+	inlined   []*cc.Obj
+	inlSeen   map[*cc.Obj]bool
 }
 
 type dwRef struct {
@@ -404,8 +452,13 @@ func (d *dwarfInfo) declPos(tok *cc.Token) {
 // unit writes the functions, the global variables and the types
 func (d *dwarfInfo) unit(g *gen) {
 	d.keys, d.pkeys, d.recIDs = map[string]int{}, map[string]bool{}, map[*cc.Record]int{}
+	d.inlSeen = map[*cc.Obj]bool{}
 	for _, fn := range g.dbgFuncs {
 		ob := fn.ob
+		if fn.ir != nil {
+			d.irSubprogram(fn)
+			continue
+		}
 		var vars []*cc.Obj
 		if fn.frame {
 			for _, v := range append(append([]*cc.Obj(nil), ob.Params...), ob.Locals...) {
@@ -458,6 +511,16 @@ func (d *dwarfInfo) unit(g *gen) {
 			d.buf = append(d.buf, loc...)
 		}
 		d.buf = append(d.buf, 0)
+	}
+	// the abstract instances of inlined functions
+	for _, fn := range d.inlined {
+		d.keys["inl:"+fn.AsmName] = len(d.buf)
+		d.uleb(abbrevAbstract)
+		d.str(fn.Name)
+		d.declPos(fn.Tok)
+		d.buf = append(d.buf, 1)
+		d.ref(fn.Ty.Ret)
+		d.buf = append(d.buf, 3) // DW_INL_declared_inlined
 	}
 	// global variables
 	for _, ob := range g.prog.Globals {
@@ -800,4 +863,30 @@ func (g *gen) asmLines() {
 	b = append(append(b, "AltC assembler"...), 0)
 	le.PutUint32(b, uint32(len(b)-4))
 	info.Data = b
+}
+
+// lineMark saves the state of the line table
+type lineMark struct {
+	n    int
+	last lineRec
+}
+
+func (a *Asm) lineMark() lineMark {
+	m := lineMark{n: len(a.lines)}
+	if m.n > 0 {
+		m.last = a.lines[m.n-1]
+	}
+	return m
+}
+
+// lineRestore drops the line changes made since m (only when no code was
+// emitted since)
+func (a *Asm) lineRestore(m lineMark) {
+	if len(a.lines) == m.n && (m.n == 0 || a.lines[m.n-1] == m.last) {
+		return
+	}
+	a.lines = a.lines[:m.n]
+	if m.n > 0 {
+		a.lines[m.n-1] = m.last
+	}
 }

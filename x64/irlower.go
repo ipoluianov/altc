@@ -77,6 +77,7 @@ type irBuilder struct {
 	varType  map[*cc.Obj]irType
 
 	analyzed map[*cc.Obj]bool // functions whose locals were classified
+	dbgVars  map[*cc.Obj]bool // the named variables described in the debug information (-g)
 	inl      *inlineCtx       // the innermost function being inlined
 	inlineN  int              // inlined copies so far (label prefixes)
 
@@ -158,7 +159,18 @@ func (g *gen) lowerFunction(fn *cc.Obj) (f *irFunc, err error) {
 		labels: map[string]*irBlock{}, pending: map[*irBlock][]phiPending{},
 		varType: map[*cc.Obj]irType{}, analyzed: map[*cc.Obj]bool{},
 	}
+	if g.debug {
+		b.dbgVars = dbgVarSet(fn)
+	}
 	b.build()
+	if g.debug {
+		b.f.dbgMem = map[*cc.Obj]*irSlot{}
+		for v := range b.dbgVars {
+			if s, ok := b.slots[v]; ok && !b.promoted[v] {
+				b.f.dbgMem[v] = s
+			}
+		}
+	}
 	return b.f, nil
 }
 
@@ -170,7 +182,10 @@ func (b *irBuilder) build() {
 	}
 	ret := ft.Ret
 	switch {
-	case ret.Kind == cc.TyLongDouble || retInX87(ret) || retInX87Pair(ret) || is128(ret):
+	case ret.Kind == cc.TyLongDouble:
+		b.f.RetX87 = true
+		b.f.RetType = iI64
+	case retInX87(ret) || retInX87Pair(ret) || is128(ret):
 		unsupported("x87 or 128-bit return")
 	case ret.IsRecord():
 		if _, _, ok := irStructRegs(ret); ok {
@@ -199,14 +214,24 @@ func (b *irBuilder) build() {
 	}
 	for _, p := range fn.Params {
 		t := p.Ty
-		if t.Kind == cc.TyLongDouble || is128(t) || hasLD(t) {
+		if is128(t) {
 			unsupported("x87 or 128-bit parameter")
+		}
+		if isLD(t) {
+			// in memory, 16-byte aligned: the variable's home
+			stackOff = alignTo(stackOff, 16)
+			b.slots[p] = &irSlot{Size: 16, Align: 16, Offset: stackOff, Fixed: true, Name: p.Name}
+			stackOff += 16
+			continue
 		}
 		if t.IsRecord() {
 			if t.Size() == 0 {
 				continue
 			}
 			ng, nf, ok := irStructRegs(t)
+			if ok && hasLD(t) {
+				unsupported("x87 or 128-bit parameter")
+			}
 			if ok && gp+ng <= 6 && fp+nf <= 8 {
 				addr := b.slotAddr(p)
 				for _, c := range chunksOf(t) {
@@ -401,6 +426,7 @@ func (b *irBuilder) labelBlock(name string) *irBlock {
 func (b *irBuilder) writeVar(v *cc.Obj, val *irValue) {
 	b.ensure()
 	b.cur.defs[v] = val
+	b.recordDef(v, val)
 }
 
 func (b *irBuilder) readVar(v *cc.Obj) *irValue {
@@ -430,6 +456,7 @@ func (b *irBuilder) readVarIn(v *cc.Obj, blk *irBlock) *irValue {
 	case !blk.sealed:
 		val = b.newPhi(blk, t)
 		b.pending[blk] = append(b.pending[blk], phiPending{v, val})
+		b.recordDef(v, val)
 	case len(blk.Preds) == 0:
 		val = b.undef(blk, t)
 	case len(blk.Preds) == 1:
@@ -437,6 +464,7 @@ func (b *irBuilder) readVarIn(v *cc.Obj, blk *irBlock) *irValue {
 	default:
 		phi := b.newPhi(blk, t)
 		blk.defs[v] = phi
+		b.recordDef(v, phi)
 		val = b.addPhiOperands(v, phi)
 	}
 	blk.defs[v] = val
@@ -524,7 +552,7 @@ func (b *irBuilder) load(addr *irValue, t *cc.Type) *irValue {
 	v := b.add(opLoad, it, addr)
 	v.AuxInt = cSize(t)
 	v.Signed = !unsignedType(t)
-	v.vol = t.Volatile
+	v.vol = t.Volatile || t.Atomic
 	return v
 }
 
@@ -817,6 +845,9 @@ func (b *irBuilder) cond(n *cc.Node, t, f *irBlock) {
 		return
 	}
 	v := b.expr(n)
+	if isLD(n.Ty) {
+		v = b.ldTruth(v)
+	}
 	b.branch(b.truth(v), t, f)
 }
 
@@ -841,6 +872,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 	case cc.NNull:
 		return nil
 	case cc.NNum:
+		if isLD(n.Ty) {
+			return b.ldConst(n)
+		}
 		t := irTypeOf(n.Ty)
 		if t.isFloat() {
 			return b.fconst(t, n.FVal)
@@ -850,7 +884,7 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		if b.promoted[n.Var] {
 			return b.readVar(n.Var)
 		}
-		if isAddrType(n.Ty) {
+		if isAddrType(n.Ty) || isLD(n.Ty) {
 			return b.addr(n)
 		}
 		return b.load(b.addr(n), n.Ty)
@@ -858,13 +892,13 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		if n.Member.Bitfield {
 			return b.loadBitfield(n)
 		}
-		if isAddrType(n.Ty) {
+		if isAddrType(n.Ty) || isLD(n.Ty) {
 			return b.addr(n)
 		}
 		return b.load(b.addr(n), n.Ty)
 	case cc.NDeref:
 		p := b.expr(n.LHS)
-		if isAddrType(n.Ty) {
+		if isAddrType(n.Ty) || isLD(n.Ty) {
 			return p
 		}
 		return b.load(p, n.Ty)
@@ -890,11 +924,20 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		if isAddrType(n.Ty) {
 			return v
 		}
+		if isLD(n.LHS.Ty) {
+			return b.fromLD(v, n.Ty)
+		}
+		if isLD(n.Ty) {
+			return b.toLD(v, n.LHS.Ty)
+		}
 		return b.convert(v, n.LHS.Ty, n.Ty)
 	case cc.NCond:
 		return b.condExpr(n)
 	case cc.NNot:
 		v := b.expr(n.LHS)
+		if isLD(n.LHS.Ty) {
+			return b.x87Compare(x87Eq, v, b.ldZero())
+		}
 		if v.Type.isFloat() {
 			return b.add(opFEq, iI32, v, b.fconst(v.Type, 0))
 		}
@@ -909,6 +952,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 	switch n.Kind {
 	case cc.NNeg:
 		v := b.expr(n.LHS)
+		if isLD(n.Ty) {
+			return b.x87(x87Neg, v)
+		}
 		if v.Type.isFloat() {
 			return b.add(opFNeg, v.Type, v)
 		}
@@ -940,6 +986,12 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 	case cc.NFence:
 		b.add(opFence, iNone)
 		return nil
+	case cc.NCas:
+		return b.casExpr(n)
+	case cc.NExch:
+		return b.exchExpr(n)
+	case cc.NFetchOp:
+		return b.fetchOpExpr(n)
 	case cc.NBuiltin:
 		return b.builtin(n)
 	case cc.NVaStart:
@@ -1030,7 +1082,7 @@ func (b *irBuilder) assign(n *cc.Node) *irValue {
 	if lhs.Kind == cc.NMember && lhs.Member.Bitfield {
 		return b.storeBitfield(lhs, n.RHS)
 	}
-	if isAddrType(lhs.Ty) {
+	if isAddrType(lhs.Ty) || isLD(lhs.Ty) {
 		if lhs.Ty.Kind == cc.TyArray || lhs.Ty.Kind == cc.TyFunc {
 			unsupported("array assignment")
 		}
@@ -1038,12 +1090,18 @@ func (b *irBuilder) assign(n *cc.Node) *irValue {
 		src := b.expr(n.RHS)
 		c := b.add(opMemcpy, iNone, dst, src)
 		c.AuxInt = lhs.Ty.Size()
+		if isLD(lhs.Ty) {
+			c.AuxInt = 10
+		}
 		return dst
 	}
 	irTypeOf(lhs.Ty)
 	a := b.addr(lhs)
 	v := b.expr(n.RHS)
 	b.store(a, v, lhs.Ty)
+	if lhs.Ty.Atomic {
+		b.add(opFence, iNone) // a sequentially consistent store (like gcc: mov; mfence)
+	}
 	return v
 }
 
@@ -1081,7 +1139,11 @@ func (b *irBuilder) condExpr(n *cc.Node) *irValue {
 		b.cur = join
 		return nil
 	}
-	tmp := b.newTemp(irTypeOf(n.Ty))
+	tt := iI64 // long double values are addresses
+	if !isLD(n.Ty) {
+		tt = irTypeOf(n.Ty)
+	}
+	tmp := b.newTemp(tt)
 	b.cur = t
 	b.writeVar(tmp, b.expr(n.Then))
 	b.jump(join)
@@ -1102,6 +1164,12 @@ func (b *irBuilder) binary(n *cc.Node) *irValue {
 	y := b.expr(n.RHS)
 	if x == nil || y == nil {
 		unsupported("void operand")
+	}
+	if isLD(lt) || isLD(n.RHS.Ty) {
+		if !isLD(lt) || !isLD(n.RHS.Ty) {
+			unsupported("mixed long double operands")
+		}
+		return b.ldBinary(n, x, y)
 	}
 	if x.Type.isFloat() {
 		if x.Type != y.Type {
@@ -1298,7 +1366,7 @@ func (b *irBuilder) intConvert(v *irValue, fs int64, fu bool, ts int64, tu bool)
 
 func (b *irBuilder) call(n *cc.Node) *irValue {
 	rt := n.Ty
-	if rt.Kind == cc.TyLongDouble || retInX87(rt) || retInX87Pair(rt) || is128(rt) {
+	if retInX87(rt) || retInX87Pair(rt) || is128(rt) {
 		unsupported("x87 or 128-bit call result")
 	}
 	ft := n.FuncTy
@@ -1325,6 +1393,10 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 	}
 	// a struct result: a buffer in the frame
 	var buf *irSlot
+	if isLD(rt) {
+		buf = b.newSlot(16, 16)
+		call.RetX87 = buf
+	}
 	if rt.IsRecord() {
 		buf = b.newSlot(rt.Size(), max(rt.Align(), 8))
 		if _, _, ok := irStructRegs(rt); ok {
@@ -1337,8 +1409,14 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 	}
 	for _, a := range n.Args {
 		t := a.Ty
-		if t.Kind == cc.TyLongDouble || is128(t) || hasLD(t) {
+		if is128(t) {
 			unsupported("x87 or 128-bit argument")
+		}
+		if isLD(t) {
+			stack = alignTo(stack, 16)
+			push(b.expr(a), callLoc{Reg: NoReg, Stack: stack, Copy: 16})
+			stack += 16
+			continue
 		}
 		if t.IsRecord() {
 			if t.Size() == 0 {
@@ -1347,6 +1425,9 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 			}
 			addr := b.expr(a)
 			ng, nf, ok := irStructRegs(t)
+			if ok && hasLD(t) {
+				unsupported("x87 or 128-bit argument")
+			}
 			if ok && gp+ng <= 6 && fp+nf <= 8 {
 				for _, c := range chunksOf(t) {
 					v := b.loadN(b.offset(addr, c.off), c.size, c.t)
@@ -1393,7 +1474,7 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 		args = append(args, b.expr(fnode))
 	}
 	t := iNone
-	if !rt.IsRecord() {
+	if !rt.IsRecord() && !isLD(rt) {
 		t = irTypeOf(rt)
 	}
 	c := b.add(opCall, t, args...)
@@ -1429,6 +1510,9 @@ func (b *irBuilder) builtin(n *cc.Node) *irValue {
 		return nil
 	case "isunordered":
 		x, y := b.expr(n.Args[0]), b.expr(n.Args[1])
+		if isLD(n.Args[0].Ty) && isLD(n.Args[1].Ty) {
+			return b.x87Compare(x87Unord, x, y)
+		}
 		if !x.Type.isFloat() || !y.Type.isFloat() {
 			unsupported("isunordered")
 		}
@@ -1449,6 +1533,12 @@ func (b *irBuilder) builtin(n *cc.Node) *irValue {
 		return v
 	}
 	x := b.expr(arg)
+	if isLD(arg.Ty) {
+		if v, ok := b.ldBuiltin(name, x); ok {
+			return v
+		}
+		unsupported("builtin %s", name)
+	}
 	if !x.Type.isFloat() {
 		unsupported("builtin %s", name)
 	}
@@ -1562,7 +1652,7 @@ func (b *irBuilder) storeBitfield(lhs, rhs *cc.Node) *irValue {
 // n.Ty.Base, taking it from the register save area while registers last
 func (b *irBuilder) vaArg(n *cc.Node) *irValue {
 	t := n.Ty.Base
-	if t.Kind == cc.TyLongDouble || is128(t) || hasLD(t) {
+	if is128(t) {
 		unsupported("va_arg of x87 or 128-bit type")
 	}
 	ap := b.expr(n.LHS)
@@ -1571,9 +1661,14 @@ func (b *irBuilder) vaArg(n *cc.Node) *irValue {
 	var ng, nf int
 	var chunks []irChunk
 	switch {
+	case isLD(t):
+		ng, nf = -1, -1 // always in memory
 	case t.IsRecord():
 		var ok bool
 		ng, nf, ok = irStructRegs(t)
+		if ok && hasLD(t) {
+			unsupported("va_arg of x87 or 128-bit type")
+		}
 		if !ok {
 			ng, nf = -1, -1
 		} else {

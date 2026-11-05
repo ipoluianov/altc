@@ -91,6 +91,7 @@ func (f *irFunc) simplifyCFG() {
 			}
 			x.Preds = nil
 			x.Succs = nil
+			x.dbgFwd = s
 			changed = true
 		}
 		// merge a block into its only predecessor when that has no other successor
@@ -104,6 +105,10 @@ func (f *irFunc) simplifyCFG() {
 			}
 			for _, v := range s.Instrs {
 				v.Block = b
+			}
+			s.dbgFwd = b
+			if n := len(b.Instrs); n > 0 {
+				s.dbgAfter = b.Instrs[n-1]
 			}
 			b.Instrs = append(b.Instrs, s.Instrs...)
 			b.Kind, b.Ctrl, b.Succs, b.RetVals = s.Kind, s.Ctrl, s.Succs, s.RetVals
@@ -943,6 +948,7 @@ func (f *irFunc) licm() {
 			for _, v := range b.Instrs {
 				if v.Op.pure() && !v.Op.traps() && f.invariant(v, in) {
 					v.Block = pre
+					v.tok = nil // the line table keeps the code before (no jump back into the loop's lines)
 					pre.Instrs = append(pre.Instrs, v)
 					continue
 				}

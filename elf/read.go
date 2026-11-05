@@ -101,7 +101,7 @@ func ReadObject(name string, data []byte) (*Object, error) {
 		switch goelf.ST_BIND(es.Info) {
 		case goelf.STB_GLOBAL:
 			s.Bind = BindGlobal
-		case goelf.STB_WEAK:
+		case goelf.STB_WEAK, 10: // STB_GNU_UNIQUE: one definition is kept, like weak ones
 			s.Bind = BindWeak
 		default:
 			s.Bind = BindLocal

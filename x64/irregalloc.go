@@ -92,6 +92,7 @@ type irAlloc struct {
 	f          *irFunc
 	order      []*irBlock
 	segs       map[*irValue][]seg
+	own        map[*irValue][]seg // the segments of a group root before coalescing
 	parent     map[*irValue]*irValue
 	calls      []int
 	asms       []int // inline assembly may use any register
@@ -154,7 +155,7 @@ func (f *irFunc) allocate() *irAlloc {
 			c.fused = true
 		}
 	}
-	ra := &irAlloc{f: f, order: f.Blocks, segs: map[*irValue][]seg{}, parent: map[*irValue]*irValue{}}
+	ra := &irAlloc{f: f, order: f.Blocks, segs: map[*irValue][]seg{}, own: map[*irValue][]seg{}, parent: map[*irValue]*irValue{}}
 	ra.number()
 	ra.liveRanges()
 	ra.coalesce()
@@ -391,6 +392,9 @@ func (ra *irAlloc) coalesce() {
 					continue
 				}
 				merged := ra.segs[ra1]
+				if _, ok := ra.own[ra1]; !ok {
+					ra.own[ra1] = merged
+				}
 				for _, s := range ra.segs[rb] {
 					merged = addSeg(merged, s.from, s.to)
 				}

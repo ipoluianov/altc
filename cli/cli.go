@@ -39,6 +39,7 @@ Options (gcc compatible):
   -std=STD    c89, c99, c11, c17, c23 (or gnu89...gnu23; default gnu17)
   -include f  include a file first       -nostdinc
   -w          suppress warnings          -s  strip the symbol table
+  -static     link statically (libc.a)
   -v          verbose
 Ignored for compatibility: -O*, -g*, -W*, -f*, -m64, -pipe, -pthread, -MD, -MMD, -MP
 `
@@ -186,7 +187,7 @@ func gccMode(args []string) int {
 	var inputs []string
 	var libs, libDirs []string
 	out := ""
-	compileOnly, asmOnly, ppOnly, strip, verbose := false, false, false, false, false
+	compileOnly, asmOnly, ppOnly, strip, verbose, static := false, false, false, false, false, false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		next := func(prefix string) (string, bool) {
@@ -252,7 +253,9 @@ func gccMode(args []string) int {
 			inputs = append(inputs, "-l"+v)
 		case a == "-MF" || a == "-MT" || a == "-MQ" || a == "-x":
 			i++
-		case a == "-static" || a == "-shared":
+		case a == "-static":
+			static = true
+		case a == "-shared":
 			fmt.Fprintf(os.Stderr, "altc: %s is not supported\n", a)
 			return 1
 		case a == "-O0":
@@ -356,7 +359,7 @@ func gccMode(args []string) int {
 		}(in)
 	}
 	wg.Wait()
-	link := &driver.LinkInput{}
+	link := &driver.LinkInput{Static: static}
 	for _, in := range inputs {
 		switch {
 		case strings.HasPrefix(in, "-l"):

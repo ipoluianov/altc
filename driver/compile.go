@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -334,7 +335,7 @@ func parseGenError(path string, err error) Diagnostic {
 // linking needs only the shared libc.so.6
 const runtimeSource = `
 typedef unsigned long size_t;
-void *__dso_handle __attribute__((visibility("hidden"))) = &__dso_handle;
+void *__dso_handle __attribute__((weak, visibility("hidden"))) = &__dso_handle; /* crtbegin*.o has it in static links */
 int __cxa_atexit(void (*f)(void *), void *arg, void *dso);
 int __cxa_at_quick_exit(void (*f)(void *), void *dso);
 int __register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void), void *dso);
@@ -646,6 +647,15 @@ func runtimeObjects() ([]*elf.Object, error) {
 			return
 		}
 		runtimeObjs = append(runtimeObjs, c.Obj)
+		// runtime definitions only fill gaps: a library defining the same
+		// names (libc.a and libgcc.a when linking statically) wins
+		for _, o := range runtimeObjs {
+			for _, s := range o.Symbols {
+				if s.Bind == elf.BindGlobal && s.Defined() {
+					s.Bind = elf.BindWeak
+				}
+			}
+		}
 	})
 	return runtimeObjs, runtimeErr
 }
@@ -665,6 +675,7 @@ type LinkInput struct {
 	Archives  []*elf.Archive
 	Shared    []*elf.SharedLib
 	Strip     bool // do not write the symbol table
+	Static    bool // link statically with libc.a (-static); set before AddLib
 	sharedSet map[string]bool
 }
 
@@ -702,6 +713,9 @@ func (in *LinkInput) AddFile(path string) error {
 		}
 		in.Archives = append(in.Archives, ar)
 	case len(data) > 18 && string(data[:4]) == "\x7fELF" && data[16] == 3:
+		if in.Static {
+			return fmt.Errorf("%s: a shared library cannot be linked statically", path)
+		}
 		return in.addShared(path)
 	case len(data) > 4 && string(data[:4]) == "\x7fELF":
 		obj, err := elf.ReadObject(path, data)
@@ -736,6 +750,18 @@ func (in *LinkInput) AddLib(name string, dirs []string) error {
 		return nil // libm.so.6 is always linked
 	}
 	all := append(append([]string{}, dirs...), DefaultLibDirs...)
+	if d := gccLibDir(); d != "" {
+		all = append(all, d) // libstdc++, libgcc, libatomic...
+	}
+	if in.Static {
+		for _, d := range all {
+			p := filepath.Join(d, "lib"+name+".a")
+			if _, err := os.Stat(p); err == nil {
+				return in.AddFile(p)
+			}
+		}
+		return fmt.Errorf("cannot find -l%s (no static library lib%s.a)", name, name)
+	}
 	for _, d := range all {
 		p := filepath.Join(d, "lib"+name+".so")
 		if _, err := os.Stat(p); err == nil {
@@ -757,6 +783,84 @@ func (in *LinkInput) AddLib(name string, dirs []string) error {
 	return fmt.Errorf("cannot find -l%s", name)
 }
 
+// gccLibDir is the newest /usr/lib/gcc/x86_64-linux-gnu/<version> holding
+// libgcc.a and the crtbegin/crtend objects
+func gccLibDir() string {
+	dirs, _ := filepath.Glob("/usr/lib/gcc/x86_64-linux-gnu/*/libgcc.a")
+	best, bestVer := "", []int(nil)
+	for _, p := range dirs {
+		d := filepath.Dir(p)
+		var ver []int
+		for _, f := range strings.Split(filepath.Base(d), ".") {
+			n, _ := strconv.Atoi(f)
+			ver = append(ver, n)
+		}
+		if best == "" || slices.Compare(ver, bestVer) > 0 {
+			best, bestVer = d, ver
+		}
+	}
+	return best
+}
+
+// linkStatic links like gcc -static: crt1.o crti.o crtbeginT.o <objects>
+// --start-group libgcc.a libgcc_eh.a libc.a --end-group crtend.o crtn.o
+func linkStatic(in *LinkInput) ([]byte, []Diagnostic) {
+	fail := func(f string, a ...any) ([]byte, []Diagnostic) {
+		return nil, []Diagnostic{{Severity: SevError, Message: fmt.Sprintf(f, a...)}}
+	}
+	gcc := gccLibDir()
+	if gcc == "" {
+		return fail("-static: libgcc.a not found (install gcc)")
+	}
+	need := func(path string) string {
+		if _, err := os.Stat(path); err != nil {
+			return ""
+		}
+		return path
+	}
+	crt := &LinkInput{Static: true}
+	tail := &LinkInput{Static: true}
+	libs := &LinkInput{Static: true}
+	for _, f := range []struct {
+		in   *LinkInput
+		path string
+		opt  bool
+	}{
+		{crt, findSystemLib("crt1.o"), false},
+		{crt, findSystemLib("crti.o"), false},
+		{crt, need(filepath.Join(gcc, "crtbeginT.o")), false},
+		{libs, findSystemLib("libm.a"), true},
+		{libs, findSystemLib("libc.a"), false},
+		{libs, need(filepath.Join(gcc, "libgcc.a")), false},
+		{libs, need(filepath.Join(gcc, "libgcc_eh.a")), true},
+		{tail, need(filepath.Join(gcc, "crtend.o")), false},
+		{tail, findSystemLib("crtn.o"), false},
+	} {
+		if f.path == "" {
+			if f.opt {
+				continue
+			}
+			return fail("-static: the static C library is missing (libc.a, crt1.o: install libc6-dev)")
+		}
+		if err := f.in.AddFile(f.path); err != nil {
+			return fail("%v", err)
+		}
+	}
+	rt, err := runtimeObjects()
+	if err != nil {
+		return fail("%v", err)
+	}
+	ln := &elf.Linker{
+		Objects:   append(crt.Objects, in.Objects...),
+		Archives:  append(in.Archives, libs.Archives...),
+		Tail:      tail.Objects,
+		Lazy:      append([]*elf.Object(nil), rt...),
+		StripSyms: in.Strip,
+		Static:    true,
+	}
+	return runLinker(ln)
+}
+
 func findSystemLib(name string) string {
 	for _, d := range DefaultLibDirs {
 		p := filepath.Join(d, name)
@@ -769,7 +873,9 @@ func findSystemLib(name string) string {
 
 // Link builds an executable image from the inputs
 func Link(in *LinkInput) ([]byte, []Diagnostic) {
-	var diags []Diagnostic
+	if in.Static {
+		return linkStatic(in)
+	}
 	libc := findSystemLib("libc.so.6")
 	if libc == "" {
 		return nil, []Diagnostic{{Severity: SevError, Message: "libc.so.6 not found: a glibc-based Linux is required"}}
@@ -806,6 +912,12 @@ func Link(in *LinkInput) ([]byte, []Diagnostic) {
 		Lazy:       append([]*elf.Object(nil), rt...),
 		StripSyms:  in.Strip,
 	}
+	return runLinker(ln)
+}
+
+// runLinker links and turns link errors into diagnostics
+func runLinker(ln *elf.Linker) ([]byte, []Diagnostic) {
+	var diags []Diagnostic
 	img, err := ln.Link()
 	if err != nil {
 		if le, ok := err.(*elf.LinkError); ok {

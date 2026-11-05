@@ -110,6 +110,12 @@ func (b *irBuilder) tryInline(n *cc.Node, fn *cc.Obj) (*irValue, bool) {
 	if fn.Ty.Ret.Kind != cc.TyVoid {
 		ctx.result = b.newTemp(irTypeOf(fn.Ty.Ret))
 	}
+	site := b.f.curSite
+	var here *dbgSite
+	if b.g.debug {
+		here = &dbgSite{fn: fn, call: n.Tok, outer: site, vars: dbgVarSet(fn)}
+		b.f.curSite = here
+	}
 	for i, p := range fn.Params {
 		if i >= len(args) {
 			break
@@ -123,6 +129,15 @@ func (b *irBuilder) tryInline(n *cc.Node, fn *cc.Obj) (*irValue, bool) {
 	b.inl = ctx
 	b.stmt(fn.Body)
 	b.jump(ctx.exit)
+	if here != nil {
+		here.mem = map[*cc.Obj]*irSlot{}
+		for v := range here.vars {
+			if s, ok := b.slots[v]; ok && !b.promoted[v] {
+				here.mem[v] = s
+			}
+		}
+	}
+	b.f.curSite = site
 	b.inl = ctx.outer
 	b.seal(ctx.exit)
 	b.cur = ctx.exit

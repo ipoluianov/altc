@@ -34,6 +34,7 @@ func (g *gen) irFunction(fn *cc.Obj) (ok bool) {
 		return false
 	}
 	f.curTok = nil // values made by the optimizations take the position of the code before
+	f.curSite = nil
 	f.isa = g.isa
 	f.noVectorize = os.Getenv("ALTC_NOVECTORIZE") != ""
 	f.fastMath = g.fastMath
@@ -58,7 +59,11 @@ func (g *gen) irFunction(fn *cc.Obj) (ok bool) {
 	}
 	g.fn = fn
 	g.asmSlots = map[*cc.AsmOperand]int64{}
-	(&irEmitter{g: g, a: g.a, f: f, ra: ra}).emit()
+	em := &irEmitter{g: g, a: g.a, f: f, ra: ra}
+	em.emit()
+	if g.debug {
+		g.irDbg = em.debugInfo()
+	}
 	if irStats {
 		fmt.Fprintf(os.Stderr, "ir: %s: ok\n", fn.Name)
 	}
@@ -68,6 +73,8 @@ func (g *gen) irFunction(fn *cc.Obj) (ok bool) {
 type irEmitter struct {
 	g        *gen
 	a        *Asm
+	events   []dbgEvent // positions and their code offsets (-g)
+	sites    []*dbgSite // inlined calls (-g)
 	f        *irFunc
 	ra       *irAlloc
 	labels   map[*irBlock]Label
@@ -220,13 +227,37 @@ func (e *irEmitter) emit() {
 			}
 		}
 		a.Bind(e.labels[b])
+		dbg := e.g.debug
+		if dbg {
+			e.events = append(e.events, dbgEvent{b.start, len(a.Code)})
+		}
 		for _, v := range b.Instrs {
+			lm := a.lineMark()
 			if v.tok != nil {
 				e.g.lineAt(v.tok)
 			}
+			if dbg {
+				e.events = append(e.events, dbgEvent{v.pos, len(a.Code)})
+			}
+			lo := len(a.Code)
 			e.value(v)
+			if len(a.Code) == lo {
+				a.lineRestore(lm) // no code (a constant, a fused compare): the line goes to what comes next
+			}
+			if dbg && v.site != nil && len(a.Code) > lo {
+				if !e.seen(v.site) {
+					e.sites = append(e.sites, v.site)
+				}
+				noteSite(v.site, lo, len(a.Code))
+			}
+		}
+		if dbg {
+			e.events = append(e.events, dbgEvent{b.end - 4, len(a.Code)})
 		}
 		e.terminator(b)
+		if dbg {
+			e.events = append(e.events, dbgEvent{b.end, len(a.Code)})
+		}
 	}
 	a.Bind(e.epilogue)
 	if e.ymm && f.RetType != iV256 {
@@ -601,6 +632,10 @@ func (e *irEmitter) value(v *irValue) {
 		e.finish(v, d)
 	case opCall:
 		e.call(v)
+	case opX87:
+		e.x87(v)
+	case opAtomic:
+		e.atomic(v)
 	default:
 		panic(fmt.Sprintf("cannot emit %s", opNames[v.Op]))
 	}
@@ -1059,6 +1094,10 @@ func (e *irEmitter) call(v *irValue) {
 	} else {
 		a.CallInd(Q(R11))
 	}
+	if c.RetX87 != nil {
+		a.Fstp(10, M(RBP, int32(c.RetX87.Offset)))
+		return
+	}
 	if c.RetSlot != nil {
 		gi, fi := 0, 0
 		for _, ch := range c.RetChunks {
@@ -1194,7 +1233,14 @@ func (e *irEmitter) terminator(b *irBlock) {
 			}
 			e.parallelMove(moves)
 		}
-		if c := b.Ctrl; c != nil {
+		if e.f.RetX87 {
+			// the value goes to st(0)
+			if c := b.Ctrl; c != nil {
+				a.Fld(10, e.x87Mem(c, RAX))
+			} else {
+				a.Fldz()
+			}
+		} else if c := b.Ctrl; c != nil {
 			if c.Type.inXMM() {
 				e.fmaterialize(c, XMM0)
 			} else {

@@ -55,6 +55,7 @@ type gen struct {
 	dbgFuncs   []dbgFunc       // the functions described in .debug_info
 	asmFiles   map[int]string  // .file entries of assembly text
 	usedIR     bool            // the last function was compiled by the IR backend
+	irDbg      *irDebug        // its variable locations and inlined calls (-g)
 	isa        ISA             // instruction set extensions of the function being compiled
 	baseISA    ISA             // those of the unit (command line)
 
@@ -364,7 +365,11 @@ func (g *gen) run() (err error) {
 		g.compileFunction(ob, ob.Target)
 		s.Size = int64(len(g.a.Code)) - start
 		if g.debug {
-			g.dbgFuncs = append(g.dbgFuncs, dbgFunc{ob: ob, start: int(start), end: len(g.a.Code), frame: g.noRegAlloc && !g.usedIR})
+			fd := dbgFunc{ob: ob, start: int(start), end: len(g.a.Code), frame: g.noRegAlloc && !g.usedIR}
+			if g.usedIR {
+				fd.ir = g.irDbg
+			}
+			g.dbgFuncs = append(g.dbgFuncs, fd)
 		}
 		if ob.LabelAddrs {
 			// symbols for labels whose addresses are stored in static data
@@ -2018,12 +2023,8 @@ func (g *gen) genFetchOp(n *cc.Node) {
 	g.genExpr(n.LHS)
 	g.push()
 	g.genExpr(n.RHS)
-	if elem.Kind == cc.TyPtr && (n.Val == cc.FetchAdd || n.Val == cc.FetchSub) {
-		// pointer arithmetic in units of the pointed-to type
-		if s := elem.Base.Size(); s > 1 {
-			g.a.Imul3(8, RAX, Q(RAX), s)
-		}
-	}
+	// pointers are added as integers, like gcc (an _Atomic pointer's
+	// compound assignment is scaled by the front end)
 	g.a.Mov(8, Q(RSI), Q(RAX))
 	g.pop(RDI)
 	r := Sized(RSI, sz)

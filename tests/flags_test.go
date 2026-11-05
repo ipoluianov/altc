@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ipoluianov/altc/driver"
+	"github.com/ipoluianov/altc/elf"
 	"github.com/ipoluianov/altc/x64"
 )
 
@@ -20,6 +21,8 @@ func testConfig(c *driver.Config) *driver.Config {
 		case "-g":
 			c.Debug = true
 			continue
+		case "-static":
+			continue // linkInput
 		}
 		if _, err := c.MachineFlag(f); err != nil {
 			panic(err)
@@ -54,4 +57,15 @@ func withFlags(c *driver.Config, flags []string) *driver.Config {
 		}
 	}
 	return c
+}
+
+// linkInput makes a link input honoring -static in ALTC_TEST_FLAGS
+func linkInput(objs ...*elf.Object) *driver.LinkInput {
+	in := &driver.LinkInput{Objects: objs}
+	for _, f := range strings.Fields(os.Getenv("ALTC_TEST_FLAGS")) {
+		if f == "-static" {
+			in.Static = true
+		}
+	}
+	return in
 }

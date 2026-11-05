@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/ipoluianov/altc/driver"
-	"github.com/ipoluianov/altc/elf"
 )
 
 func run(t *testing.T, exe string, dir string) (string, int) {
@@ -95,7 +94,7 @@ func TestCompareWithGCC(t *testing.T) {
 				}
 				t.FailNow()
 			}
-			img, diags := driver.Link(&driver.LinkInput{Objects: []*elf.Object{u.Obj}})
+			img, diags := driver.Link(linkInput(u.Obj))
 			if img == nil {
 				for _, d := range diags {
 					t.Error(d)

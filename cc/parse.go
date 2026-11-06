@@ -770,6 +770,8 @@ func (p *parser) declspec(attr *declAttr) *Type {
 				ty = complexOf(tyFloat)
 			case LONG + DOUBLE:
 				ty = complexOf(tyLDouble)
+			case LONG:
+				// _Complex long double: checked when the specifiers end
 			default:
 				p.errorAt(t, "complex integer types are not supported")
 			}
@@ -815,6 +817,9 @@ func (p *parser) declspec(attr *declAttr) *Type {
 		default:
 			p.errorAt(t, "invalid combination of type specifiers")
 		}
+	}
+	if counter == COMPLEX+LONG {
+		p.errorAt(start, "complex integer types are not supported")
 	}
 	if counter == 0 && attr != nil && attr.isAuto && p.opt.Std >= 2023 || counter == 0 && attr != nil && attr.isAuto && start.Text == "__auto_type" {
 		ty = nil // type inferred from the initializer

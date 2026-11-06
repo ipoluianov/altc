@@ -39,18 +39,21 @@ func (k i128Kind) isCompare() bool { return k >= i128Lt }
 // ---- lowering ----
 
 // pair makes a 128-bit value of two i64 halves
-func (b *irBuilder) pair(lo, hi *irValue) *irValue {
+func (b *irBuilder) pair(lo, hi *irValue) *irValue { return b.pairOf(iI128, lo, hi) }
+
+// pairOf makes a value of a pair type t from its halves
+func (b *irBuilder) pairOf(t irType, lo, hi *irValue) *irValue {
 	b.ensure()
-	v := b.f.newValue(b.cur, opPair, iI128, lo, hi)
+	v := b.f.newValue(b.cur, opPair, t, lo, hi)
 	b.cur.Instrs = append(b.cur.Instrs, v)
 	return v
 }
 
-// halves splits a 128-bit value
+// halves splits a value of a pair type
 func halves(v *irValue) (lo, hi *irValue) {
 	v = v.resolve()
 	if v.Op != opPair {
-		panic("128-bit value is not a pair")
+		panic("value is not a pair")
 	}
 	return v.Args[0].resolve(), v.Args[1].resolve()
 }
@@ -65,18 +68,24 @@ func (b *irBuilder) op128(k i128Kind, t irType, args ...*irValue) *irValue {
 	return v
 }
 
-// halfVar is a half of a 128-bit variable
+// halfVar is a half of a variable of a pair type
 type halfVar struct {
 	v    *cc.Obj
-	half int // 1: low, 2: high
+	half int // 1: low (real), 2: high (imaginary)
 }
 
-// halfVars are the SSA variables of the halves of a 128-bit variable
+// halfVars are the SSA variables of the halves of a variable of a pair
+// type (a 128-bit integer or a complex number)
 func (b *irBuilder) halfVars(v *cc.Obj) [2]*cc.Obj {
 	h, ok := b.halves128[v]
 	if !ok {
-		h = [2]*cc.Obj{{Name: v.Name + ".lo"}, {Name: v.Name + ".hi"}}
-		b.varType[h[0]], b.varType[h[1]] = iI64, iI64
+		t := b.varType[v]
+		names := [2]string{".lo", ".hi"}
+		if t != iI128 {
+			names = [2]string{".re", ".im"}
+		}
+		h = [2]*cc.Obj{{Name: v.Name + names[0]}, {Name: v.Name + names[1]}}
+		b.varType[h[0]], b.varType[h[1]] = t.part(), t.part()
 		b.halves128[v] = h
 		b.halfOf[h[0]], b.halfOf[h[1]] = halfVar{v, 1}, halfVar{v, 2}
 	}

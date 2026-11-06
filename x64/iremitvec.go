@@ -260,7 +260,8 @@ func (e *irEmitter) vinsn(v *irValue) {
 		e.text("%s %s%s, %s", vmn, imm, e.xsrc(x, XMM14, form != vExtract), xname(d, res))
 	case len(args) == 2:
 		x, y := args[0], args[1]
-		regOnly := mn == "movss" || mn == "movsd" || !y.Type.inXMM()
+		// a scalar float in memory is not a 16-byte operand (complex packing)
+		regOnly := mn == "movss" || mn == "movsd" || !y.Type.inXMM() || y.Type.isFloat() && !strings.HasSuffix(mn, "ss") && !strings.HasSuffix(mn, "sd")
 		if avx {
 			var ys string
 			if y.Type.inXMM() {

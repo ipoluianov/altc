@@ -1192,6 +1192,9 @@ func (e *irEmitter) call(v *irValue) {
 	}
 	if c.RetX87 != nil {
 		a.Fstp(10, M(RBP, int32(c.RetX87.Offset)))
+		if c.RetX87Im != nil {
+			a.Fstp(10, M(RBP, int32(c.RetX87Im.Offset)))
+		}
 		return
 	}
 	if c.RetSlot != nil {
@@ -1314,7 +1317,16 @@ func (e *irEmitter) terminator(b *irBlock) {
 			}
 		}
 	case bRet:
-		if len(b.RetVals) > 0 {
+		if e.f.RetX87Pair {
+			// the imaginary part goes to st(1), the real part to st(0)
+			if len(b.RetVals) == 2 {
+				a.Fld(10, e.x87Mem(b.RetVals[1], RAX))
+				a.Fld(10, e.x87Mem(b.RetVals[0], RAX))
+			} else {
+				a.Fldz()
+				a.Fldz()
+			}
+		} else if len(b.RetVals) > 0 {
 			var moves []pmove
 			gi, fi := 0, 0
 			for _, x := range b.RetVals {

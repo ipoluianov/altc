@@ -3,7 +3,6 @@ package tests
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -27,51 +26,73 @@ func TestRepeatedLinks(t *testing.T) {
 		}
 		want[p] = out
 	}
+	// the links run at the same time; the programs are written and run
+	// afterwards, one by one
+	imgs := make([][]byte, 24)
 	var wg sync.WaitGroup
-	for i := 0; i < 24; i++ {
+	for i := range imgs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			p := progs[i%len(progs)]
-			out, ok := runIn(t, buildIn(t, dir, p, fmt.Sprintf("p%d", i)))
-			if ok && out != want[p] {
-				t.Errorf("%s (link %d): output differs:\n%s\nwant:\n%s", p, i, out, want[p])
-			}
+			imgs[i] = linkIn(t, progs[i%len(progs)])
 		}()
 	}
 	wg.Wait()
+	for i, img := range imgs {
+		if img == nil {
+			continue
+		}
+		p := progs[i%len(progs)]
+		out, ok := runIn(t, writeExe(t, dir, fmt.Sprintf("p%d", i), img))
+		if ok && out != want[p] {
+			t.Errorf("%s (link %d): output differs:\n%s\nwant:\n%s", p, i, out, want[p])
+		}
+	}
 }
 
 func runIn(t *testing.T, exe string) (string, bool) {
 	if exe == "" {
 		return "", false
 	}
-	out, err := exec.Command(exe).CombinedOutput()
-	if err != nil {
-		t.Errorf("%s: %v\n%s", filepath.Base(exe), err, out)
+	out, code := run(t, exe, filepath.Dir(exe))
+	if code != 0 {
+		t.Errorf("%s: exit %d\n%s", filepath.Base(exe), code, out)
 		return "", false
 	}
-	return string(out), true
+	return out, true
 }
 
 // buildIn compiles and links one test program in this process
 func buildIn(t *testing.T, dir, file, name string) string {
+	img := linkIn(t, file)
+	if img == nil {
+		return ""
+	}
+	return writeExe(t, dir, name, img)
+}
+
+// linkIn compiles and links a program in memory
+func linkIn(t *testing.T, file string) []byte {
 	src, _ := filepath.Abs(file)
 	data, err := os.ReadFile(src)
 	if err != nil {
 		t.Error(err)
-		return ""
+		return nil
 	}
 	u := driver.CompileSource(src, data, &driver.Config{Std: "gnu17", NoWarnings: true})
 	if u.Obj == nil {
 		t.Error(u.Diagnostics)
-		return ""
+		return nil
 	}
 	img, diags := driver.Link(&driver.LinkInput{Objects: []*elf.Object{u.Obj}})
 	if img == nil {
 		t.Error(diags)
-		return ""
+		return nil
 	}
+	return img
+}
+
+func writeExe(t *testing.T, dir, name string, img []byte) string {
 	exe := filepath.Join(dir, name)
 	if err := os.WriteFile(exe, img, 0o755); err != nil {
 		t.Error(err)

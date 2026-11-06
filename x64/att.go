@@ -7,6 +7,7 @@ package x64
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -71,6 +72,10 @@ type textAsm struct {
 	trial    bool         // trial pass: record the jumps
 	branchN  int
 	branches []branchInfo
+	aligns   []alignInfo          // alignments of a trial pass
+	labelEvs map[labelRef]relaxEv // where labels were defined (trial)
+	regions  map[*Asm]int         // alignments so far per section
+	seq      int                  // order of the recorded events
 
 	// LEB128 values of label differences not known when they are met:
 	// their sizes come from the trial passes too
@@ -99,7 +104,7 @@ func AssembleText(env *TextEnv, text string) error {
 		env.Labels = map[string]*TextLabel{}
 	}
 	short, lebSize := relaxBranches(env, text)
-	_, _, err := assemblePass(env, text, short, lebSize, false)
+	_, err := assemblePass(env, text, short, lebSize, false)
 	return err
 }
 
@@ -110,15 +115,44 @@ type branchInfo struct {
 	end    int // end of the instruction
 	label  Label
 	addend int64
+	grow   int // the long form is this much longer
+	relaxEv
 }
 
-// relaxBranches chooses the jumps that can be short: start with all of
-// them short and lengthen those out of range until the layout is stable;
-// the sizes of forward LEB128 label differences are settled alongside
+// relaxEv places a jump, alignment or label among the others: the order
+// of the text, and the region (alignments before it in the section)
+type relaxEv struct {
+	seq, region int
+}
+
+// alignInfo is an alignment directive in a trial pass
+type alignInfo struct {
+	a       *Asm
+	pos     int // before the padding
+	n       int64
+	maxSkip int64
+	pad     int
+	relaxEv
+}
+
+// trialInfo is what a trial pass records
+type trialInfo struct {
+	branches []branchInfo
+	aligns   []alignInfo
+	labels   map[labelRef]relaxEv
+	lebs     []lebInfo
+}
+
+// relaxBranches chooses the jumps that can be short. It follows GNU as
+// (relax_segment) to make the same choices: all jumps start short; each
+// pass walks the code in order, lengthening the jumps out of range with
+// the addresses moved by the growth so far (alignments absorb some of
+// it); a forward target past an alignment is assumed not to move. The
+// sizes of forward LEB128 label differences are settled alongside.
 func relaxBranches(env *TextEnv, text string) (map[int]bool, map[int]int) {
 	lebSize := map[int]int{}
 	var lebs []lebInfo
-	trial := func(short map[int]bool) ([]branchInfo, bool) {
+	trial := func(short map[int]bool) (*trialInfo, bool) {
 		ext := &Asm{}
 		ext.NewLabel()
 		secs := map[string]*Asm{}
@@ -138,9 +172,12 @@ func relaxBranches(env *TextEnv, text string) (map[int]bool, map[int]int) {
 		for name := range env.Labels {
 			tenv.Labels[name] = &TextLabel{A: ext, L: 0, Defined: true}
 		}
-		infos, l, err := assemblePass(tenv, text, short, lebSize, true)
-		lebs = l
-		return infos, err == nil
+		info, err := assemblePass(tenv, text, short, lebSize, true)
+		if err != nil {
+			return nil, false
+		}
+		lebs = info.lebs
+		return info, true
 	}
 	// lebSettle updates the LEB128 sizes from the last trial layout
 	lebSettle := func() bool {
@@ -158,36 +195,122 @@ func relaxBranches(env *TextEnv, text string) (map[int]bool, map[int]int) {
 		}
 		return changed
 	}
-	infos, ok := trial(nil)
-	if !ok || len(infos) == 0 && len(lebs) == 0 {
+	info, ok := trial(nil)
+	if !ok || len(info.branches) == 0 && len(lebs) == 0 {
 		return nil, nil
 	}
 	short := map[int]bool{}
-	for _, b := range infos {
+	for _, b := range info.branches {
 		short[b.ord] = true
 	}
 	lebSettle()
-	for iter := 0; iter < 32; iter++ {
-		infos, ok = trial(short)
+	for iter := 0; iter < 64; iter++ {
+		info, ok = trial(short)
 		if !ok {
 			return nil, lebSize
 		}
 		changed := lebSettle()
-		for _, b := range infos {
-			if !short[b.ord] {
-				continue
-			}
-			pos := b.a.labels[b.label]
-			if pos < 0 || !fitsI8(int64(pos)+b.addend-int64(b.end)) {
-				delete(short, b.ord)
-				changed = true
-			}
+		if relaxPass(info, short) {
+			changed = true
 		}
 		if !changed {
 			return short, lebSize
 		}
 	}
 	return nil, lebSize
+}
+
+// relaxPass is one pass of GNU as over the layout of a trial: it
+// lengthens the short jumps found out of range and tells whether any was
+func relaxPass(info *trialInfo, short map[int]bool) bool {
+	type event struct {
+		seq int
+		br  *branchInfo
+		al  *alignInfo
+		lbl labelRef
+	}
+	bySec := map[*Asm][]event{}
+	for i := range info.branches {
+		b := &info.branches[i]
+		bySec[b.a] = append(bySec[b.a], event{seq: b.seq, br: b})
+	}
+	for i := range info.aligns {
+		al := &info.aligns[i]
+		bySec[al.a] = append(bySec[al.a], event{seq: al.seq, al: al})
+	}
+	for l, ev := range info.labels {
+		bySec[l.a] = append(bySec[l.a], event{seq: ev.seq, lbl: l})
+	}
+	changed := false
+	for _, evs := range bySec {
+		sort.Slice(evs, func(i, j int) bool { return evs[i].seq < evs[j].seq })
+		moved := map[Label]int{} // labels already reached: their new position
+		stretch, fragStart := 0, 0
+		for _, ev := range evs {
+			switch {
+			case ev.al != nil:
+				al := ev.al
+				pos := al.pos + stretch
+				pad := int((al.n - int64(pos)%al.n) % al.n)
+				if al.maxSkip >= 0 && int64(pad) > al.maxSkip {
+					pad = 0
+				}
+				stretch += pad - al.pad
+				fragStart = pos + pad
+			case ev.br != nil:
+				b := ev.br
+				size := 2
+				if !short[b.ord] {
+					size += b.grow
+				}
+				start := b.end - size + stretch
+				fragAddr := fragStart // gas compares with the start of the jump's frag
+				fragStart = start + size
+				if !short[b.ord] {
+					continue // jumps never get shorter
+				}
+				var target int
+				if p, ok := moved[b.label]; ok {
+					target = p
+				} else {
+					target = b.a.labels[b.label]
+					if target < 0 {
+						continue
+					}
+					if lev, ok := info.labels[labelRef{b.a, b.label}]; ok && stretch != 0 {
+						switch {
+						case stretch < 0 || lev.region == b.region:
+							target += stretch
+						case target+int(b.addend) < fragAddr:
+							continue
+						}
+					}
+				}
+				if !fitsI8(int64(target) + b.addend - int64(start+2)) {
+					delete(short, b.ord)
+					stretch += b.grow
+					fragStart += b.grow
+					changed = true
+				}
+			default:
+				moved[ev.lbl.l] = ev.lbl.a.labels[ev.lbl.l] + stretch
+			}
+		}
+	}
+	return changed
+}
+
+// event places the next jump or alignment of a trial pass
+func (t *textAsm) event() relaxEv {
+	t.seq++
+	return relaxEv{t.seq, t.regions[t.a]}
+}
+
+// noteLabel records where a label was defined in a trial pass
+func (t *textAsm) noteLabel(l Label) {
+	if t.trial {
+		t.labelEvs[labelRef{t.a, l}] = t.event()
+	}
 }
 
 // lebLen is the size of the LEB128 encoding of v
@@ -198,12 +321,12 @@ func lebLen(v int64, signed bool) int {
 	return len(appendULEB(nil, uint64(v)))
 }
 
-func assemblePass(env *TextEnv, text string, short map[int]bool, lebSize map[int]int, trial bool) ([]branchInfo, []lebInfo, error) {
+func assemblePass(env *TextEnv, text string, short map[int]bool, lebSize map[int]int, trial bool) (*trialInfo, error) {
 	t := &textAsm{env: env, numBack: map[string]labelRef{}, numFwd: map[string]labelRef{}, defNames: map[string]bool{},
-		short: short, trial: trial, lebSize: lebSize}
+		short: short, trial: trial, lebSize: lebSize, labelEvs: map[labelRef]relaxEv{}, regions: map[*Asm]int{}}
 	a, err := env.Section(".text", "")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	t.a, t.secName = a, ".text"
 	t.prev = secEntry{t.secName, t.a}
@@ -252,15 +375,15 @@ func assemblePass(env *TextEnv, text string, short map[int]bool, lebSize map[int
 				if file == "" {
 					file = env.FileName
 				}
-				return nil, nil, fmt.Errorf("%s:%d: %v", file, st.line, err)
+				return nil, fmt.Errorf("%s:%d: %v", file, st.line, err)
 			}
-			return nil, nil, fmt.Errorf("%v (in '%s')", err, strings.TrimSpace(st.text))
+			return nil, fmt.Errorf("%v (in '%s')", err, strings.TrimSpace(st.text))
 		}
 	}
 	for n := range t.numFwd {
-		return nil, nil, fmt.Errorf("undefined local label '%sf'", n)
+		return nil, fmt.Errorf("undefined local label '%sf'", n)
 	}
-	return t.branches, t.lebs, nil
+	return &trialInfo{branches: t.branches, aligns: t.aligns, labels: t.labelEvs, lebs: t.lebs}, nil
 }
 
 // asmStmt is a statement of assembly text with its position
@@ -389,6 +512,7 @@ func (t *textAsm) defineLabel(name string) error {
 			delete(t.numFwd, name)
 		}
 		t.a.Bind(l)
+		t.noteLabel(l)
 		t.numBack[name] = labelRef{t.a, l}
 		return nil
 	}
@@ -405,6 +529,7 @@ func (t *textAsm) defineLabel(name string) error {
 	}
 	tl.Defined = true
 	t.a.Bind(tl.L)
+	t.noteLabel(tl.L)
 	return nil
 }
 
@@ -1932,7 +2057,7 @@ func (t *textAsm) branchRelax(op []byte, shortOp byte, target aop, short bool) e
 			t.a.imm(0, 4)
 		}
 		if t.trial {
-			t.branches = append(t.branches, branchInfo{ord, t.a, len(t.a.Code), v.lbl.l, v.v})
+			t.branches = append(t.branches, branchInfo{ord, t.a, len(t.a.Code), v.lbl.l, v.v, len(op) + 4 - 2, t.event()})
 		}
 		return nil
 	}
@@ -2939,6 +3064,13 @@ func (t *textAsm) directive(name, rest string) error {
 		}
 		pad := (n - int64(len(t.a.Code))%n) % n
 		if maxSkip >= 0 && pad > maxSkip {
+			pad = 0
+		}
+		if t.trial {
+			t.aligns = append(t.aligns, alignInfo{t.a, len(t.a.Code), n, maxSkip, int(pad), t.event()})
+			t.regions[t.a]++
+		}
+		if pad == 0 {
 			return nil
 		}
 		switch {

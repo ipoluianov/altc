@@ -1409,6 +1409,15 @@ func (a *Asm) Fchs()   { a.list("fchs"); a.b(0xD9, 0xE0) }
 func (a *Asm) Fabs()   { a.list("fabs"); a.b(0xD9, 0xE1) }
 func (a *Asm) Fldz()   { a.list("fldz"); a.b(0xD9, 0xEE) }
 func (a *Asm) Fld1()   { a.list("fld1"); a.b(0xD9, 0xE8) }
+func (a *Asm) Fxam()   { a.list("fxam"); a.b(0xD9, 0xE5) }
+
+// FnstswAX stores the x87 status word in ax
+func (a *Asm) FnstswAX() {
+	if a.Listing != nil {
+		fmt.Fprintf(a.Listing, "\tfnstsw\t%%ax\n")
+	}
+	a.b(0xDF, 0xE0)
+}
 
 // FldSt pushes a copy of st(i)
 func (a *Asm) FldSt(i int) {

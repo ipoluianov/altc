@@ -166,8 +166,8 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
 - Programs are linked dynamically against `libc.so.6` and `libm.so.6`. The
   linker generates `_start`, PLT/GOT, TLS, init/fini arrays and `.dynamic`
   itself. What glibc keeps in `libc_nonshared.a` (`atexit`...) and the
-  libgcc helpers for `__int128` come from a small runtime compiled on the
-  fly.
+  libgcc helpers for `__int128` and `_Complex` come from a small runtime
+  compiled on the fly.
 - `-static` (or `"static": true` in `altc.json`) links like `gcc -static`:
   `crt1.o`, `crti.o`, `crtbeginT.o`, the objects, `libc.a`, `libm.a`,
   `libgcc.a`, `libgcc_eh.a`, `crtend.o`, `crtn.o` (the `libc6-dev` and
@@ -206,9 +206,15 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
   `alloca` move the stack pointer below the frame (the outgoing argument
   area moves with it); VLA scopes save and restore it, also on `goto` out
   of them and on every loop iteration.
+- `_Complex` values are pairs of their parts in the IR, like `__int128`:
+  `float` and `double` parts in xmm registers (a `float _Complex` argument
+  packed in one register), `long double` parts as x87 values in memory,
+  returned in `st(0)` and `st(1)`. Multiplication is inline, with the
+  libgcc helper (C11 Annex G) only when both parts come out NaN, as gcc
+  does; division calls the helpers, whose runtime versions follow libgcc
+  bit for bit. `creal`, `cimag` and `conj` are expanded in place.
 - Functions the IR does not cover (structs returned in x87 registers,
-  `_Complex`, asm goto, K&R definitions, computed goto, `setjmp`) use the
-  older
+  asm goto, K&R definitions, computed goto, `setjmp`) use the older
   stack-machine generator, which keeps the most used locals in callee-saved
   registers. The two mix freely within a file.
 - The result is typically close to gcc `-O2` on scalar code, and close to

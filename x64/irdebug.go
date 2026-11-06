@@ -293,7 +293,7 @@ func (e *irEmitter) debugInfo() *irDebug {
 		d.addVar(k.site, dbgVarLoc{v: k.v, list: list})
 	}
 	for _, w := range halfOrder {
-		d.addVar(w.site, dbgVarLoc{v: w.v, list: pieces128(halfLists[w])})
+		d.addVar(w.site, dbgVarLoc{v: w.v, list: pieces(halfLists[w], byte(w.v.Ty.Size()/2))})
 	}
 	return d
 }
@@ -306,10 +306,10 @@ func (d *irDebug) addVar(site *dbgSite, l dbgVarLoc) {
 	}
 }
 
-// pieces128 combines the location lists of the halves of a 128-bit
-// variable: DW_OP_piece 8 after each (an empty piece: that half is not
-// known there)
-func pieces128(h [2][]dbgPiece) []dbgPiece {
+// pieces combines the location lists of the halves of a 128-bit or
+// complex variable: DW_OP_piece size after each (an empty piece: that half
+// is not known there)
+func pieces(h [2][]dbgPiece, size byte) []dbgPiece {
 	var cuts []int
 	for _, l := range h {
 		for _, p := range l {
@@ -335,8 +335,8 @@ func pieces128(h [2][]dbgPiece) []dbgPiece {
 		if a == nil && b == nil {
 			continue
 		}
-		ex := append(append(append([]byte(nil), a...), 0x93, 8), b...) // DW_OP_piece 8
-		ex = append(ex, 0x93, 8)
+		ex := append(append(append([]byte(nil), a...), 0x93, size), b...) // DW_OP_piece size
+		ex = append(ex, 0x93, size)
 		if n := len(list); n > 0 && list[n-1].hi == lo && string(list[n-1].expr) == string(ex) {
 			list[n-1].hi = hi
 			continue

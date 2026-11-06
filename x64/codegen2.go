@@ -1,6 +1,7 @@
 package x64
 
 import (
+	"encoding/binary"
 	"math"
 	"sort"
 
@@ -1256,8 +1257,45 @@ func (g *gen) toDoubleXMM0(t *cc.Type) {
 	case cc.TyFloat:
 		g.a.CvtFF(true, XMM0, X(XMM0))
 	case cc.TyLongDouble:
-		g.cast(t, cc.TypeDouble)
+		g.ldClassDouble()
 	}
+}
+
+// ldClassDouble replaces the long double in st(0) by a double of the same
+// class and sign in xmm0 (NaN, infinity, 1, a subnormal or 0), for the
+// classification builtins: the value converted could overflow or
+// underflow
+func (g *gen) ldClassDouble() {
+	g.a.Fxam()
+	g.a.FnstswAX()
+	g.a.FstpSt(0)
+	// the class C3 C2 C0 (bits 14, 10, 8) as an index, C1 the sign (bit 9)
+	nan, inf := math.Float64bits(math.NaN()), math.Float64bits(math.Inf(1))
+	var table []byte
+	for _, v := range []uint64{nan, nan, math.Float64bits(1), inf, 0, nan, math.Float64bits(1e-310), nan} {
+		table = binary.LittleEndian.AppendUint64(table, v)
+	}
+	g.a.Mov(4, D(RCX), D(RAX))
+	g.a.ShiftImm(SHR, 4, D(RCX), 8)
+	g.a.Alu(AND, 4, D(RCX), Imm(1))
+	g.a.Mov(4, D(RDX), D(RAX))
+	g.a.ShiftImm(SHR, 4, D(RDX), 9)
+	g.a.Alu(AND, 4, D(RDX), Imm(2))
+	g.a.Alu(OR, 4, D(RCX), D(RDX))
+	g.a.Mov(4, D(RDX), D(RAX))
+	g.a.ShiftImm(SHR, 4, D(RDX), 12)
+	g.a.Alu(AND, 4, D(RDX), Imm(4))
+	g.a.Alu(OR, 4, D(RCX), D(RDX))
+	g.a.Lea(RDX, MSym(g.constLabel(table, 8), 0))
+	g.a.ShiftImm(SHL, 4, D(RCX), 3)
+	g.a.Alu(ADD, 8, Q(RDX), Q(RCX))
+	g.a.Mov(8, Q(RCX), M(RDX, 0))
+	// the sign
+	g.a.ShiftImm(SHR, 4, D(RAX), 9)
+	g.a.Alu(AND, 4, D(RAX), Imm(1))
+	g.a.ShiftImm(SHL, 8, Q(RAX), 63)
+	g.a.Alu(OR, 8, Q(RCX), Q(RAX))
+	g.a.MovqToX(8, XMM0, RCX)
 }
 
 func (g *gen) genFloatClass(op string, t *cc.Type) {

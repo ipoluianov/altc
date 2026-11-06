@@ -81,8 +81,11 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
     variables (.debug_loc, .debug_ranges).
 20. __int128 (pairs of 64-bit halves) and VLAs/alloca in the IR; exact
     128-bit constant initializers.
-21. Later: AVX-512 (needs a machine or emulator that can run it to test
-    the generated code), _Complex in the IR.
+21. _Complex in the IR (pairs of parts; long double parts in memory,
+    st(0)/st(1) results); inline multiplication; libgcc-exact runtime
+    division; GNU as-compatible jump relaxation.
+22. Later: AVX-512 (needs a machine or emulator that can run it to test
+    the generated code).
 
 ## CLI
 

@@ -118,10 +118,26 @@ func (p *parser) complexBinary(op NodeKind, a, b *Node, tok *Token) *Node {
 	}
 	var res *Node
 	switch op {
+	// a real operand is not converted to complex (C11 G.5.2): the
+	// imaginary part is the other operand's (the sign of a zero stays)
 	case NAdd:
-		res = makeComplex(ct, bin(NAdd, ar, br), bin(NAdd, ai, bi), tok)
+		im := bin(NAdd, ai, bi)
+		switch {
+		case !a.Ty.IsComplex():
+			im = bi
+		case !b.Ty.IsComplex():
+			im = ai
+		}
+		res = makeComplex(ct, bin(NAdd, ar, br), im, tok)
 	case NSub:
-		res = makeComplex(ct, bin(NSub, ar, br), bin(NSub, ai, bi), tok)
+		im := bin(NSub, ai, bi)
+		switch {
+		case !a.Ty.IsComplex():
+			im = newUnary(NNeg, bi, tok)
+		case !b.Ty.IsComplex():
+			im = ai
+		}
+		res = makeComplex(ct, bin(NSub, ar, br), im, tok)
 	case NMul:
 		switch {
 		case !b.Ty.IsComplex():
@@ -132,8 +148,18 @@ func (p *parser) complexBinary(op NodeKind, a, b *Node, tok *Token) *Node {
 			res = makeComplex(ct, bin(NSub, bin(NMul, ar, br), bin(NMul, ai, bi)),
 				bin(NAdd, bin(NMul, ar, bi), bin(NMul, ai, br)), tok)
 		default:
-			// libgcc-compatible helper: recovers infinities (C11 Annex G)
-			res = p.complexHelper("mul", ct, ar, ai, br, bi, tok)
+			// the product, and when both parts are NaN the libgcc-compatible
+			// helper, which computes the same parts first and recovers
+			// infinities (C11 Annex G), as gcc does
+			x, y := p.newLvar("", bt), p.newLvar("", bt)
+			v := func(o *Obj) *Node { n := newVarNode(o, tok); addType(n); return n }
+			setX := bin(NAssign, v(x), bin(NSub, bin(NMul, ar, br), bin(NMul, ai, bi)))
+			setY := bin(NAssign, v(y), bin(NAdd, bin(NMul, ar, bi), bin(NMul, ai, br)))
+			ok := bin(NLogOr, bin(NEq, v(x), v(x)), bin(NEq, v(y), v(y)))
+			sel := &Node{Kind: NCond, Cond: ok, Then: makeComplex(ct, v(x), v(y), tok),
+				Els: p.complexHelper("mul", ct, ar, ai, br, bi, tok), Tok: tok}
+			addType(sel)
+			res = bin(NComma, setX, bin(NComma, setY, sel))
 		}
 	case NDiv:
 		if !b.Ty.IsComplex() {
@@ -230,3 +256,46 @@ func (p *parser) evalComplex(e *Node) (re, im *Node) {
 	_, r, i := p.cparts(e, e.Tok)
 	return r, i
 }
+
+// dupMember copies a member access of a plain variable (v.a.b)
+func dupMember(n *Node, tok *Token) *Node {
+	if n.Kind == NVar {
+		return newVarNode(n.Var, tok)
+	}
+	m := &Node{Kind: NMember, LHS: dupMember(n.LHS, tok), Member: n.Member, Tok: tok}
+	addType(m)
+	return m
+}
+
+// complexLibBuiltin expands a call of creal, cimag or conj (and their f
+// and l versions) in place, as gcc does with these library functions
+func (p *parser) complexLibBuiltin(call *Node) *Node {
+	fn := call.LHS
+	if fn.Kind != NVar || !fn.Var.IsFunction || fn.Var.IsLocal || len(call.Args) != 1 {
+		return nil
+	}
+	ft := call.FuncTy
+	if ft.OldStyle || len(ft.Params) != 1 || !ft.Params[0].IsComplex() {
+		return nil
+	}
+	kind := complexLibFuncs[fn.Var.Name]
+	if kind == 0 || ft.Ret.IsComplex() != (kind == 'c') || !ft.Ret.IsComplex() && !ft.Ret.IsFlonum() {
+		return nil
+	}
+	arg := call.Args[0] // converted to the parameter type
+	var e *Node
+	switch kind {
+	case 'r':
+		e = p.realImag(arg, false, call.Tok)
+	case 'i':
+		e = p.realImag(arg, true, call.Tok)
+	default:
+		e = p.complexUnary(NBitNot, arg, call.Tok)
+	}
+	e = newCast(e, ft.Ret.Unqual())
+	addType(e)
+	return e
+}
+
+var complexLibFuncs = map[string]byte{"creal": 'r', "crealf": 'r', "creall": 'r', "cimag": 'i', "cimagf": 'i',
+	"cimagl": 'i', "conj": 'c', "conjf": 'c', "conjl": 'c'}

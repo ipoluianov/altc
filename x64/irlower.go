@@ -24,6 +24,12 @@ func irTypeOf(t *cc.Type) irType {
 		return iF64
 	case t.Kind == cc.TyVector:
 		return vecIRType(t)
+	case t.Kind == cc.TyComplex && t.Base.Kind == cc.TyFloat:
+		return iC32
+	case t.Kind == cc.TyComplex && t.Base.Kind == cc.TyDouble:
+		return iC64
+	case t.Kind == cc.TyComplex && t.Base.Kind == cc.TyLongDouble:
+		return iCLD
 	case t.Kind == cc.TyLongDouble, t.Kind == cc.TyComplex:
 		unsupported("type %d", t.Kind)
 	case t.Kind == cc.TyPtr, t.Kind == cc.TyNullptr, t.Kind == cc.TyArray, t.Kind == cc.TyVLA, t.Kind == cc.TyFunc,
@@ -93,6 +99,9 @@ type irBuilder struct {
 	retPtr    *irValue  // that pointer
 	retChunks []irChunk // a struct result returned in registers
 	ret128    bool      // a 128-bit result
+	retCplx   irType    // a complex result (iC32, iC64, iCLD)
+
+	ldOwned map[*irValue]bool // long double values in memory of their own (results, constants)
 }
 
 // irChunk is an eightbyte of a struct passed in a register
@@ -164,7 +173,7 @@ func (g *gen) lowerFunction(fn *cc.Obj) (f *irFunc, err error) {
 		promoted: map[*cc.Obj]bool{}, slots: map[*cc.Obj]*irSlot{},
 		labels: map[string]*irBlock{}, pending: map[*irBlock][]phiPending{},
 		varType: map[*cc.Obj]irType{}, analyzed: map[*cc.Obj]bool{}, halves128: map[*cc.Obj][2]*cc.Obj{},
-		halfOf: map[*cc.Obj]halfVar{},
+		halfOf: map[*cc.Obj]halfVar{}, ldOwned: map[*irValue]bool{},
 	}
 	if g.debug {
 		b.dbgVars = dbgVarSet(fn)
@@ -192,10 +201,15 @@ func (b *irBuilder) build() {
 	case ret.Kind == cc.TyLongDouble:
 		b.f.RetX87 = true
 		b.f.RetType = iI64
-	case retInX87(ret) || retInX87Pair(ret):
+	case retInX87Pair(ret):
+		b.retCplx = iCLD // in st(0) and st(1)
+		b.f.RetX87Pair = true
+	case retInX87(ret):
 		unsupported("x87 return")
 	case is128(ret):
 		b.ret128 = true // in rax:rdx
+	case isCplx(ret):
+		b.retCplx = irTypeOf(ret) // in xmm0 (and xmm1)
 	case ret.IsRecord():
 		if _, _, ok := irStructRegs(ret); ok {
 			b.retChunks = chunksOf(ret)
@@ -245,6 +259,45 @@ func (b *irBuilder) build() {
 				b.writeVar(p, b.pair(lo, hi))
 			} else {
 				b.store128(b.slotAddr(p), b.pair(lo, hi))
+			}
+			continue
+		}
+		if isCLD(t) {
+			// in memory, 16-byte aligned: the variable's home
+			stackOff = alignTo(stackOff, 16)
+			b.slots[p] = &irSlot{Size: 32, Align: 16, Offset: stackOff, Fixed: true, Name: p.Name}
+			stackOff += 32
+			continue
+		}
+		if isCplx(t) {
+			ct := irTypeOf(t)
+			var v *irValue
+			nr := len(cplxChunks(ct))
+			switch {
+			case fp+nr <= 8 && ct == iC32:
+				v = b.cplxUnpack(b.param(irParamLoc{Reg: XMM0 + Reg(fp), Type: iF64}))
+				fp++
+			case fp+nr <= 8:
+				re := b.param(irParamLoc{Reg: XMM0 + Reg(fp), Type: iF64})
+				im := b.param(irParamLoc{Reg: XMM0 + Reg(fp+1), Type: iF64})
+				v = b.pairOf(ct, re, im)
+				fp += 2
+			case !b.promoted[p]:
+				// the incoming stack argument is the variable's home
+				b.slots[p] = &irSlot{Size: t.Size(), Align: 8, Offset: stackOff, Fixed: true, Name: p.Name}
+				stackOff += alignTo(t.Size(), 8)
+				continue
+			default:
+				n := int64(ct.size() / 2)
+				re := b.param(irParamLoc{Reg: NoReg, Stack: stackOff, Type: ct.part()})
+				im := b.param(irParamLoc{Reg: NoReg, Stack: stackOff + n, Type: ct.part()})
+				v = b.pairOf(ct, re, im)
+				stackOff += alignTo(t.Size(), 8)
+			}
+			if b.promoted[p] {
+				b.writeVar(p, v)
+			} else {
+				b.storeCplx(b.slotAddr(p), v, t)
 			}
 			continue
 		}
@@ -389,7 +442,7 @@ func (b *irBuilder) analyzeLocals(fn *cc.Obj) {
 		if t.Kind == cc.TyVLA || taken[v] || v.RegName != "" || t.Volatile || t.Atomic || v.Align > 16 && !t.IsVector() {
 			continue
 		}
-		if t.Kind == cc.TyPtr || t.Kind == cc.TyNullptr || t.IsInteger() && (t.Size() <= 8 || is128(t)) || t.Kind == cc.TyFloat || t.Kind == cc.TyDouble || t.IsVector() {
+		if t.Kind == cc.TyPtr || t.Kind == cc.TyNullptr || t.IsInteger() && (t.Size() <= 8 || is128(t)) || t.Kind == cc.TyFloat || t.Kind == cc.TyDouble || t.IsVector() || isCplx(t) && !isCLD(t) {
 			b.promoted[v] = true
 			b.varType[v] = irTypeOf(t)
 		}
@@ -406,13 +459,13 @@ func (b *irBuilder) ensure() {
 }
 
 func (b *irBuilder) add(op irOp, t irType, args ...*irValue) *irValue {
-	// 128-bit values are taken apart before any operation
-	if t == iI128 {
-		unsupported("128-bit %s", opNames[op])
+	// 128-bit and complex values are taken apart before any operation
+	if t.isPair() {
+		unsupported("%s %s", t, opNames[op])
 	}
 	for _, a := range args {
-		if a.Type == iI128 {
-			unsupported("128-bit operand of %s", opNames[op])
+		if a.Type.isPair() {
+			unsupported("%s operand of %s", a.Type, opNames[op])
 		}
 	}
 	b.ensure()
@@ -424,6 +477,9 @@ func (b *irBuilder) add(op irOp, t irType, args ...*irValue) *irValue {
 func (b *irBuilder) iconst(t irType, c int64) *irValue {
 	if t == iI128 {
 		return b.const128(c, c>>63)
+	}
+	if t.isPair() {
+		return b.cplxConst(t, float64(c), 0)
 	}
 	if t == iI32 {
 		c = int64(int32(c))
@@ -485,7 +541,7 @@ func (b *irBuilder) labelBlock(name string) *irBlock {
 
 func (b *irBuilder) writeVar(v *cc.Obj, val *irValue) {
 	b.ensure()
-	if b.varType[v] == iI128 {
+	if b.varType[v].isPair() {
 		h := b.halfVars(v)
 		lo, hi := halves(val)
 		b.writeVar(h[0], lo)
@@ -498,9 +554,9 @@ func (b *irBuilder) writeVar(v *cc.Obj, val *irValue) {
 
 func (b *irBuilder) readVar(v *cc.Obj) *irValue {
 	b.ensure()
-	if b.varType[v] == iI128 {
+	if t := b.varType[v]; t.isPair() {
 		h := b.halfVars(v)
-		return b.pair(b.readVarIn(h[0], b.cur), b.readVarIn(h[1], b.cur))
+		return b.pairOf(t, b.readVarIn(h[0], b.cur), b.readVarIn(h[1], b.cur))
 	}
 	return b.readVarIn(v, b.cur)
 }
@@ -622,6 +678,9 @@ func (b *irBuilder) load(addr *irValue, t *cc.Type) *irValue {
 	if is128(t) {
 		return b.load128(addr, t)
 	}
+	if isCplx(t) {
+		return b.loadCplx(addr, t)
+	}
 	it := irTypeOf(t)
 	v := b.add(opLoad, it, addr)
 	v.AuxInt = cSize(t)
@@ -633,6 +692,10 @@ func (b *irBuilder) load(addr *irValue, t *cc.Type) *irValue {
 func (b *irBuilder) store(addr, val *irValue, t *cc.Type) {
 	if is128(t) {
 		b.store128(addr, val)
+		return
+	}
+	if isCplx(t) {
+		b.storeCplx(addr, val, t)
 		return
 	}
 	v := b.add(opStore, iNone, val, addr)
@@ -776,6 +839,22 @@ func (b *irBuilder) stmt(n *cc.Node) {
 				lo, hi := halves(v)
 				b.ensure()
 				b.cur.RetVals = []*irValue{lo, hi}
+			}
+			b.ret(nil)
+			return
+		case b.retCplx == iCLD:
+			if v != nil {
+				re, im := halves(v)
+				b.ensure()
+				b.cur.RetVals = []*irValue{re, im}
+			}
+			b.ret(nil)
+			return
+		case b.retCplx != iNone:
+			if v != nil {
+				regs := b.cplxRegs(v)
+				b.ensure()
+				b.cur.RetVals = regs
 			}
 			b.ret(nil)
 			return
@@ -957,6 +1036,9 @@ func (b *irBuilder) cond(n *cc.Node, t, f *irBlock) {
 	if is128(n.Ty) {
 		v = b.truth128(v)
 	}
+	if isCplx(n.Ty) {
+		v = b.cplxTruth(v)
+	}
 	b.branch(b.truth(v), t, f)
 }
 
@@ -1004,6 +1086,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		if n.Member.Bitfield {
 			return b.loadBitfield(n)
 		}
+		if isCplx(n.LHS.Ty) && !b.inMemory(n.LHS) {
+			return cplxPart(b.expr(n.LHS), n.Member)
+		}
 		if isAddrType(n.Ty) || isLD(n.Ty) {
 			return b.addr(n)
 		}
@@ -1027,7 +1112,7 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 			return nil
 		}
 		if n.Ty.IsComplex() || n.LHS.Ty.IsComplex() {
-			unsupported("complex")
+			return b.cplxConvert(b.expr(n.LHS), n.LHS.Ty, n.Ty)
 		}
 		if n.Ty.IsVector() || n.LHS.Ty.IsVector() {
 			return b.vecConvert(b.expr(n.LHS), n.LHS.Ty, n.Ty)
@@ -1055,6 +1140,9 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		}
 		if is128(n.LHS.Ty) {
 			return b.add(opEq, iI32, b.truth128(v), b.iconst(iI32, 0))
+		}
+		if isCplx(n.LHS.Ty) {
+			return b.add(opEq, iI32, b.cplxTruth(v), b.iconst(iI32, 0))
 		}
 		if v.Type.isFloat() {
 			return b.add(opFEq, iI32, v, b.fconst(v.Type, 0))
@@ -1139,6 +1227,14 @@ func (b *irBuilder) expr(n *cc.Node) *irValue {
 		return nil
 	case cc.NVaArg:
 		return b.vaArg(n)
+	case cc.NMakeComplex:
+		re := b.expr(n.LHS)
+		im := b.expr(n.RHS)
+		v := b.pairOf(irTypeOf(n.Ty), re, im)
+		if v.Type == iCLD {
+			v = b.ownParts(v)
+		}
+		return v
 	case cc.NAdd, cc.NSub, cc.NMul, cc.NDiv, cc.NMod, cc.NBitAnd, cc.NBitOr, cc.NBitXor, cc.NShl, cc.NShr,
 		cc.NEq, cc.NNe, cc.NLt, cc.NLe:
 		return b.binary(n)
@@ -1216,6 +1312,12 @@ func (b *irBuilder) assign(n *cc.Node) *irValue {
 	}
 	if lhs.Kind == cc.NMember && lhs.Member.Bitfield {
 		return b.storeBitfield(lhs, n.RHS)
+	}
+	if lhs.Kind == cc.NMember && lhs.LHS.Kind == cc.NVar && b.promoted[lhs.LHS.Var] && isCplx(lhs.LHS.Ty) {
+		z := lhs.LHS.Var
+		v := b.expr(n.RHS)
+		b.writeVar(z, b.cplxSetPart(b.readVar(z), lhs.Member, v))
+		return v
 	}
 	if isAddrType(lhs.Ty) || isLD(lhs.Ty) {
 		if lhs.Ty.Kind == cc.TyArray || lhs.Ty.Kind == cc.TyFunc {
@@ -1507,7 +1609,7 @@ func (b *irBuilder) intConvert(v *irValue, fs int64, fu bool, ts int64, tu bool)
 
 func (b *irBuilder) call(n *cc.Node) *irValue {
 	rt := n.Ty
-	if retInX87(rt) || retInX87Pair(rt) {
+	if retInX87(rt) {
 		unsupported("x87 call result")
 	}
 	ft := n.FuncTy
@@ -1543,7 +1645,16 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 		call.RetSlot = buf
 		call.RetChunks = []irChunk{{off: 0, size: 8, t: iI64}, {off: 8, size: 8, t: iI64}}
 	}
-	if rt.IsRecord() {
+	switch {
+	case isCLD(rt):
+		buf = b.newSlot(16, 16)
+		call.RetX87 = buf
+		call.RetX87Im = b.newSlot(16, 16)
+	case isCplx(rt):
+		buf = b.newSlot(16, 8)
+		call.RetSlot = buf
+		call.RetChunks = cplxChunks(irTypeOf(rt))
+	case rt.IsRecord():
 		buf = b.newSlot(rt.Size(), max(rt.Align(), 8))
 		if _, _, ok := irStructRegs(rt); ok {
 			call.RetSlot = buf
@@ -1566,6 +1677,30 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 				push(lo, callLoc{Reg: NoReg, Stack: stack})
 				push(hi, callLoc{Reg: NoReg, Stack: stack + 8})
 				stack += 16
+			}
+			continue
+		}
+		if isCLD(t) {
+			// in memory: the parts one after the other
+			tmp := b.slotRef(b.newSlot(32, 16))
+			b.storeCplx(tmp, b.expr(a), t)
+			stack = alignTo(stack, 16)
+			push(tmp, callLoc{Reg: NoReg, Stack: stack, Copy: 32})
+			stack += 32
+			continue
+		}
+		if isCplx(t) {
+			regs := b.cplxRegs(b.expr(a))
+			if fp+len(regs) <= 8 {
+				for _, r := range regs {
+					push(r, callLoc{Reg: XMM0 + Reg(fp)})
+					fp++
+				}
+				continue
+			}
+			for _, r := range regs {
+				push(r, callLoc{Reg: NoReg, Stack: stack})
+				stack += 8
 			}
 			continue
 		}
@@ -1638,6 +1773,12 @@ func (b *irBuilder) call(n *cc.Node) *irValue {
 	c.Call = call
 	if is128(rt) {
 		return b.load128(b.slotRef(buf), rt)
+	}
+	if isCLD(rt) {
+		return b.pairOf(iCLD, b.slotRef(buf), b.slotRef(call.RetX87Im))
+	}
+	if isCplx(rt) {
+		return b.loadCplx(b.slotRef(buf), rt)
 	}
 	if buf != nil {
 		return b.slotRef(buf)

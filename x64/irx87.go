@@ -56,6 +56,7 @@ func (b *irBuilder) x87(k x87Kind, args ...*irValue) *irValue {
 	dst := b.ldSlot()
 	v := b.add(opX87, iNone, append([]*irValue{dst}, args...)...)
 	v.AuxInt = int64(k)
+	b.ldOwned[dst] = true
 	return dst
 }
 
@@ -80,6 +81,7 @@ func (b *irBuilder) ldBytes(data []byte) *irValue {
 	data = append(append([]byte(nil), data...), make([]byte, 16-len(data))...)
 	a := b.add(opGlobal, iI64)
 	a.Sym = b.g.constLabel(data, 16)
+	b.ldOwned[a] = true
 	return a
 }
 

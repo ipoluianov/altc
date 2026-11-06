@@ -409,23 +409,75 @@ __altc_u128 __fixunsdfti(double d) {
 }
 __altc_i128 __fixdfti(double d) { return d < 0 ? -(__altc_i128)__fixunsdfti(-d) : (__altc_i128)__fixunsdfti(d); }
 
-/* complex division (the libgcc names), Smith's algorithm */
-#define __ALTC_CDIV(NAME, T) \
-T _Complex NAME(T a, T b, T c, T d) { \
-	T ratio, denom, x, y; \
-	T ac = c < 0 ? -c : c, ad = d < 0 ? -d : d; \
-	if (ac < ad) { \
-		ratio = c / d; denom = c * ratio + d; \
-		x = (a * ratio + b) / denom; y = (b * ratio - a) / denom; \
-	} else { \
-		ratio = d / c; denom = d * ratio + c; \
-		x = (b * ratio + a) / denom; y = (b - a * ratio) / denom; \
+/* complex division, as libgcc does it (GCC 12 and later): float in double
+   precision, double and long double by Smith's method with scaling; then
+   the C11 Annex G recovery of infinities and zeros computed as NaN+iNaN */
+#define __ALTC_CDIV_FIX(T, INF) \
+	if (__builtin_isnan(x) && __builtin_isnan(y)) { \
+		if (c == 0.0 && d == 0.0 && (!__builtin_isnan(a) || !__builtin_isnan(b))) { \
+			x = (T)__builtin_copysignl(INF, c) * a; \
+			y = (T)__builtin_copysignl(INF, c) * b; \
+		} else if ((__builtin_isinf(a) || __builtin_isinf(b)) && __builtin_isfinite(c) && __builtin_isfinite(d)) { \
+			a = __builtin_copysignl(__builtin_isinf(a) ? 1 : 0, a); \
+			b = __builtin_copysignl(__builtin_isinf(b) ? 1 : 0, b); \
+			x = INF * (a * c + b * d); \
+			y = INF * (b * c - a * d); \
+		} else if ((__builtin_isinf(c) || __builtin_isinf(d)) && __builtin_isfinite(a) && __builtin_isfinite(b)) { \
+			c = __builtin_copysignl(__builtin_isinf(c) ? 1 : 0, c); \
+			d = __builtin_copysignl(__builtin_isinf(d) ? 1 : 0, d); \
+			x = 0.0 * (a * c + b * d); \
+			y = 0.0 * (b * c - a * d); \
+		} \
 	} \
-	return __builtin_complex(x, y); \
+	return __builtin_complex(x, y);
+float _Complex __divsc3(float a, float b, float c, float d) {
+	double aa = a, bb = b, cc = c, dd = d;
+	double denom = cc * cc + dd * dd;
+	float x = (aa * cc + bb * dd) / denom;
+	float y = (bb * cc - aa * dd) / denom;
+	__ALTC_CDIV_FIX(float, __builtin_inff())
 }
-__ALTC_CDIV(__divsc3, float)
-__ALTC_CDIV(__divdc3, double)
-__ALTC_CDIV(__divxc3, long double)
+#define __ALTC_CDIV(NAME, T, ABS, INF, MAX, MIN, EPS) \
+T _Complex NAME(T a, T b, T c, T d) { \
+	const T RBIG = MAX / 2, RMIN = MIN, RMIN2 = EPS, RMINSCAL = 1 / EPS, RMAX2 = RBIG * RMIN2; \
+	T denom, ratio, x, y; \
+	if (ABS(c) < ABS(d)) { \
+		if (ABS(d) >= RBIG) { a = a / 2; b = b / 2; c = c / 2; d = d / 2; } \
+		if (ABS(d) < RMIN2 || (ABS(a) < RMIN && ABS(b) < RMAX2 && ABS(d) < RMAX2) || \
+		    (ABS(b) < RMIN && ABS(a) < RMAX2 && ABS(d) < RMAX2)) { \
+			a = a * RMINSCAL; b = b * RMINSCAL; c = c * RMINSCAL; d = d * RMINSCAL; \
+		} \
+		ratio = c / d; \
+		denom = c * ratio + d; \
+		if (ABS(ratio) > RMIN) { \
+			x = (a * ratio + b) / denom; \
+			y = (b * ratio - a) / denom; \
+		} else { \
+			x = (c * (a / d) + b) / denom; \
+			y = (c * (b / d) - a) / denom; \
+		} \
+	} else { \
+		if (ABS(c) >= RBIG) { a = a / 2; b = b / 2; c = c / 2; d = d / 2; } \
+		if (ABS(c) < RMIN2 || (ABS(a) < RMIN && ABS(b) < RMAX2 && ABS(c) < RMAX2) || \
+		    (ABS(b) < RMIN && ABS(a) < RMAX2 && ABS(c) < RMAX2)) { \
+			a = a * RMINSCAL; b = b * RMINSCAL; c = c * RMINSCAL; d = d * RMINSCAL; \
+		} \
+		ratio = d / c; \
+		denom = d * ratio + c; \
+		if (ABS(ratio) > RMIN) { \
+			x = (b * ratio + a) / denom; \
+			y = (b - a * ratio) / denom; \
+		} else { \
+			x = (a + d * (b / c)) / denom; \
+			y = (b - d * (a / c)) / denom; \
+		} \
+	} \
+	__ALTC_CDIV_FIX(T, INF) \
+}
+__ALTC_CDIV(__divdc3, double, __builtin_fabs, __builtin_inf(), 1.7976931348623157e308, 2.2250738585072014e-308,
+	2.220446049250313e-16)
+__ALTC_CDIV(__divxc3, long double, __builtin_fabsl, __builtin_infl(), 1.18973149535723176502e+4932L,
+	3.36210314311209350626e-4932L, 1.08420217248550443401e-19L)
 
 /* complex multiplication with the C11 Annex G recovery of infinities */
 #define __ALTC_CMUL(NAME, T, INF) \

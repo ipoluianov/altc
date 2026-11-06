@@ -52,11 +52,11 @@ func (g *gen) checkInlinable(fn *cc.Obj) bool {
 	if fn.Body == nil || fn.NoInline || fn.IsWeak || fn.LabelAddrs || ft.Variadic || ft.OldStyle && len(fn.Params) > 0 {
 		return false
 	}
-	if ft.Ret.IsRecord() || ft.Ret.Kind == cc.TyLongDouble {
+	if ft.Ret.IsRecord() && !isCplx(ft.Ret) || ft.Ret.Kind == cc.TyLongDouble || isCLD(ft.Ret) {
 		return false
 	}
 	for _, p := range fn.Params {
-		if p.Ty.IsRecord() || p.Ty.Kind == cc.TyLongDouble {
+		if p.Ty.IsRecord() && !isCplx(p.Ty) || p.Ty.Kind == cc.TyLongDouble || isCLD(p.Ty) {
 			return false
 		}
 	}

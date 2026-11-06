@@ -30,7 +30,25 @@ const (
 	iV128 // a 128-bit vector (any element type)
 	iV256 // a 256-bit vector (needs AVX)
 	iI128 // a 128-bit integer: only opPair values while lowering (see ir128.go)
+	iC32  // a complex float: only opPair values (real, imaginary part) while lowering (see ircomplex.go)
+	iC64  // a complex double
+	iCLD  // a complex long double: the parts are addresses of long doubles (see irx87.go)
 )
+
+// isPair tells whether values of the type exist only as opPair values
+// while lowering (taken apart before any operation)
+func (t irType) isPair() bool { return t == iI128 || t == iC32 || t == iC64 || t == iCLD }
+
+// part is the type of each half of a pair type
+func (t irType) part() irType {
+	switch t {
+	case iC32:
+		return iF32
+	case iC64:
+		return iF64
+	}
+	return iI64
+}
 
 func (t irType) isFloat() bool { return t == iF32 || t == iF64 }
 
@@ -47,14 +65,18 @@ func (t irType) size() int {
 		return 16
 	case iV256:
 		return 32
-	case iI128:
+	case iI128, iC64:
 		return 16
+	case iCLD:
+		return 32
+	case iC32:
+		return 8
 	}
 	return 4
 }
 
 func (t irType) String() string {
-	return [...]string{"void", "i32", "i64", "f32", "f64", "v128", "v256", "i128"}[t]
+	return [...]string{"void", "i32", "i64", "f32", "f64", "v128", "v256", "i128", "c32", "c64", "cld"}[t]
 }
 
 type irOp uint8
@@ -142,7 +164,7 @@ const (
 	opVBroadcast   // scalar to all elements; Sym: element kind (b w d q ps pd)
 	opX87          // long double operation AuxInt (x87Kind) on 16-byte memory operands (see irx87.go)
 	opAtomic       // locked read-modify-write AuxInt (atomicKind) returning the old value (see iratomic.go)
-	opPair         // a 128-bit integer (Args: low, high halves) while lowering; never emitted
+	opPair         // a 128-bit integer (Args: low, high halves) or complex number (real, imaginary parts) while lowering; never emitted
 	op128          // a half or a comparison of 128-bit integer operations AuxInt (i128Kind, see ir128.go)
 	opAlloca       // Args[0] bytes of stack (rounded to 16): the address
 	opStackSave    // the stack pointer
@@ -220,6 +242,7 @@ type irCall struct {
 	RetSlot   *irSlot
 	RetChunks []irChunk // a struct result in registers, stored to RetSlot
 	RetX87    *irSlot   // a long double result: st(0) is stored there
+	RetX87Im  *irSlot   // and the imaginary part of a complex long double, from st(1)
 }
 
 // callLoc is where an argument goes: a register, or the stack (a struct
@@ -314,6 +337,9 @@ type irFunc struct {
 	RetType irType
 	VaSlot  *irSlot // register save area of a variadic function
 	RetX87  bool    // returns a long double: the returned value is its address, loaded into st(0)
+	// returns a complex long double: RetVals are the addresses of the
+	// parts, loaded into st(0) and st(1)
+	RetX87Pair bool
 
 	isa         ISA                 // instruction set extensions for the function
 	noVectorize bool                // no loop vectorization

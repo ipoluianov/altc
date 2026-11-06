@@ -196,6 +196,10 @@ func (p *parser) toAssign(op NodeKind, lhs, rhs *Node, tok *Token) *Node {
 	if p.fn == nil {
 		p.errorAt(tok, "compound assignment outside of a function")
 	}
+	// a member of a plain variable: v.x = v.x op C (v keeps its address untaken)
+	if lhs.Kind == NMember && isPure(lhs) {
+		return p.newBinary(NAssign, lhs, p.arith(op, dupMember(lhs, tok), rhs, tok), tok)
+	}
 	// A.x op= C  ->  tmp = &A, (*tmp).x = (*tmp).x op C  (A.x may be a bit-field)
 	if lhs.Kind == NMember {
 		v := p.newLvar("", pointerTo(lhs.LHS.Ty))
@@ -234,7 +238,11 @@ func (p *parser) conditional() *Node {
 		v := p.newLvar("", decayType(c.Ty).Unqual())
 		e1 := p.newBinary(NAssign, newVarNode(v, t), c, t)
 		rhs := p.conditional()
-		n := &Node{Kind: NCond, Cond: newVarNode(v, t), Then: newVarNode(v, t), Els: rhs, Tok: t}
+		cond := newVarNode(v, t)
+		if v.Ty.IsComplex() {
+			cond = p.toBool(cond)
+		}
+		n := &Node{Kind: NCond, Cond: cond, Then: newVarNode(v, t), Els: rhs, Tok: t}
 		return p.newBinary(NComma, e1, n, t)
 	}
 	n := &Node{Kind: NCond, Cond: c, Tok: t}
@@ -242,6 +250,9 @@ func (p *parser) conditional() *Node {
 	p.expect(":")
 	n.Els = p.conditional()
 	addType(n.Cond)
+	if n.Cond.Ty.IsComplex() {
+		n.Cond = p.toBool(n.Cond)
+	}
 	if !decayType(n.Cond.Ty).IsScalar() {
 		p.errorAt(t, "used non-scalar value where scalar is required")
 	}
@@ -896,6 +907,9 @@ func (p *parser) funcall(fn *Node, tok *Token) *Node {
 		p.errorAt(tok, "too few arguments to function")
 	}
 	p.expect(")")
+	if b := p.complexLibBuiltin(n); b != nil {
+		return b
+	}
 	if ft.Ret.IsRecord() {
 		if !ft.Ret.IsComplete() {
 			p.errorAt(tok, "calling a function with incomplete return type")

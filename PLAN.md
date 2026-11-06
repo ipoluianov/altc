@@ -108,6 +108,209 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
     - dropping the dynamic linking code of `elf/` (no longer used) or
       keeping it for targets that need system libraries.
 
+## Standard library
+
+AltC will ship a standard library for C programs that covers what Go's
+standard library covers for Go programs: strings and bytes, strconv,
+unicode/utf8, bufio, encoding (json, base64, hex, binary, csv, pem, asn1),
+hash, compress, archive, net, net/http, net/url, mime, crypto, time,
+math/big, regexp, log, flag, os/exec, path, sort, containers, context,
+sync. What the C library already provides (fmt, os, math, syscall) is
+not repeated; what is tied to the Go language (reflect, unsafe, runtime,
+go/*, testing, plugin, embed) has no counterpart.
+
+- Written by AltC's authors, in C, compiled by AltC like the C library
+  (on first use, into the build cache; only what a program uses is
+  linked). No third-party sources are vendored for it.
+- Implementations follow the standards (RFCs, FIPS, Unicode) and are
+  checked against their test vectors and, in tests only, against external
+  tools as references.
+- Go's standard library (BSD-3-Clause) may be consulted and translated:
+  files derived from it keep the Go authors' copyright and refer to
+  `LICENSE-Go`. Other code may be consulted only under permissive licenses
+  (MIT, BSD, ISC, Apache-2.0, CC0), never GPL/LGPL.
+- The API is classic C (functions, structures, return codes, explicit
+  ownership of memory), designed anew rather than copied from Go: C has
+  no garbage collector, interfaces or goroutines.
+- musl stays the C library for now; AltC may patch it (`libc/patches`).
+
+### Concurrency
+
+Programs are network services and UI programs alike, so there are two
+kinds of execution:
+
+- OS threads (pthreads), as now: computation, blocking calls of other
+  code, background work of UI programs.
+- Tasks: lightweight coroutines with their own stacks, always bound to
+  the thread that runs them (never migrated: `__thread` variables, `errno`
+  and pthread mutexes stay correct). Any thread may run a scheduler: one
+  per core for a network service, the main thread of a UI program (the
+  display connection is one more file descriptor its poller waits on, so
+  UI events, sockets and timers share one loop, and tasks of the UI thread
+  touch the UI without locks).
+- The scheduler's waiting is an abstraction of its own: epoll first,
+  later IOCP/MsgWaitForMultipleObjects on Windows and kqueue/the Cocoa run
+  loop on macOS.
+- The blocking API (network, HTTP...) is the same in both: called from a
+  thread it waits (poll, futex), called from a task it yields.
+
+Communication and synchronization, built on one internal waiter that
+parks a task in its scheduler or puts a thread to sleep on a futex; a
+wakeup from another thread goes through the target scheduler's lock-free
+queue and an eventfd. Every primitive therefore works between tasks,
+between tasks and threads and between threads:
+
+- channels (elements copied by value, buffered or not, close, deadlines)
+  and `select` over several of them;
+- mutex, rwmutex, condition variable, once, wait group, semaphore (a task
+  waiting blocks only itself; pthread mutexes keep working but block the
+  whole thread);
+- timers (sleep, one-shot and periodic timers usable in `select`);
+- contexts: cancellation and deadlines inherited by children, taken by
+  every blocking network and HTTP operation;
+- running a function on another thread's scheduler (for example on the
+  UI thread);
+- a thread pool for computation and blocking work.
+
+Atomics are `<stdatomic.h>`. The scheduler saves and restores `errno`
+when it switches tasks, so plain libc calls (-1 and `errno`) are reliable
+inside tasks too.
+
+### Errors
+
+- Functions return `int` (`ssize_t` for counts): `>= 0` is success or a
+  count, `< 0` is the negated error code. No hidden state (`errno` would
+  be overwritten by other tasks of the thread while a task waits).
+- Created objects come back through an out parameter:
+  `int alt_listen(alt_listener **out, const char *addr, ...)`.
+- System errors are negated `errno` values (`-ETIMEDOUT`, `-ECONNRESET`,
+  `-ENOMEM`); on other platforms the library maps native codes to them.
+- Errors of a domain have codes of their own above the `errno` range, one
+  range per package (`ALT_EHTTP_*`, `ALT_ETLS_*`, `ALT_EJSON_*`);
+  `alt_strerror(code)` describes any code.
+- Details live in the structures of the API concerned (the offset of a
+  JSON syntax error, a TLS alert), never in global state.
+- Programming errors (NULL where not allowed, double close, use after
+  free that is detected) abort with a message, like a Go panic. Running
+  out of memory is an ordinary `-ENOMEM`.
+
+### Time
+
+- `alt_time`: an instant of the monotonic clock in nanoseconds (`int64`,
+  about 292 years of range); unaffected by clock changes, used for every
+  deadline and timeout.
+- `alt_dur`: a duration in nanoseconds (`int64`), with `ALT_US`, `ALT_MS`,
+  `ALT_SEC`, `ALT_MIN`, `ALT_HOUR` (`5 * ALT_SEC`).
+- Deadlines are absolute (retries share one deadline):
+  `alt_deadline(dur)` (now + dur, saturating), `ALT_FOREVER`, `ALT_NOWAIT`
+  (any instant in the past means "do not wait").
+- `alt_wall`: calendar time, nanoseconds since the Unix epoch in UTC, for
+  timestamps, logs, HTTP dates; formatting and parsing (RFC 3339, RFC
+  1123, layouts) and time zones (the system tzdata, the `TZ` variable) in
+  the time package. The two kinds are never mixed.
+- Simple waits (channels, sync, sleep, select) take an `alt_time`
+  deadline; network and HTTP operations take an `alt_ctx *` (deadline and
+  cancellation, NULL for none); connections also have their own read and
+  write deadlines, as in Go.
+
+### API conventions
+
+The aim is Go's capabilities with the means of C, choosing the best
+solution for C rather than copying Go's shapes.
+
+- Names: `alt_<package>_<name>` for functions and types
+  (`alt_http_server`, `alt_json_parse`), `ALT_<PACKAGE>_<NAME>` for
+  constants; core packages drop the package part (`alt_chan_send`,
+  `alt_mutex_lock`, `alt_deadline`). Where two Go packages share a last
+  element the C name says which (`alt_cryptorand_*`, `alt_rand_*`).
+- Headers follow Go's import paths under `alt/`: `<alt/net/http.h>`,
+  `<alt/encoding/json.h>`, `<alt/crypto/sha256.h>`, `<alt/sync.h>`.
+- Byte strings: `alt_str` (pointer and length) for data that is not
+  NUL-terminated or may contain NUL (HTTP headers, JSON strings, binary
+  data), so nothing calls strlen twice and slices of a buffer cost
+  nothing; functions taking plain C strings say so in their names
+  (`_cstr`). `alt_buf` is a growable byte buffer (strings.Builder,
+  bytes.Buffer).
+- Memory without a garbage collector: whoever creates an object frees it
+  (`alt_x_new`/`alt_x_free`); arenas (`alt_arena`) give short-lived work a
+  single lifetime: an HTTP request and everything allocated for it (parsed
+  headers, JSON values, the response) is freed at once when the handler
+  returns. Allocation failures return `-ENOMEM`.
+- Interfaces become small structures of function pointers with a context
+  (`alt_reader`, `alt_writer`, `alt_handler`), so streams compose as
+  io.Reader/io.Writer do (gzip over a connection, JSON into a buffer).
+- Generic containers (map, slice helpers, heap, list, sort) work on
+  elements of a given size with hash/compare callbacks, and typed wrappers
+  are generated by macros (`ALT_MAP(name, key, value)`) for type safety
+  and inlining.
+- No hidden global state: no allocation or thread creation behind the
+  caller's back except where documented (the scheduler's poller, the
+  thread pool).
+
+### Layout and build
+
+- `std/include/alt/...` (headers, searched after the compiler's and
+  before musl's), `std/src/<package>/` (sources), `std/tests/` (C tests
+  with expected outputs, test vectors).
+- Built like the C library: on first use, by AltC, into the build cache,
+  as an archive linked into every program (only the members a program
+  uses end up in it).
+- Platform-specific parts (poller, context switch, sockets) are separated
+  from the portable code from the start (`_linux_amd64.c`, as Go's file
+  suffixes).
+
+### Order of work
+
+Each stage ends with something usable and tested.
+
+1. Core: errors (`alt_strerror`), time (`alt_time`, `alt_wall`, clocks),
+   `alt_str`/`alt_buf`, arenas, unicode/utf8; the context switch
+   (assembler), tasks, schedulers, the poller (epoll), the waiter,
+   `errno` saving.
+2. Concurrency: channels and select, sync, timers, contexts, the thread
+   pool, running on another thread's scheduler.
+3. io and bufio (readers, writers, buffered streams), strconv additions,
+   strings/bytes functions, containers and sort.
+4. net: TCP, UDP, Unix sockets, listeners and connections with deadlines,
+   address parsing (netip); an own DNS resolver (RFC 1035, `/etc/hosts`,
+   `/etc/resolv.conf`) that waits in the poller instead of blocking.
+5. net/url (RFC 3986), mime, net/http: an HTTP/1.1 server and client (RFC
+   9110/9112: keep-alive, chunked, limits, graceful shutdown), a request
+   multiplexer with Go 1.22 patterns (`GET /items/{id}`), a file server
+   (sendfile, ranges, conditional requests), test helpers. A web server
+   without TLS is usable here.
+6. encoding: hex, base64, base32, binary, json (DOM and streaming, RFC
+   8259), csv, pem; log/slog-style structured logging; flag.
+7. hash (crc32, crc64, adler32, fnv) and compress (flate RFC 1951, gzip
+   RFC 1952, zlib RFC 1950); archive (tar, zip); HTTP gzip.
+8. crypto: rand (getrandom), subtle (constant time), sha1/sha256/sha512,
+   hmac, hkdf, pbkdf2, aes (AES-NI with a constant-time fallback) with GCM
+   and CTR, chacha20-poly1305, x25519, ed25519, ecdsa/ecdh P-256/P-384,
+   rsa (PSS, PKCS#1 v1.5); checked against NIST CAVP, RFC and Wycheproof
+   vectors.
+9. ASN.1 DER, x509 (RFC 5280: parsing, chain verification, host names),
+   root certificates (the system's), TLS 1.3 client and server (RFC
+   8446), then TLS 1.2 for older servers; HTTPS and HTTP/2 after that.
+10. The rest of Go's set: regexp (RE2's linear-time algorithm), math/big,
+    text/template and html/template (contextual escaping), os/exec,
+    path/filepath, websocket-level helpers, profiling (pprof-like
+    sampling).
+
+Toolchain counterparts of the Go commands come alongside: `altc test`
+(test functions in `*_test.c`, like `go test`), later formatting and
+static checks.
+
+### Testing
+
+- Every package has C tests with expected results; parsers and decoders
+  (HTTP, JSON, DNS, X.509, TLS records, flate) get fuzzers.
+- Standards' own vectors (RFC appendices, NIST CAVP, Unicode data,
+  Wycheproof) are test data.
+- Interoperability against external tools, used only as references and
+  skipped without them: curl and python3 against the HTTP server and
+  client, openssl s_server/s_client for TLS, gzip/zlib output, dig-like
+  answers for DNS.
+
 ## CLI
 
 ```

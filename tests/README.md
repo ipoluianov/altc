@@ -1,7 +1,13 @@
 # AltC comparison tests
 
 `compare_test.go` compiles every `c/*.c` with gcc (`-O0 -w`) and with AltC,
-runs both binaries and compares stdout+stderr and the exit code.
+runs both binaries and compares stdout+stderr and the exit code. gcc only
+compiles (with the built-in C library's headers, see `gcc_test.go`); AltC's
+linker links both programs with the built-in C library.
+
+`libc_test.go` builds the C library with gcc too and runs the programs of
+`libc/` (gcc and AltC builds) with both libraries: the output must be the
+same. `ALTC_TEST_KEEP=dir` keeps the files of the tests in `dir`.
 
     go test ./tests/ -run TestCompareWithGCC            # all
     ONLY=name go test ./tests/ -run TestCompareWithGCC -v  # one file
@@ -23,5 +29,5 @@ A first-lines comment `// std: c99` selects the `-std=` for both compilers
 
 ## Known limitations (intentional, not tracked as bugs)
 
-* `_Complex`, `<complex.h>`, `<tgmath.h>`, `__float128`/`_Float128`, `_BitInt`
+* `__float128`/`_Float128`, `_BitInt`
 * GNU nested functions

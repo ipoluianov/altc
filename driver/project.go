@@ -27,7 +27,6 @@ type Project struct {
 	Std         string   `json:"std,omitempty"`         // "c17" by default
 	Output      string   `json:"output,omitempty"`      // relative to Dir; default: "build/<Name>"
 	CFlags      []string `json:"cflags,omitempty"`      // extra command-line flags
-	Static      bool     `json:"static,omitempty"`      // link statically with libc.a (also "-static" in cflags)
 	Args        []string `json:"args,omitempty"`        // arguments for "run"
 }
 

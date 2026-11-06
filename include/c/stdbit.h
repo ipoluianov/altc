@@ -1,10 +1,10 @@
-/* AltC <stdbit.h> - C23 bit and byte utilities (functions exported by
-   glibc 2.39+; the type-generic macros need _Generic, i.e. C11 or later).  */
+/* AltC <stdbit.h> - C23 bit and byte utilities (the functions are in the
+   built-in C library, libc/altc/stdbit.c; the type-generic macros need
+   _Generic, i.e. C11 or later).  */
 
 #ifndef _STDBIT_H
 #define _STDBIT_H 1
 
-#include <features.h>
 #include <stdbool.h>
 
 #define __STDC_VERSION_STDBIT_H__ 202311L
@@ -19,7 +19,9 @@
 # define __altc_stdbit_bool unsigned char
 #endif
 
-__BEGIN_DECLS
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 extern unsigned int stdc_leading_zeros_uc (unsigned char __x) __attribute__ ((__const__));
 extern unsigned int stdc_leading_zeros_us (unsigned short __x) __attribute__ ((__const__));
@@ -193,6 +195,8 @@ extern unsigned long long int stdc_bit_ceil_ull (unsigned long long int __x) __a
             unsigned long long int: stdc_bit_ceil_ull) (x)
 #endif
 
-__END_DECLS
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* stdbit.h */

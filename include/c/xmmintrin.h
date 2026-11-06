@@ -2,6 +2,7 @@
 #ifndef _XMMINTRIN_H_INCLUDED
 #define _XMMINTRIN_H_INCLUDED
 #include <altc_intrin_common.h>
+#include <mmintrin.h>
 #include <mm_malloc.h>
 __ALTC_INL __m128 _mm_add_ps(__m128 __a, __m128 __b);
 __ALTC_INL __m128 _mm_add_ss(__m128 __a, __m128 __b);

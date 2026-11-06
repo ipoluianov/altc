@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -126,7 +125,7 @@ func (p *Project) Build(ctx context.Context, opt BuildOptions) *BuildResult {
 	if ctx.Err() != nil {
 		return fail("build cancelled")
 	}
-	in := &LinkInput{Static: p.Static || slices.Contains(p.CFlags, "-static")}
+	in := &LinkInput{}
 	for _, u := range units {
 		res.Diagnostics = append(res.Diagnostics, u.Diagnostics...)
 		if u.Obj != nil {
@@ -141,6 +140,9 @@ func (p *Project) Build(ctx context.Context, opt BuildOptions) *BuildResult {
 		if err := in.AddLib(l, libDirs); err != nil {
 			return fail(err.Error())
 		}
+	}
+	if err := PrepareLibc(func(s string) { log("%s", s) }); err != nil {
+		return fail(err.Error())
 	}
 	out := p.OutputPath()
 	rel, _ := filepath.Rel(p.Dir, out)

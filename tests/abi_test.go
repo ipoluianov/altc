@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -192,10 +191,7 @@ func genABI(seed int64) (header, callee, caller string) {
 }
 
 func TestABIInterop(t *testing.T) {
-	gcc, err := exec.LookPath("gcc")
-	if err != nil {
-		t.Skip("gcc not found")
-	}
+	gcc := needGCC(t)
 	for seed := int64(1); seed <= abiSeeds(); seed++ {
 		seed := seed
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
@@ -209,11 +205,7 @@ func TestABIInterop(t *testing.T) {
 			os.WriteFile(filepath.Join(dir, "callee.c"), []byte(callee), 0o644)
 			os.WriteFile(filepath.Join(dir, "caller.c"), []byte(caller), 0o644)
 			gccObj := func(name string) string {
-				o := filepath.Join(dir, name+".gcc.o")
-				if out, err := exec.Command(gcc, "-c", "-w", "-O1", "-fno-pic", "-o", o, filepath.Join(dir, name+".c")).CombinedOutput(); err != nil {
-					t.Fatalf("gcc: %v\n%s", err, out)
-				}
-				return o
+				return gcc.object(t, filepath.Join(dir, name+".gcc.o"), filepath.Join(dir, name+".c"), "-w", "-O1", "-fno-pic")
 			}
 			altcObj := func(name string) *elf.Object {
 				p := filepath.Join(dir, name+".c")
@@ -225,13 +217,15 @@ func TestABIInterop(t *testing.T) {
 				return u.Obj
 			}
 			// reference: everything by gcc
-			ref := filepath.Join(dir, "ref")
-			if out, err := exec.Command(gcc, "-no-pie", "-o", ref, gccObj("callee"), gccObj("caller")).CombinedOutput(); err != nil {
-				t.Fatalf("gcc link: %v\n%s", err, out)
+			ref := &driver.LinkInput{}
+			for _, o := range []string{gccObj("callee"), gccObj("caller")} {
+				if err := ref.AddFile(o); err != nil {
+					t.Fatal(err)
+				}
 			}
-			want, _ := run(t, ref, dir)
+			want, _ := run(t, linkTo(t, filepath.Join(dir, "ref"), ref), dir)
 			for _, mode := range []string{"altc-caller", "altc-callee", "altc-both"} {
-				in := linkInput()
+				in := &driver.LinkInput{}
 				switch mode {
 				case "altc-caller":
 					in.Objects = append(in.Objects, altcObj("caller"))

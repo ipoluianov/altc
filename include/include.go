@@ -1,6 +1,7 @@
-// Package include holds the C standard headers built into the compiler.
-// They are glibc-compatible for linux/amd64, so programs link against the
-// system libc.so.6 without needing /usr/include.
+// Package include holds the headers that come with the compiler rather
+// than with the C library (package libc): intrinsics, <stdatomic.h>,
+// <stdckdint.h>, <stdbit.h>, <cpuid.h>. They are searched before the C
+// library's headers.
 package include
 
 import "embed"

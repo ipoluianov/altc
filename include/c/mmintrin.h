@@ -2,6 +2,8 @@
 #ifndef _MMINTRIN_H_INCLUDED
 #define _MMINTRIN_H_INCLUDED
 #include <altc_intrin_common.h>
-/* MMX (__m64) intrinsics are not supported */
+/* MMX intrinsics are not supported; the type is (for pointer casts like
+   (__m64 *)p in SSE code) */
+typedef int __m64 __attribute__((__vector_size__(8), __may_alias__));
 __ALTC_INL void _mm_empty(void) {}
 #endif

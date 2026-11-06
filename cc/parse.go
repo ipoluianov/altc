@@ -377,6 +377,16 @@ func (p *parser) isTypename(t *Token) bool {
 	return p.isTypedefName(t)
 }
 
+// typenameAt tells whether a type name starts at the k-th token ahead:
+// __extension__ before it does not decide, (__extension__ (1 + 2)) is an
+// expression
+func (p *parser) typenameAt(k int) bool {
+	for p.peekAt(k).Is("__extension__") {
+		k++
+	}
+	return p.isTypename(p.peekAt(k))
+}
+
 func (p *parser) isTypedefName(t *Token) bool {
 	v := p.findVar(t.Text)
 	return v != nil && v.typedef != nil

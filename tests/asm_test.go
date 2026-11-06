@@ -20,10 +20,7 @@ import (
 // program with the AltC assembler. The sections and relocations must match
 // GNU as, and the program linked by AltC must behave like the gcc build.
 func TestAssembleGCCOutput(t *testing.T) {
-	gcc, err := exec.LookPath("gcc")
-	if err != nil {
-		t.Skip("gcc not found")
-	}
+	gcc := needGCC(t)
 	gas, err := exec.LookPath("as")
 	if err != nil {
 		t.Skip("as not found")
@@ -53,13 +50,7 @@ func TestAssembleGCCOutput(t *testing.T) {
 			std := stdFor(src)
 			flags := flagsFor(t, src)
 			asmFile := filepath.Join(tmp, name+".s")
-			if out, err := exec.Command(gcc, append(append([]string{"-std=" + std, "-w", "-O2"}, flags...), "-S", "-o", asmFile, f)...).CombinedOutput(); err != nil {
-				t.Fatalf("gcc -S: %v\n%s", err, out)
-			}
-			ref := filepath.Join(tmp, name+".gcc2")
-			if out, err := exec.Command(gcc, append(append([]string{"-std=" + std, "-w", "-O2"}, flags...), "-o", ref, f, "-lm")...).CombinedOutput(); err != nil {
-				t.Fatalf("gcc: %v\n%s", err, out)
-			}
+			gcc.run(t, append(append([]string{"-std=" + std, "-w", "-O2"}, flags...), "-S", "-o", asmFile, f)...)
 			gasObj := filepath.Join(tmp, name+".gas.o")
 			if out, err := exec.Command(gas, "--64", "-o", gasObj, asmFile).CombinedOutput(); err != nil {
 				t.Skipf("GNU as rejects gcc's output: %s", out)
@@ -75,19 +66,13 @@ func TestAssembleGCCOutput(t *testing.T) {
 			}
 			compareWithGas(t, gasObj, u.Obj)
 
-			want, wantCode := run(t, ref, tmp)
-			img, diags := driver.Link(linkInput(u.Obj))
-			if img == nil {
-				for _, d := range diags {
-					t.Error(d)
-				}
-				t.FailNow()
-			}
-			exe := filepath.Join(tmp, name+".as.altc")
-			if err := os.WriteFile(exe, img, 0o755); err != nil {
+			// the reference: the object of GNU as
+			in := &driver.LinkInput{}
+			if err := in.AddFile(gasObj); err != nil {
 				t.Fatal(err)
 			}
-			got, gotCode := run(t, exe, tmp)
+			want, wantCode := run(t, linkTo(t, filepath.Join(tmp, name+".gas"), in), tmp)
+			got, gotCode := run(t, linkObjects(t, filepath.Join(tmp, name+".as.altc"), u.Obj), tmp)
 			if got != want || gotCode != wantCode {
 				t.Errorf("output differs\n--- gcc -O2 (exit %d):\n%s\n--- assembled by altc (exit %d):\n%s", wantCode, want, gotCode, got)
 			}

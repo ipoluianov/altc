@@ -1,7 +1,9 @@
 # AltC — plan
 
 A C compiler in pure Go (no cgo, no external as/ld) plus a simple IDE.
-Goal: `altc <folder>` → a ready-to-run ELF executable for linux/amd64.
+Goal: `altc <folder>` → a ready-to-run ELF executable for linux/amd64, with
+distribution like Go's: one binary, nothing else installed (no gcc, no
+binutils, no C library), static executables.
 
 ## Architecture
 
@@ -13,16 +15,18 @@ Goal: `altc <folder>` → a ready-to-run ELF executable for linux/amd64.
 .s/.S sources ─►        AT&T assembler (inline asm, file-scope asm, .s files)
                 │
                 ▼
-               elf/     object model, ELF .o writer/reader, .a archives,
-                │       .so dynamic symbol reader, linker
+               elf/     object model, ELF .o writer/reader, .a archives, linker
+                │
                 ▼
-         ELF64 executable (ET_EXEC), dynamically linked with libc.so.6 / libm.so.6
+         static ELF64 executable (ET_EXEC at 0x400000)
 ```
 
-* `include/` — built-in standard headers (embedded), layout-compatible with
-  glibc x86-64. System `/usr/include` is not required.
-* libc is the system `libc.so.6` (present on every glibc Linux). The linker
-  generates `_start` itself (calls `__libc_start_main`).
+* `libc/` — the C library: musl 1.2.5 sources (embedded, x86_64 only,
+  headers installed into `musl/include`), AltC's additions (`altc/`) and
+  patches (`patches/`). Compiled by AltC on first use into the build cache,
+  keyed by the hash of the compiler executable.
+* `include/` — the compiler's own headers (intrinsics, `<stdatomic.h>`...),
+  searched before musl's. Nothing is read from the system.
 * `driver/` — build pipeline: files, project folder (`altc.json` optional),
   parallel compilation, diagnostics.
 * `ide/` — a simple IDE on nui: file tree, editor tabs, syntax highlighting,
@@ -86,6 +90,23 @@ expressions, `__typeof__`, `&&label`, `case a ... b`, `__builtin_*`).
     division; GNU as-compatible jump relaxation.
 22. Later: AVX-512 (needs a machine or emulator that can run it to test
     the generated code).
+23. Distribution like Go: musl 1.2.5 embedded and compiled by AltC on
+    first use into the build cache (pruned to the last builds); every
+    executable static; glibc, the system headers and libraries, libgcc
+    and shared libraries dropped. AltC's startup applies IRELATIVE
+    relocations (IFUNC, target_clones); `<stdbit.h>` functions and the C23
+    `<stddef.h>` additions come from AltC. Tests compare with gcc using
+    the same headers and library; `TestLibcAgainstGCC` compares the
+    library with gcc's build of it.
+24. Next steps of the distribution work:
+    - a build cache for project objects (incremental builds, like
+      `go build`);
+    - the compiler running on other hosts (Windows, macOS) and producing
+      Linux executables, then other targets;
+    - musl's libc-test suite against AltC's build of the library;
+    - `backtrace()` (`<execinfo.h>`) from `.eh_frame`, which musl lacks;
+    - dropping the dynamic linking code of `elf/` (no longer used) or
+      keeping it for targets that need system libraries.
 
 ## CLI
 

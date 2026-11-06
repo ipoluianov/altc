@@ -55,10 +55,7 @@ func stdFor(src []byte) string {
 }
 
 func TestCompareWithGCC(t *testing.T) {
-	gcc, err := exec.LookPath("gcc")
-	if err != nil {
-		t.Skip("gcc not found")
-	}
+	gcc := needGCC(t)
 	files, _ := filepath.Glob("c/*.c")
 	if only := os.Getenv("ONLY"); only != "" {
 		files, _ = filepath.Glob("c/" + only + ".c")
@@ -80,10 +77,7 @@ func TestCompareWithGCC(t *testing.T) {
 			}
 			std := stdFor(src)
 			flags := flagsFor(t, src)
-			ref := filepath.Join(tmp, name+".gcc")
-			if out, err := exec.Command(gcc, append(append([]string{"-std=" + std, "-w", "-O0"}, flags...), "-o", ref, f, "-lm")...).CombinedOutput(); err != nil {
-				t.Fatalf("gcc: %v\n%s", err, out)
-			}
+			ref := gcc.program(t, filepath.Join(tmp, name+".gcc"), []string{f}, append([]string{"-std=" + std, "-w", "-O0"}, flags...)...)
 			want, wantCode := run(t, ref, tmp)
 
 			abs, _ := filepath.Abs(f)
@@ -94,18 +88,7 @@ func TestCompareWithGCC(t *testing.T) {
 				}
 				t.FailNow()
 			}
-			img, diags := driver.Link(linkInput(u.Obj))
-			if img == nil {
-				for _, d := range diags {
-					t.Error(d)
-				}
-				t.FailNow()
-			}
-			exe := filepath.Join(tmp, name+".altc")
-			if err := os.WriteFile(exe, img, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			got, gotCode := run(t, exe, tmp)
+			got, gotCode := run(t, linkObjects(t, filepath.Join(tmp, name+".altc"), u.Obj), tmp)
 			if got != want || gotCode != wantCode {
 				t.Errorf("output differs\n--- gcc (exit %d):\n%s\n--- altc (exit %d):\n%s", wantCode, want, gotCode, got)
 			}

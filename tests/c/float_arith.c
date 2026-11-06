@@ -49,6 +49,6 @@ int main(void) {
     double hex = 0x1.2p+3; float hf = 0x.8p1f; long double hl = 0x1p-16382L;
     printf("%g %g %Lg\n", hex, hf, hl);
     printf("%g %g\n", 1.e2, .5e-1);
-    printf("%g %g %g\n", 1e+2f, 2E3, 3.L);
+    printf("%g %g %Lg\n", 1e+2f, 2E3, 3.L);
     return 0;
 }

@@ -20,10 +20,6 @@ func TestDebugInfo(t *testing.T) {
 	if err != nil {
 		t.Skip("gdb not found")
 	}
-	gcc, err := exec.LookPath("gcc")
-	if err != nil {
-		t.Skip("gcc not found")
-	}
 	tmp := t.TempDir()
 	src, _ := filepath.Abs("debug/point.c")
 	data, err := os.ReadFile(src)
@@ -31,15 +27,7 @@ func TestDebugInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := func(t *testing.T, objs ...*elf.Object) string {
-		img, diags := driver.Link(&driver.LinkInput{Objects: objs, Static: strings.HasSuffix(t.Name(), "static")})
-		if img == nil {
-			t.Fatal(diags)
-		}
-		exe := filepath.Join(tmp, strings.ReplaceAll(t.Name(), "/", "_"))
-		if err := os.WriteFile(exe, img, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		return exe
+		return linkObjects(t, filepath.Join(tmp, strings.ReplaceAll(t.Name(), "/", "_")), objs...)
 	}
 	compile := func(t *testing.T, path string, src []byte, cfg *driver.Config) *elf.Object {
 		u := driver.CompileSource(path, src, cfg)
@@ -71,32 +59,14 @@ func TestDebugInfo(t *testing.T) {
 	t.Run("altc", func(t *testing.T) {
 		check(t, link(t, compile(t, src, data, &driver.Config{Std: "gnu17", NoWarnings: true, NoRegAlloc: true, Debug: true})), true)
 	})
-	t.Run("altc_static", func(t *testing.T) {
-		check(t, link(t, compile(t, src, data, &driver.Config{Std: "gnu17", NoWarnings: true, NoRegAlloc: true, Debug: true})), true)
-	})
 	t.Run("gcc_asm", func(t *testing.T) {
 		s := filepath.Join(tmp, "point.s")
-		if out, err := exec.Command(gcc, "-g", "-O0", "-S", "-o", s, src).CombinedOutput(); err != nil {
-			t.Fatalf("%v\n%s", err, out)
-		}
+		needGCC(t).run(t, "-g", "-O0", "-S", "-o", s, src)
 		asm, _ := os.ReadFile(s)
 		check(t, link(t, compile(t, s, asm, &driver.Config{Std: "gnu17", NoWarnings: true})), true)
 	})
 	t.Run("gcc_obj", func(t *testing.T) {
-		o := filepath.Join(tmp, "point.o")
-		if out, err := exec.Command(gcc, "-g", "-O0", "-c", "-o", o, src).CombinedOutput(); err != nil {
-			t.Fatalf("%v\n%s", err, out)
-		}
-		in := &driver.LinkInput{}
-		if err := in.AddFile(o); err != nil {
-			t.Fatal(err)
-		}
-		img, diags := driver.Link(in)
-		if img == nil {
-			t.Fatal(diags)
-		}
-		exe := filepath.Join(tmp, "gcc_obj")
-		os.WriteFile(exe, img, 0o755)
+		exe := needGCC(t).program(t, filepath.Join(tmp, "gcc_obj"), []string{src}, "-g", "-O0")
 		check(t, exe, true)
 	})
 }
@@ -118,14 +88,7 @@ func TestDebugOptimized(t *testing.T) {
 	if u.Obj == nil {
 		t.Fatal(u.Diagnostics)
 	}
-	img, diags := driver.Link(&driver.LinkInput{Objects: []*elf.Object{u.Obj}})
-	if img == nil {
-		t.Fatal(diags)
-	}
-	exe := filepath.Join(t.TempDir(), "opt")
-	if err := os.WriteFile(exe, img, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	exe := linkObjects(t, filepath.Join(t.TempDir(), "opt"), u.Obj)
 	cmds := []string{"break opt.c:15", "run", "info args", "info locals", "c", "info locals", "delete", "break sq", "c", "bt", "next", "info locals",
 		"delete", "break opt.c:33", "c", "info locals", "delete", "break cplx", "c", "info args", "break opt.c:42", "c", "info locals"}
 	want := []string{"work (n=5, a=", "sum = 2", "scale = 1.5", "i = 0", "sum = 7", "scale = 1.875", "i = 1",

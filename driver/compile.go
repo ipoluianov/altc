@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +12,7 @@ import (
 	"github.com/ipoluianov/altc/cc"
 	"github.com/ipoluianov/altc/elf"
 	"github.com/ipoluianov/altc/include"
+	"github.com/ipoluianov/altc/libc"
 	"github.com/ipoluianov/altc/x64"
 )
 
@@ -32,6 +31,9 @@ type Config struct {
 	ISA         x64.ISA  // instruction set extensions (-march, -m<feature>)
 	FastMath    bool     // -ffast-math: floating-point operations may be reassociated
 	Debug       bool     // -g: DWARF debug information
+
+	// ReadFile reads source files and headers (os.ReadFile when nil)
+	ReadFile func(path string) ([]byte, error)
 }
 
 // MachineFlag applies the code generation options: -march=...,
@@ -109,15 +111,13 @@ func StdLevel(std string) (int, bool, error) {
 	return 0, false, fmt.Errorf("unknown C standard '%s'", std)
 }
 
-// systemIncludeDirs are searched after the built-in headers
-var systemIncludeDirs = []string{"/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include"}
-
 func (c *Config) ppConfig() (cc.PPConfig, error) {
 	level, gnu, err := StdLevel(c.Std)
 	if err != nil {
 		return cc.PPConfig{}, err
 	}
-	pc := cc.PPConfig{Std: level, GNU: gnu, QuoteDirs: c.QuoteDirs, Defines: append(c.isaDefines(), c.Defines...), PreInclude: c.PreInclude}
+	pc := cc.PPConfig{Std: level, GNU: gnu, QuoteDirs: c.QuoteDirs, Defines: append(c.isaDefines(), c.Defines...), PreInclude: c.PreInclude,
+		ReadFile: c.ReadFile}
 	for _, d := range c.IncludeDirs {
 		pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: d})
 	}
@@ -125,10 +125,10 @@ func (c *Config) ppConfig() (cc.PPConfig, error) {
 		pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: d, System: true})
 	}
 	if !c.NoStdInc {
-		pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: include.Root, Embedded: include.FS, System: true})
-		for _, d := range systemIncludeDirs {
-			pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: d, System: true})
-		}
+		// the compiler's headers, then the C library's: nothing from the
+		// system
+		pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: include.Root, Embedded: include.FS, System: true},
+			cc.IncludeDir{Path: libc.Include, Embedded: libc.FS, System: true})
 	}
 	return pc, nil
 }
@@ -331,21 +331,10 @@ func parseGenError(path string, err error) Diagnostic {
 
 // ---- runtime support ----
 
-// runtimeSource provides what glibc keeps in libc_nonshared.a, so that
-// linking needs only the shared libc.so.6
+// runtimeSource is the compiler's support library (what libgcc provides
+// to gcc-compiled code)
 const runtimeSource = `
 typedef unsigned long size_t;
-void *__dso_handle __attribute__((weak, visibility("hidden"))) = &__dso_handle; /* crtbegin*.o has it in static links */
-int __cxa_atexit(void (*f)(void *), void *arg, void *dso);
-int __cxa_at_quick_exit(void (*f)(void *), void *dso);
-int __register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void), void *dso);
-int atexit(void (*f)(void)) { return __cxa_atexit((void (*)(void *))f, 0, __dso_handle); }
-int at_quick_exit(void (*f)(void)) { return __cxa_at_quick_exit((void (*)(void *))f, __dso_handle); }
-int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void)) {
-	return __register_atfork(prepare, parent, child, __dso_handle);
-}
-void __stack_chk_fail(void);
-void __stack_chk_fail_local(void) { __stack_chk_fail(); }
 
 /* 128-bit integer helpers (the libgcc names) */
 typedef unsigned __int128 __altc_u128;
@@ -395,6 +384,14 @@ __altc_i128 __modti3(__altc_i128 a, __altc_i128 b) {
 	__altc_u128 r;
 	__altc_udivmod(a < 0 ? -(__altc_u128)a : (__altc_u128)a, b < 0 ? -(__altc_u128)b : (__altc_u128)b, &r);
 	return a < 0 ? -(__altc_i128)r : (__altc_i128)r;
+}
+/* quotient and remainder at once (libgcc 14) */
+__altc_u128 __udivmodti4(__altc_u128 a, __altc_u128 b, __altc_u128 *r) { return __altc_udivmod(a, b, r); }
+__altc_i128 __divmodti4(__altc_i128 a, __altc_i128 b, __altc_i128 *r) {
+	__altc_u128 ur;
+	__altc_u128 q = __altc_udivmod(a < 0 ? -(__altc_u128)a : (__altc_u128)a, b < 0 ? -(__altc_u128)b : (__altc_u128)b, &ur);
+	*r = a < 0 ? -(__altc_i128)ur : (__altc_i128)ur;
+	return (a < 0) != (b < 0) ? -(__altc_i128)q : (__altc_i128)q;
 }
 double __floatuntidf(__altc_u128 a) {
 	return (double)(unsigned long)(a >> 64) * 18446744073709551616.0 + (double)(unsigned long)a;
@@ -741,44 +738,23 @@ func runtimeObjects() ([]*elf.Object, error) {
 
 // ---- libraries ----
 
-// DefaultLibDirs are searched for -l libraries
-var DefaultLibDirs = []string{"/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu", "/lib64", "/usr/lib64",
-	"/usr/local/lib", "/lib", "/usr/lib"}
-
-// libraries merged into libc.so.6 since glibc 2.34
-var mergedLibs = map[string]bool{"c": true, "pthread": true, "dl": true, "rt": true, "util": true, "anl": true}
+// libcLibs are the libraries that are part of the C library: -lm,
+// -lpthread... add nothing
+var libcLibs = map[string]bool{"c": true, "m": true, "rt": true, "pthread": true, "crypt": true, "util": true,
+	"xnet": true, "resolv": true, "dl": true}
 
 // LinkInput is what the linker reads besides the compiled units
 type LinkInput struct {
-	Objects   []*elf.Object
-	Archives  []*elf.Archive
-	Shared    []*elf.SharedLib
-	Strip     bool // do not write the symbol table
-	Static    bool // link statically with libc.a (-static); set before AddLib
-	sharedSet map[string]bool
+	Objects  []*elf.Object
+	Archives []*elf.Archive
+	Strip    bool // do not write the symbol table
+	// LibcDir holds another build of the C library (libc.a and the
+	// startup objects, as in the cache) to link with instead of the
+	// built-in one
+	LibcDir string
 }
 
-func (in *LinkInput) addShared(path string) error {
-	if in.sharedSet == nil {
-		in.sharedSet = map[string]bool{}
-	}
-	real, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		real = path
-	}
-	if in.sharedSet[real] {
-		return nil
-	}
-	lib, err := elf.ReadSharedLib(path)
-	if err != nil {
-		return err
-	}
-	in.sharedSet[real] = true
-	in.Shared = append(in.Shared, lib)
-	return nil
-}
-
-// AddFile adds an object (.o), archive (.a) or shared library (.so) by path
+// AddFile adds an object (.o) or archive (.a) by path
 func (in *LinkInput) AddFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -792,10 +768,7 @@ func (in *LinkInput) AddFile(path string) error {
 		}
 		in.Archives = append(in.Archives, ar)
 	case len(data) > 18 && string(data[:4]) == "\x7fELF" && data[16] == 3:
-		if in.Static {
-			return fmt.Errorf("%s: a shared library cannot be linked statically", path)
-		}
-		return in.addShared(path)
+		return fmt.Errorf("%s: shared libraries are not supported: executables are static", path)
 	case len(data) > 4 && string(data[:4]) == "\x7fELF":
 		obj, err := elf.ReadObject(path, data)
 		if err != nil {
@@ -803,193 +776,59 @@ func (in *LinkInput) AddFile(path string) error {
 		}
 		in.Objects = append(in.Objects, obj)
 	default:
-		// a GNU ld script (like libc.so)
-		files, err := elf.ParseLinkerScript(path)
-		if err != nil {
-			return err
-		}
-		for _, f := range files {
-			if strings.Contains(f, "libc_nonshared") {
-				continue // our runtime replaces it
-			}
-			if err := in.AddFile(f); err != nil {
-				return err
-			}
-		}
+		return fmt.Errorf("%s: not an object file or archive", path)
 	}
 	return nil
 }
 
-// AddLib resolves -lname in the library directories
+// AddLib resolves -lname: lib<name>.a in the -L directories. The
+// libraries of the C library itself are part of it.
 func (in *LinkInput) AddLib(name string, dirs []string) error {
-	if mergedLibs[name] {
+	if libcLibs[name] {
 		return nil
 	}
-	if name == "m" {
-		return nil // libm.so.6 is always linked
-	}
-	all := append(append([]string{}, dirs...), DefaultLibDirs...)
-	if d := gccLibDir(); d != "" {
-		all = append(all, d) // libstdc++, libgcc, libatomic...
-	}
-	if in.Static {
-		for _, d := range all {
-			p := filepath.Join(d, "lib"+name+".a")
-			if _, err := os.Stat(p); err == nil {
-				return in.AddFile(p)
-			}
-		}
-		return fmt.Errorf("cannot find -l%s (no static library lib%s.a)", name, name)
-	}
-	for _, d := range all {
-		p := filepath.Join(d, "lib"+name+".so")
-		if _, err := os.Stat(p); err == nil {
-			return in.AddFile(p)
-		}
-		p = filepath.Join(d, "lib"+name+".a")
+	for _, d := range dirs {
+		p := filepath.Join(d, "lib"+name+".a")
 		if _, err := os.Stat(p); err == nil {
 			return in.AddFile(p)
 		}
 	}
-	// no development symlink: use the versioned runtime library
-	for _, d := range all {
-		matches, _ := filepath.Glob(filepath.Join(d, "lib"+name+".so.*"))
-		if len(matches) > 0 {
-			sort.Strings(matches)
-			return in.AddFile(matches[0])
-		}
-	}
-	return fmt.Errorf("cannot find -l%s", name)
+	return fmt.Errorf("cannot find -l%s (lib%s.a in the -L directories)", name, name)
 }
 
-// gccLibDir is the newest /usr/lib/gcc/x86_64-linux-gnu/<version> holding
-// libgcc.a and the crtbegin/crtend objects
-func gccLibDir() string {
-	dirs, _ := filepath.Glob("/usr/lib/gcc/x86_64-linux-gnu/*/libgcc.a")
-	best, bestVer := "", []int(nil)
-	for _, p := range dirs {
-		d := filepath.Dir(p)
-		var ver []int
-		for _, f := range strings.Split(filepath.Base(d), ".") {
-			n, _ := strconv.Atoi(f)
-			ver = append(ver, n)
-		}
-		if best == "" || slices.Compare(ver, bestVer) > 0 {
-			best, bestVer = d, ver
-		}
+// Link builds a static executable from the inputs and the C library, as
+// gcc -static does: crt1.o crti.o <objects> <archives> libc.a crtn.o, the
+// compiler's runtime filling the remaining gaps
+func Link(in *LinkInput) ([]byte, []Diagnostic) {
+	fail := func(err error) ([]byte, []Diagnostic) {
+		return nil, []Diagnostic{{Severity: SevError, Message: err.Error()}}
 	}
-	return best
-}
-
-// linkStatic links like gcc -static: crt1.o crti.o crtbeginT.o <objects>
-// --start-group libgcc.a libgcc_eh.a libc.a --end-group crtend.o crtn.o
-func linkStatic(in *LinkInput) ([]byte, []Diagnostic) {
-	fail := func(f string, a ...any) ([]byte, []Diagnostic) {
-		return nil, []Diagnostic{{Severity: SevError, Message: fmt.Sprintf(f, a...)}}
+	var lib *builtLibc
+	var err error
+	if in.LibcDir != "" {
+		lib, err = readLibc(in.LibcDir)
+	} else {
+		lib, err = getLibc(nil)
 	}
-	gcc := gccLibDir()
-	if gcc == "" {
-		return fail("-static: libgcc.a not found (install gcc)")
+	if err != nil {
+		return fail(err)
 	}
-	need := func(path string) string {
-		if _, err := os.Stat(path); err != nil {
-			return ""
-		}
-		return path
-	}
-	crt := &LinkInput{Static: true}
-	tail := &LinkInput{Static: true}
-	libs := &LinkInput{Static: true}
-	for _, f := range []struct {
-		in   *LinkInput
-		path string
-		opt  bool
-	}{
-		{crt, findSystemLib("crt1.o"), false},
-		{crt, findSystemLib("crti.o"), false},
-		{crt, need(filepath.Join(gcc, "crtbeginT.o")), false},
-		{libs, findSystemLib("libm.a"), true},
-		{libs, findSystemLib("libc.a"), false},
-		{libs, need(filepath.Join(gcc, "libgcc.a")), false},
-		{libs, need(filepath.Join(gcc, "libgcc_eh.a")), true},
-		{tail, need(filepath.Join(gcc, "crtend.o")), false},
-		{tail, findSystemLib("crtn.o"), false},
-	} {
-		if f.path == "" {
-			if f.opt {
-				continue
-			}
-			return fail("-static: the static C library is missing (libc.a, crt1.o: install libc6-dev)")
-		}
-		if err := f.in.AddFile(f.path); err != nil {
-			return fail("%v", err)
-		}
+	// the inputs are written to by the linker: copies for each link
+	ar, err := elf.ReadArchive("libc.a", lib.archive)
+	if err != nil {
+		return fail(err)
 	}
 	rt, err := runtimeObjects()
 	if err != nil {
-		return fail("%v", err)
+		return fail(err)
 	}
 	ln := &elf.Linker{
-		Objects:   append(crt.Objects, in.Objects...),
-		Archives:  append(in.Archives, libs.Archives...),
-		Tail:      tail.Objects,
-		Lazy:      append([]*elf.Object(nil), rt...),
+		Objects:   append([]*elf.Object{lib.crt1.Clone(), lib.crti.Clone(), lib.start.Clone()}, in.Objects...),
+		Archives:  append(append([]*elf.Archive(nil), in.Archives...), ar),
+		Tail:      []*elf.Object{lib.crtn.Clone()},
+		Lazy:      rt,
 		StripSyms: in.Strip,
 		Static:    true,
-	}
-	return runLinker(ln)
-}
-
-func findSystemLib(name string) string {
-	for _, d := range DefaultLibDirs {
-		p := filepath.Join(d, name)
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
-}
-
-// Link builds an executable image from the inputs
-func Link(in *LinkInput) ([]byte, []Diagnostic) {
-	if in.Static {
-		return linkStatic(in)
-	}
-	libc := findSystemLib("libc.so.6")
-	if libc == "" {
-		return nil, []Diagnostic{{Severity: SevError, Message: "libc.so.6 not found: a glibc-based Linux is required"}}
-	}
-	// libc and libm come first so their symbols win
-	base := &LinkInput{}
-	if err := base.addShared(libc); err != nil {
-		return nil, []Diagnostic{{Severity: SevError, Message: err.Error()}}
-	}
-	if libm := findSystemLib("libm.so.6"); libm != "" {
-		base.addShared(libm)
-	}
-	for _, s := range in.Shared {
-		real, _ := filepath.EvalSymlinks(s.Path)
-		if !base.sharedSet[real] {
-			base.Shared = append(base.Shared, s)
-			base.sharedSet[real] = true
-		}
-	}
-	// the unwinder (_Unwind_Resume, __gcc_personality_v0 of code compiled
-	// with -fexceptions or C++), last and needed only when used, like gcc's
-	// --as-needed -lgcc_s
-	if gs := findSystemLib("libgcc_s.so.1"); gs != "" {
-		base.addShared(gs)
-	}
-	rt, err := runtimeObjects()
-	if err != nil {
-		return nil, []Diagnostic{{Severity: SevError, Message: err.Error()}}
-	}
-	ln := &elf.Linker{
-		Objects:    in.Objects,
-		Archives:   in.Archives,
-		SharedLibs: base.Shared,
-		Lazy:       append([]*elf.Object(nil), rt...),
-		StripSyms:  in.Strip,
 	}
 	return runLinker(ln)
 }

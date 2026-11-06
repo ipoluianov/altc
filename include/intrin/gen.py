@@ -132,7 +132,7 @@ struct __altc_f64 { double __v; } __attribute__((__packed__, __may_alias__));
 #define __ALTC_SPLAT(T, x) __builtin_altc_broadcast(*(T *)0, (x))""")
 
 # ---------------------------------------------------------------- SSE
-begin("xmmintrin.h", "_XMMINTRIN_H_INCLUDED", ["altc_intrin_common.h", "mm_malloc.h"])
+begin("xmmintrin.h", "_XMMINTRIN_H_INCLUDED", ["altc_intrin_common.h", "mmintrin.h", "mm_malloc.h"])
 emit("""#define _MM_SHUFFLE(fp3, fp2, fp1, fp0) (((fp3) << 6) | ((fp2) << 4) | ((fp1) << 2) | (fp0))
 #define _MM_HINT_T0 3
 #define _MM_HINT_T1 2
@@ -844,7 +844,7 @@ static __inline__ void *_mm_malloc(size_t __size, size_t __align) {
 }
 static __inline__ void _mm_free(void *__p) { free(__p); }""")
 begin("mmintrin.h", "_MMINTRIN_H_INCLUDED", ["altc_intrin_common.h"])
-emit("/* MMX (__m64) intrinsics are not supported */\n__ALTC_INL void _mm_empty(void) {}")
+emit("/* MMX intrinsics are not supported; the type is (for pointer casts like\n   (__m64 *)p in SSE code) */\ntypedef int __m64 __attribute__((__vector_size__(8), __may_alias__));\n__ALTC_INL void _mm_empty(void) {}")
 
 # ---------------------------------------------------------------- write
 for name, (guard, includes, body, protos) in files.items():

@@ -260,9 +260,8 @@ func addType(n *Node) {
 			}
 			panic(fatal{errAt(n.Tok, false, "invalid pointer dereference")})
 		}
-		if t.Base.Kind == TyVoid {
-			panic(fatal{errAt(n.Tok, false, "dereferencing a 'void *' pointer")})
-		}
+		// *p of a void *p is an expression of type void, as in gcc (used
+		// in __typeof__ by <tgmath.h>); using its value is an error
 		n.Ty = t.Base
 	case NStmtExpr:
 		n.Ty = tyVoid

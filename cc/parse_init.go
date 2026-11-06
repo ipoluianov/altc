@@ -407,7 +407,12 @@ func (p *parser) initializer2(init *initializer) {
 		p.stringInitializer(init)
 		return
 	}
-	if init.ty.Kind == TyArray && p.is("{") && p.peekAt(1).Kind == TStr && (p.peekAt(2).Is("}") || p.peekAt(2).Is(",") && p.peekAt(3).Is("}")) &&
+	// { "string" }, the string possibly made of adjacent literals
+	k := 1
+	for p.peekAt(k).Kind == TStr {
+		k++
+	}
+	if init.ty.Kind == TyArray && p.is("{") && k > 1 && (p.peekAt(k).Is("}") || p.peekAt(k).Is(",") && p.peekAt(k+1).Is("}")) &&
 		init.ty.Base.IsInteger() {
 		p.next()
 		p.stringInitializer(init)

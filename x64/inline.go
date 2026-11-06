@@ -1123,7 +1123,8 @@ func (g *gen) finishAsm(text *elf.Section, syms map[string]*elf.Symbol) ([]pendi
 		case !strings.Contains(s.flags, "a") && (strings.HasPrefix(s.name, ".debug") || strings.HasPrefix(s.name, ".comment") ||
 			strings.HasPrefix(s.name, ".note") || strings.HasPrefix(s.name, ".gnu.lto")):
 			kind = elf.SecOther // not loaded: debug information, comments, notes
-		case strings.HasPrefix(s.name, ".text") || strings.Contains(s.flags, "x"):
+		case strings.HasPrefix(s.name, ".text") || strings.Contains(s.flags, "x") || s.name == ".init" || s.name == ".fini":
+			// code; GNU as knows .init and .fini by name
 			kind = elf.SecText
 		case strings.HasPrefix(s.name, ".rodata"):
 			kind = elf.SecROData

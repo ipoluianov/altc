@@ -32,6 +32,10 @@ func isLvalue(n *Node) bool {
 
 func (p *parser) checkLvalue(n *Node, tok *Token, what string) {
 	addType(n)
+	if n.Ty.Kind == TyVoid && what != "unary '&' operand" {
+		p.errorAt(tok, "invalid use of void expression")
+		return
+	}
 	if !isLvalue(n) {
 		p.errorAt(tok, "lvalue required as %s", what)
 	}
@@ -51,6 +55,8 @@ func (p *parser) checkAssign(to *Type, e *Node, tok *Token, ctx string) {
 	addType(e)
 	from := e.Ty
 	switch {
+	case from.Kind == TyVoid && to.Kind != TyVoid:
+		p.errorAt(tok, "void value not ignored as it ought to be")
 	case to.Kind == TyPtr && from.IsInteger() && !isNullPtrConst(e):
 		p.warnAt(tok, "%s makes pointer from integer without a cast", ctx)
 	case to.IsInteger() && to.Kind != TyBool && decayType(from).Kind == TyPtr:
@@ -246,9 +252,9 @@ func (p *parser) conditional() *Node {
 		return p.newBinary(NComma, e1, n, t)
 	}
 	n := &Node{Kind: NCond, Cond: c, Tok: t}
-	n.Then = p.expr()
+	n.Then = p.nullPtrConst(p.expr())
 	p.expect(":")
-	n.Els = p.conditional()
+	n.Els = p.nullPtrConst(p.conditional())
 	addType(n.Cond)
 	if n.Cond.Ty.IsComplex() {
 		n.Cond = p.toBool(n.Cond)
@@ -257,6 +263,22 @@ func (p *parser) conditional() *Node {
 		p.errorAt(t, "used non-scalar value where scalar is required")
 	}
 	return n
+}
+
+// nullPtrConst folds an operand of ?: that is a null pointer constant
+// other than a plain 0, (void *)(integer constant expression of value 0),
+// to (void *)0: the other operand then gives the type of the result
+// (<tgmath.h> selects types this way: 0 ? (T *)0 : (void *)!(c))
+func (p *parser) nullPtrConst(n *Node) *Node {
+	addType(n)
+	inner := n
+	for inner.Kind == NCast && inner.Ty.Kind == TyPtr && inner.Ty.Base.Kind == TyVoid && !inner.Ty.Base.Const && !inner.Ty.Base.Volatile {
+		inner = inner.LHS
+	}
+	if inner == n || inner.Kind == NNum || !inner.Ty.IsInteger() || !p.isConstExpr(inner) || p.eval(inner) != 0 {
+		return n
+	}
+	return newCast(&Node{Kind: NNum, Ty: tyInt, Tok: inner.Tok}, n.Ty)
 }
 
 // toBool checks a controlling expression
@@ -523,7 +545,7 @@ func (p *parser) mul() *Node {
 }
 
 func (p *parser) cast() *Node {
-	if p.is("(") && p.isTypename(p.peekAt(1)) {
+	if p.is("(") && p.typenameAt(1) {
 		start := p.pos
 		t := p.next()
 		ty := p.typename()
@@ -674,7 +696,7 @@ func (p *parser) unary() *Node {
 			return p.sizeofExpr(t)
 		case "_Alignof", "alignof", "__alignof__", "__alignof":
 			p.next()
-			if p.is("(") && p.isTypename(p.peekAt(1)) {
+			if p.is("(") && p.typenameAt(1) {
 				p.next()
 				ty := p.typename()
 				p.expect(")")
@@ -701,7 +723,7 @@ func (p *parser) unary() *Node {
 }
 
 func (p *parser) sizeofExpr(t *Token) *Node {
-	if p.is("(") && p.isTypename(p.peekAt(1)) {
+	if p.is("(") && p.typenameAt(1) {
 		start := p.pos
 		p.next()
 		ty := p.typename()
@@ -777,7 +799,7 @@ func (p *parser) structRef(n *Node, name *Token) *Node {
 func (p *parser) postfix() *Node {
 	t := p.cur()
 	var n *Node
-	if p.is("(") && p.isTypename(p.peekAt(1)) {
+	if p.is("(") && p.typenameAt(1) {
 		// compound literal
 		p.next()
 		ty := p.typename()

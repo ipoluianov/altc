@@ -1,10 +1,11 @@
 # AltC
 
 A C compiler for linux/amd64 written in pure Go, with a built-in
-preprocessor, assembler and linker, plus a small IDE. One binary turns a
-folder of C (and assembler) sources into a ready-to-run executable: no gcc,
-binutils or libc development packages are needed, only the system
-`libc.so.6`.
+preprocessor, assembler, linker and C library, plus a small IDE. One binary
+turns a folder of C (and assembler) sources into a ready-to-run executable,
+the way the Go toolchain does: nothing else has to be installed, not gcc,
+not binutils, not even a C library. Executables are static and run on any
+x86-64 Linux kernel.
 
 ## Quick start
 
@@ -25,8 +26,39 @@ altc -S file.c           # GNU assembler listing
 altc -E file.c           # preprocessed output
 altc -c start.S          # assembler sources: .s, or .S with the C preprocessor
 altc -march=native f.c   # use the extensions of this processor (AVX2...)
-altc -static f.c -o f    # self-contained executable (libc.a, no dynamic loader)
 ```
+
+## The C library
+
+AltC carries the sources of [musl](https://musl.libc.org) 1.2.5 (MIT
+license) in the binary (`libc/`). The first link compiles them with AltC
+itself, in a few seconds, into the build cache (`$ALTC_CACHE`, else
+`~/.cache/altc`); later links take the library from there. The cache key
+is the hash of the compiler's executable, so every build of AltC uses a
+library it compiled, and older entries are pruned. Every program is
+linked statically with it: `crt1.o`, `crti.o`, the objects, `libc.a`,
+`crtn.o`, and a small runtime of the helpers gcc takes from libgcc
+(`__int128` division, `_Complex` multiplication and division,
+`__cpu_model`). `-lm`, `-lpthread`, `-lrt`, `-ldl` and the other parts of
+the C library are accepted and add nothing; other `-l` libraries must be
+static archives (`lib<name>.a`) in the `-L` directories. `-static` is
+accepted and changes nothing.
+
+- The headers are musl's, after AltC's own (`include/c/`: the intrinsic
+  headers, `<stdatomic.h>`, `<stdckdint.h>`, `<cpuid.h>`, and
+  `<stdbit.h>` and the C23 additions to `<stddef.h>`, which musl 1.2.5
+  does not have). Nothing is read from `/usr/include`.
+- `libc/altc/` holds AltC's additions to the library (the `<stdbit.h>`
+  functions, the startup code that applies `R_X86_64_IRELATIVE`
+  relocations of IFUNC symbols, which musl's static startup does not).
+- `libc/patches/` holds the changes to musl (the CVE-2025-26519 fix of
+  `iconv`). `go run ./libc/vendor <musl source dir>` vendors a release
+  again and applies them.
+- `TestLibcAgainstGCC` builds the same library with gcc and musl's flags
+  and checks that programs exercising formatted I/O, libm (every function,
+  three precisions, special values, rounding modes, exceptions), strings,
+  wide characters, time, regex, iconv, malloc, threads, signals and
+  `setjmp` print exactly the same with both.
 
 ## Processor extensions and SIMD
 
@@ -67,11 +99,9 @@ for more:
   `*`) are vectorized only with `-ffast-math` (or `-fassociative-math`,
   `-Ofast`), which also defines `__FAST_MATH__`.
 - Unwind tables: every function gets call frame information in
-  `.eh_frame` (and the linker builds `.eh_frame_hdr`), so `backtrace()`,
-  gdb, `pthread_cancel` cleanups and C++ exceptions work through AltC
-  code. The assembler turns `.cfi_*` directives into `.eh_frame` byte for
-  byte like GNU as; programs mixing C++ and AltC objects link with
-  `-lstdc++` (libgcc_s is added when needed).
+  `.eh_frame` (and the linker builds `.eh_frame_hdr`), for debuggers and
+  profilers. The assembler turns `.cfi_*` directives into `.eh_frame`
+  byte for byte like GNU as.
 - `-g`: DWARF 4 debug information — the line table, the functions, and at
   `-O0` the parameters, locals, globals and their types (structures,
   bit-fields, arrays, pointers), so gdb can set breakpoints, step, show
@@ -102,7 +132,6 @@ subfolder are on the include path. `altc.json` can set:
   "libs": ["z"],
   "libDirs": ["/opt/lib"],
   "cflags": ["-w"],
-  "static": false,
   "output": "bin/app",
   "args": ["--verbose"]
 }
@@ -157,29 +186,16 @@ directives (`.globl`, `.type`, `.size`, `.comm`, `.set`...). On gcc's
       x64/  code generator (System V ABI) and x86-64 encoder
        │
        ▼
-      elf/  objects, archives, shared libraries, linker ─► ELF executable
+      elf/  objects, archives, linker ─► static ELF executable
+      libc/ musl sources, compiled on first use into the build cache
 ```
 
-- `include/c/` holds the standard headers built into the binary. They are
-  layout-compatible with glibc, and missing ones fall back to
-  `/usr/include` (mixing with glibc's own headers is supported).
-- Programs are linked dynamically against `libc.so.6` and `libm.so.6`. The
-  linker generates `_start`, PLT/GOT, TLS, init/fini arrays and `.dynamic`
-  itself. What glibc keeps in `libc_nonshared.a` (`atexit`...) and the
-  libgcc helpers for `__int128` and `_Complex` come from a small runtime
-  compiled on the fly.
-- `-static` (or `"static": true` in `altc.json`) links like `gcc -static`:
-  `crt1.o`, `crti.o`, `crtbeginT.o`, the objects, `libc.a`, `libm.a`,
-  `libgcc.a`, `libgcc_eh.a`, `crtend.o`, `crtn.o` (the `libc6-dev` and
-  gcc packages). The linker then writes no `.interp`/`.dynamic`; IFUNCs
-  (glibc's `memcpy`, `strlen`...) get `R_X86_64_IRELATIVE` entries in
-  `.rela.iplt` that libc applies at startup. C++ (`-lstdc++`) and
-  `pthread_cancel` work statically too.
+- The linker lays out TLS, init/fini arrays (by priority), IFUNC slots
+  (`.rela.iplt`) and `.eh_frame_hdr`, and keeps the `.debug_*` sections.
 - Objects from gcc (`-fno-pic`, PIE or `-fPIC`) and static archives can be
   linked in. General and local dynamic TLS accesses of `-fPIC` code are
-  relaxed to local exec (or initial exec for a variable of a shared
-  library), as GNU ld does. Weak undefined references do not pull archive
-  members.
+  relaxed to local exec, as GNU ld does. Weak undefined references do not
+  pull archive members.
 - Functions are compiled through an SSA intermediate representation
   (`x64/ir*.go`): lowering builds SSA directly from the AST (locals whose
   address is never taken become values), then constant folding and
@@ -231,12 +247,16 @@ go test ./...                                 # everything
 go test ./tests -run TestCompareWithGCC       # C programs vs gcc output
 ABI_SEEDS=40 go test ./tests -run TestABI     # cross-compiler ABI calls
 go test ./tests -run TestAssembleGCCOutput    # gcc -S output vs GNU as, run
+go test ./tests -run TestLibcAgainstGCC       # the C library vs gcc's build
 go test ./x64 -run 'Encoding|AssembleText'    # encoder vs GNU as
 ASM_COMPARE_DIR=dir ASM_COMPARE_MATCH=/x86_64/ go test ./x64 -run AssembleFiles
-include/verify/run.sh                         # header layout vs glibc
 ```
 
-The comparison tests need gcc and GNU as only as a reference.
+The comparison tests use gcc and GNU as only as a reference and are
+skipped without them. gcc compiles with the built-in library's headers
+(`-nostdinc`, gcc's own headers, then musl's), and AltC's linker links its
+objects with the built-in library, so both programs use the same C
+library. `ALTC_TEST_KEEP=dir` keeps the files of the tests.
 
 Environment variables for working on the IR backend:
 
@@ -248,6 +268,7 @@ ALTC_IR_STRICT=1     # fail on internal IR errors instead of falling back
 ALTC_NOINLINE=1      # no inlining (ALTC_NOINLINE_FN=f,g: not these functions)
 ALTC_NOVECTORIZE=1   # no loop vectorization
 ALTC_TEST_FLAGS=-march=haswell go test ./tests   # the suite with other flags
+ALTC_CACHE=dir       # the build cache (the compiled C library)
 ```
 
 A test can start with `// flags: -mavx2 -mfma` (compiled with these flags

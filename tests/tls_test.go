@@ -2,7 +2,6 @@ package tests
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -12,26 +11,11 @@ import (
 
 // TestTLSRelax links gcc -fPIC objects whose thread-local accesses use the
 // general and local dynamic models (__tls_get_addr): the linker relaxes
-// them to local exec for variables of the executable and to initial exec
-// for a variable of a shared library, dynamically and with -static
+// them to local exec. The reference is the same program compiled without
+// -fPIC (local exec from the start).
 func TestTLSRelax(t *testing.T) {
-	gcc, err := exec.LookPath("gcc")
-	if err != nil {
-		t.Skip("gcc not found")
-	}
+	gcc := needGCC(t)
 	tmp := t.TempDir()
-	sh := func(args ...string) {
-		t.Helper()
-		if out, err := exec.Command(gcc, args...).CombinedOutput(); err != nil {
-			t.Fatalf("gcc %v: %v\n%s", args, err, out)
-		}
-	}
-	mainO := filepath.Join(tmp, "pic_main.o")
-	libO := filepath.Join(tmp, "lib.o")
-	libSo := filepath.Join(tmp, "libtlsvar.so")
-	sh("-fPIC", "-O2", "-c", "-o", mainO, "tls/pic_main.c")
-	sh("-fPIC", "-O2", "-c", "-o", libO, "tls/lib.c")
-	sh("-shared", "-o", libSo, libO)
 	src, err := os.ReadFile("tls/altc_part.c")
 	if err != nil {
 		t.Fatal(err)
@@ -41,42 +25,24 @@ func TestTLSRelax(t *testing.T) {
 	if u.Obj == nil {
 		t.Fatal(u.Diagnostics)
 	}
-	altcO := filepath.Join(tmp, "altc_part.o")
-	if err := os.WriteFile(altcO, elf.WriteObject(u.Obj), 0o644); err != nil {
-		t.Fatal(err)
+	gccSrcs := []string{"tls/pic_main.c", "tls/lib.c"}
+	ref := &driver.LinkInput{}
+	for _, s := range append(gccSrcs, "tls/altc_part.c") {
+		if err := ref.AddFile(gcc.object(t, filepath.Join(tmp, filepath.Base(s)+".o"), s, "-O2")); err != nil {
+			t.Fatal(err)
+		}
 	}
-	ref := filepath.Join(tmp, "ref")
-	sh("-o", ref, mainO, altcO, libO, "-pthread")
-	want, _ := run(t, ref, tmp)
+	want, _ := run(t, linkTo(t, filepath.Join(tmp, "ref"), ref), tmp)
 	if want == "" {
 		t.Fatal("no reference output")
 	}
-	for _, c := range []struct {
-		name   string
-		static bool
-		lib    string
-	}{{"shared_lib", false, libSo}, {"object", false, libO}, {"static", true, libO}} {
-		t.Run(c.name, func(t *testing.T) {
-			in := &driver.LinkInput{Objects: []*elf.Object{u.Obj}, Static: c.static}
-			for _, f := range []string{mainO, c.lib} {
-				if err := in.AddFile(f); err != nil {
-					t.Fatal(err)
-				}
-			}
-			img, diags := driver.Link(in)
-			if img == nil {
-				t.Fatal(diags)
-			}
-			exe := filepath.Join(tmp, "tls_"+c.name)
-			if err := os.WriteFile(exe, img, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			cmd := exec.Command(exe)
-			cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+tmp)
-			out, err := cmd.CombinedOutput()
-			if err != nil || string(out) != want {
-				t.Errorf("%v\ngot:\n%s\nwant:\n%s", err, out, want)
-			}
-		})
+	in := &driver.LinkInput{Objects: []*elf.Object{u.Obj}}
+	for _, s := range gccSrcs {
+		if err := in.AddFile(gcc.object(t, filepath.Join(tmp, filepath.Base(s)+".pic.o"), s, "-O2", "-fPIC")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, code := run(t, linkTo(t, filepath.Join(tmp, "tls"), in), tmp); got != want || code != 0 {
+		t.Errorf("exit %d\ngot:\n%s\nwant:\n%s", code, got, want)
 	}
 }

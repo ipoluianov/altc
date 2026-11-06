@@ -1234,7 +1234,7 @@ func (pp *Preprocessor) readFrom(d IncludeDir, name string) (string, []byte, boo
 		if err != nil {
 			return "", nil, false
 		}
-		return "<altc>/" + name, data, true
+		return "<altc>/" + p, data, true // the path inside the FS: unique per directory
 	}
 	p := filepath.Join(d.Path, name)
 	data, err := pp.cfg.ReadFile(p)
@@ -1263,13 +1263,11 @@ func (pp *Preprocessor) findInclude(s *source, name string, quoted, next bool) (
 		if s.dir != "" || s.file != nil {
 			dir := s.dir
 			if s.embedDir() {
-				// a built-in header including "x.h": look next to it in the FS
-				for i, d := range pp.cfg.Dirs {
-					if d.Embedded != nil {
-						if p, data, ok := pp.readFrom(IncludeDir{Path: path.Join(d.Path, path.Dir(strings.TrimPrefix(s.path, "<altc>/"))), Embedded: d.Embedded}, name); ok {
-							p = "<altc>/" + path.Join(path.Dir(strings.TrimPrefix(s.path, "<altc>/")), name)
-							return &foundFile{path: p, data: data, dirIdx: i, dir: ""}, true
-						}
+				// a built-in header including "x.h": look next to it in its FS
+				if s.dirIdx >= 0 && pp.cfg.Dirs[s.dirIdx].Embedded != nil {
+					p := path.Join(path.Dir(strings.TrimPrefix(s.path, "<altc>/")), name)
+					if data, err := fs.ReadFile(pp.cfg.Dirs[s.dirIdx].Embedded, p); err == nil {
+						return &foundFile{path: "<altc>/" + p, data: data, dirIdx: s.dirIdx}, true
 					}
 				}
 			} else {

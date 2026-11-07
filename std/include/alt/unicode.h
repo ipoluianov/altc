@@ -37,6 +37,21 @@ ALT__UNICODE_TABLES(ALT__UNICODE_DECL)
 #undef ALT__UNICODE_DECL
 
 bool alt_unicode_is(const alt_unicode_table *t, int32_t r);
+/* every category ("Lu", "LC", "Cn"...), script ("Greek"...) and
+   case-folding table by name (Go's Categories, Scripts, FoldCategory,
+   FoldScript), and the category aliases ("Uppercase_Letter" -> "Lu") */
+typedef struct {
+	const char *name;
+	const alt_unicode_table *table;
+} alt_unicode_group;
+extern const alt_unicode_group alt__unicode_categories[], alt__unicode_scripts[], alt__unicode_fold_categories[],
+	alt__unicode_fold_scripts[];
+extern const size_t alt__unicode_ncategories, alt__unicode_nscripts, alt__unicode_nfold_categories, alt__unicode_nfold_scripts;
+extern const char *const alt__unicode_category_aliases[][2];
+extern const size_t alt__unicode_ncategory_aliases;
+/* a table of one of those lists by exact name, NULL if absent */
+const alt_unicode_table *alt_unicode_group_find(const alt_unicode_group *g, size_t n, const char *name);
+
 /* the table of a category or property by name ("Lu", "White_Space"), NULL if unknown */
 const alt_unicode_table *alt_unicode_category(const char *name);
 

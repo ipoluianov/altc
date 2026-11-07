@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	encoding_asn1 "encoding/asn1"
 	"encoding/hex"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/cryptobyte/asn1"
+	"golang.org/x/net/http2/hpack"
 )
 
 func unhex(s string) []byte {
@@ -49,6 +51,10 @@ func answer(f []string) string {
 		return hex.EncodeToString(aead.Seal(nil, n, p, a))
 	case "der": // kind hex: parse one value with cryptobyte
 		return der(f[1], unhex(f[2]))
+	case "hpe": // ops: encode with one encoder
+		return hpackEncode(f[1:])
+	case "hpd": // max-table max-string blocks...: decode with one decoder
+		return hpackDecode(f[1:])
 	}
 	return "unknown"
 }
@@ -104,4 +110,65 @@ func der(kind string, b []byte) string {
 		return "fail"
 	}
 	return res + fmt.Sprintf(" rest=%d", len(s))
+}
+
+// hpackEncode: ops "S<size>" (SetMaxDynamicTableSize), "L<size>"
+// (SetMaxDynamicTableSizeLimit), "F<name hex>:<value hex>" or
+// "f..." (sensitive), "B" (ends a block); the blocks in hex
+func hpackEncode(ops []string) string {
+	var buf bytes.Buffer
+	e := hpack.NewEncoder(&buf)
+	var blocks []string
+	for _, op := range ops {
+		switch op[0] {
+		case 'S', 'L':
+			var n uint32
+			fmt.Sscanf(op[1:], "%d", &n)
+			if op[0] == 'S' {
+				e.SetMaxDynamicTableSize(n)
+			} else {
+				e.SetMaxDynamicTableSizeLimit(n)
+			}
+		case 'F', 'f':
+			nv := strings.SplitN(op[1:], ":", 2)
+			e.WriteField(hpack.HeaderField{Name: string(unhex(nv[0])), Value: string(unhex(nv[1])), Sensitive: op[0] == 'f'})
+		case 'B':
+			blocks = append(blocks, hex.EncodeToString(buf.Bytes()))
+			buf.Reset()
+		}
+	}
+	return strings.Join(blocks, " ")
+}
+
+// hpackDecode: each block's fields ("ok" name:value[:s] in hex) or the error, which ends it
+func hpackDecode(f []string) string {
+	var max, maxStr uint32
+	fmt.Sscanf(f[0], "%d", &max)
+	fmt.Sscanf(f[1], "%d", &maxStr)
+	d := hpack.NewDecoder(max, nil)
+	d.SetMaxStringLength(int(maxStr))
+	var res []string
+	for _, b := range f[2:] {
+		if strings.HasPrefix(b, "T") { // a table size change by the decoder's side
+			var n uint32
+			fmt.Sscanf(b[1:], "%d", &n)
+			d.SetAllowedMaxDynamicTableSize(n)
+			continue
+		}
+		hf, err := d.DecodeFull(unhex(b))
+		if err != nil {
+			res = append(res, "err "+err.Error())
+			break
+		}
+		var fs []string
+		for _, x := range hf {
+			s := hex.EncodeToString([]byte(x.Name)) + ":" + hex.EncodeToString([]byte(x.Value))
+			if x.Sensitive {
+				s += ":s"
+			}
+			fs = append(fs, s)
+		}
+		res = append(res, "ok "+strings.Join(fs, ","))
+	}
+	return strings.Join(res, " | ")
 }

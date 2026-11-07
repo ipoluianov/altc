@@ -172,3 +172,18 @@ int32_t alt_unicode_simple_fold(int32_t r) {
 	int32_t l = alt_unicode_to_lower(r);
 	return l != r ? l : alt_unicode_to_upper(r);
 }
+
+const alt_unicode_table *alt_unicode_group_find(const alt_unicode_group *g, size_t n, const char *name) {
+	size_t lo = 0, hi = n;
+	while (lo < hi) {
+		size_t m = lo + (hi - lo) / 2;
+		int c = strcmp(g[m].name, name);
+		if (c == 0)
+			return g[m].table;
+		if (c < 0)
+			lo = m + 1;
+		else
+			hi = m;
+	}
+	return 0;
+}

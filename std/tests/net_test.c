@@ -265,8 +265,8 @@ static void deadline_main(void *arg) {
 	alt_conn_close(s);
 	/* accept with a cancelled context */
 	alt_ctx *ctx;
+	t0 = alt_now(); /* before the context: its deadline counts from its creation */
 	alt_ctx_with_timeout(&ctx, 0, 15 * ALT_MS);
-	t0 = alt_now();
 	CHECK_ERR(alt_accept(l, &s, ctx), -ETIMEDOUT);
 	CHECK(alt_since(t0) >= 15 * ALT_MS);
 	alt_ctx_free(ctx);

@@ -1,9 +1,13 @@
 /* A TLS client of the library for tests/stdtls_test.go:
 	tlsc addr [-name n] [-roots ca.pem] [-insecure] [-alpn a,b] [-suites 1301,1303]
-	     [-groups 17,1d] [-cert c.pem k.pem] [-keyupdate]
-   prints "ok <suite> <group> <alpn> <chains>" or "error <message>", then
-   sends each stdin line and prints the answer line ("big N" answers are
-   reported as "big <length> <ok>") */
+	     [-groups 17,1d] [-cert c.pem k.pem] [-keyupdate] [-min 303] [-max 303]
+	     [-conns N] [-v]
+   prints "ok <suite> <group> <alpn> <chains>" (with -v then
+   "v <version> <resumed>") or "error <message>", then sends each stdin
+   line and prints the answer line ("big N" answers are reported as
+   "big <length> <ok>"). With -conns N, N connections share a session
+   cache: the first N-1 only send "ping" and read the answer (which brings
+   TLS 1.3 tickets). */
 #include <alt/crypto/tls.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +18,8 @@ int main(int argc, char **argv) {
 	static const char *alpn[8];
 	static uint16_t suites[8], groups[8];
 	static const alt_tls_cert *certs[1];
-	bool keyupdate = false;
+	bool keyupdate = false, verbose = false;
+	int conns = 1;
 	const char *addr = argv[1];
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "-name"))
@@ -23,6 +28,14 @@ int main(int argc, char **argv) {
 			cfg.insecure_skip_verify = true;
 		else if (!strcmp(argv[i], "-keyupdate"))
 			keyupdate = true;
+		else if (!strcmp(argv[i], "-v"))
+			verbose = true;
+		else if (!strcmp(argv[i], "-conns"))
+			conns = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-min"))
+			cfg.min_version = (uint16_t)strtol(argv[++i], 0, 16);
+		else if (!strcmp(argv[i], "-max"))
+			cfg.max_version = (uint16_t)strtol(argv[++i], 0, 16);
 		else if (!strcmp(argv[i], "-roots")) {
 			alt_x509_pool *p = alt_x509_pool_new();
 			FILE *f = fopen(argv[++i], "rb");
@@ -59,16 +72,33 @@ int main(int argc, char **argv) {
 			i += 2;
 		}
 	}
+	if (conns > 1)
+		cfg.session_cache = alt_tls_session_cache_new(0);
 	alt_tls_conn *t;
-	int rc = alt_tls_dial(&t, "tcp", addr, &cfg, 0);
-	if (rc < 0) {
-		printf("error %s\n", t ? alt_tls_error(t) : alt_strerror(rc));
-		return 0;
+	int rc;
+	for (int k = 0;; k++) {
+		t = 0;
+		rc = alt_tls_dial(&t, "tcp", addr, &cfg, 0);
+		if (rc < 0) {
+			printf("error %s\n", t ? alt_tls_error(t) : alt_strerror(rc));
+			return 0;
+		}
+		alt_tls_state st;
+		alt_tls_connection_state(t, &st);
+		printf("ok %04x %04x %s %zu\n", st.cipher_suite, st.group, st.alpn[0] ? st.alpn : "-", st.nverified_chains);
+		if (verbose)
+			printf("v %04x %d\n", st.version, st.did_resume);
+		fflush(stdout);
+		if (k == conns - 1)
+			break;
+		char b[512];
+		ssize_t n;
+		if (alt_tls_write(t, "ping\n", 5) < 0 || (n = alt_tls_read(t, b, sizeof b)) <= 0) {
+			printf("ping error %s\n", alt_tls_error(t));
+			return 0;
+		}
+		alt_tls_close(t);
 	}
-	alt_tls_state st;
-	alt_tls_connection_state(t, &st);
-	printf("ok %04x %04x %s %zu\n", st.cipher_suite, st.group, st.alpn[0] ? st.alpn : "-", st.nverified_chains);
-	fflush(stdout);
 	if (keyupdate)
 		alt_tls_key_update(t);
 	alt_bufreader br;

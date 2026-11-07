@@ -298,25 +298,32 @@ Each stage ends with something usable and tested.
 
 Progress (2026-11-07): stages 1, 2 and 4 are done; 3 partly (io, bufio,
 strings, strconv with Go's ParseInt/ParseUint/Quote, unicode with Go's
-tables; containers and sort to come); 5 nearly (server and client over
-HTTP and HTTPS, transparent gzip as Go's Transport, mux, files, url,
-mime; multipart, byte ranges and client-side cookies to come); 6 partly
-(hex, base64, json, pem, asn1/DER, log/slog-style logging, flag; base32,
-binary, csv to come); 7 partly (crc32, crc64, adler32, fnv, flate, gzip,
-zlib; archive to come); 8 done for what TLS needs (md5, sha1, sha2, hmac,
+tables; sort, vectors, maps, heaps, lists); 5 done (server and client
+over HTTP, HTTPS and HTTP/2, transparent gzip as Go's Transport, mux,
+files with ranges, url, mime media types, quoted-printable, multipart
+forms, the client's cookie jar, textproto, net/mail, an SMTP client, RFC 2047 encoded words); 6 done (hex, base64, base32, binary
+varints, csv, json, pem, asn1/DER, log/slog-style logging, flag); 7 done (crc32, crc64, adler32, fnv, flate, gzip,
+zlib, archive/tar and archive/zip); 8 done for what TLS needs (md5, sha1, sha2, hmac,
 hkdf, pbkdf2, rand, AES with AES-NI, CTR, CBC, GCM, ChaCha20-Poly1305,
 XChaCha20, X25519, Ed25519, ECDSA and ECDH on P-256/P-384/P-521, RSA
-PKCS #1 v1.5 and PSS; RSA key generation and OAEP to come); 9 mostly
+PKCS #1 v1.5 and PSS signatures, OAEP and PKCS #1 v1.5 encryption, key
+generation with PKCS #1/#8 encoding); 9 mostly
 (X.509 parsing as Go's ParseCertificate, chain verification as Go's
-Verify without policy validation, system roots, PEM, PKCS #8/#1/SEC 1
-keys, TLS 1.3 client and server with HRR, ALPN, SNI, client
-certificates, KeyUpdate; TLS 1.2, session resumption and HTTP/2 to
-come). Each is checked against Go's package by differential tests; TLS
+Verify with policy validation (RFC 5280/9618, mappings and constraints), system roots, PEM, PKCS #8/#1/SEC 1
+keys, TLS 1.3 and TLS 1.2 (ECDHE with AES-GCM, ChaCha20-Poly1305 and
+AES-CBC, extended master secret, downgrade protection) clients and
+servers with HRR, ALPN, SNI, client certificates, KeyUpdate, session
+resumption by tickets in both versions; HTTP/2 (HPACK, flow control,
+GOAWAY, h2c) in the HTTP server and client); 10 started (math/big's
+Int, regexp with Go's syntax, errors and leftmost-first/longest
+matches in linear time, text/template and html/template on JSON data, path, os/exec with Go's error texts and
+context cancellation). Each is checked against Go's package by differential tests; TLS
 against Go's crypto/tls both ways and against public servers.
 
 Toolchain counterparts of the Go commands come alongside: `altc test`
-(test functions in `*_test.c`, like `go test`), later formatting and
-static checks.
+(test functions in `*_test.c`, like `go test`; done: `<alt/testing.h>`
+with Go's runner, matching and output, compared with Go's testing on the
+same suite), later formatting and static checks.
 
 ### Testing
 

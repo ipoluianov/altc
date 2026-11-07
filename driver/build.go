@@ -97,33 +97,7 @@ func (p *Project) Build(ctx context.Context, opt BuildOptions) *BuildResult {
 	if len(files) == 0 {
 		return fail("no .c files in " + p.Dir)
 	}
-	jobs := opt.Jobs
-	if jobs <= 0 {
-		jobs = runtime.NumCPU()
-	}
-	units := make([]*Unit, len(files))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, jobs)
-	for i, f := range files {
-		wg.Add(1)
-		go func(i int, f string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if ctx.Err() != nil {
-				return
-			}
-			rel, _ := filepath.Rel(p.Dir, f)
-			log("compiling %s", rel)
-			data, err := os.ReadFile(f)
-			if err != nil {
-				units[i] = &Unit{Diagnostics: []Diagnostic{{File: f, Severity: SevError, Message: err.Error()}}}
-				return
-			}
-			units[i] = CompileSource(f, data, cfg)
-		}(i, f)
-	}
-	wg.Wait()
+	units := p.compileAll(ctx, files, cfg, opt.Jobs, log)
 	if ctx.Err() != nil {
 		return fail("build cancelled")
 	}
@@ -163,6 +137,38 @@ func (p *Project) Build(ctx context.Context, opt BuildOptions) *BuildResult {
 	res.Duration = time.Since(start)
 	log("done in %.2fs", res.Duration.Seconds())
 	return res
+}
+
+// compileAll compiles the files in parallel (jobs at a time, 0: one per
+// CPU); the units are in the order of files
+func (p *Project) compileAll(ctx context.Context, files []string, cfg *Config, jobs int, log func(string, ...any)) []*Unit {
+	if jobs <= 0 {
+		jobs = runtime.NumCPU()
+	}
+	units := make([]*Unit, len(files))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, jobs)
+	for i, f := range files {
+		wg.Add(1)
+		go func(i int, f string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			rel, _ := filepath.Rel(p.Dir, f)
+			log("compiling %s", rel)
+			data, err := os.ReadFile(f)
+			if err != nil {
+				units[i] = &Unit{Diagnostics: []Diagnostic{{File: f, Severity: SevError, Message: err.Error()}}}
+				return
+			}
+			units[i] = CompileSource(f, data, cfg)
+		}(i, f)
+	}
+	wg.Wait()
+	return units
 }
 
 // WriteExecutable writes the image replacing the file atomically (so a

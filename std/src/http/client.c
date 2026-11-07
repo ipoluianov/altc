@@ -6,6 +6,7 @@
 #include "http_internal.h"
 #include <alt/compress/gzip.h>
 #include <alt/crypto/tls.h>
+#include <alt/net/cookiejar.h>
 #include <alt/errors.h>
 #include <alt/sync.h>
 #include <errno.h>
@@ -28,6 +29,10 @@ struct alt_http_client {
 	alt_http_client_config cfg;
 	alt_mutex mu;
 	pconn *idle;
+	/* HTTP/2 connections, shared by concurrent requests */
+	struct alt__h2_conn *h2[32];
+	size_t nh2;
+	alt_sched *bg;      /* their reader and writer tasks */
 };
 
 typedef struct {
@@ -38,6 +43,7 @@ typedef struct {
 	alt_reader raw;     /* the body as received */
 	alt_gzip_reader *gz; /* decompressing raw, made at the first read */
 	int gz_err;
+	struct alt__h2_stream *h2s; /* the HTTP/2 stream of the response */
 } resp_state;
 
 int alt_http_client_new(alt_http_client **out, const alt_http_client_config *cfg) {
@@ -77,7 +83,21 @@ void alt_http_client_close_idle(alt_http_client *c) {
 	alt_mutex_lock(&c->mu);
 	pconn *list = c->idle;
 	c->idle = 0;
+	/* HTTP/2 connections without streams go too (as Go's CloseIdleConnections) */
+	struct alt__h2_conn *drop[32];
+	size_t nd = 0;
+	for (size_t i = 0; i < c->nh2;) {
+		bool idle;
+		alt__h2_client_idle_since(c->h2[i], &idle);
+		if (idle) {
+			drop[nd++] = c->h2[i];
+			c->h2[i] = c->h2[--c->nh2];
+		} else
+			i++;
+	}
 	alt_mutex_unlock(&c->mu);
+	for (size_t i = 0; i < nd; i++)
+		alt__h2_client_release(drop[i]);
 	while (list) {
 		pconn *n = list->next;
 		pconn_close(list);
@@ -89,7 +109,86 @@ void alt_http_client_free(alt_http_client *c) {
 	if (!c)
 		return;
 	alt_http_client_close_idle(c);
+	alt_mutex_lock(&c->mu);
+	size_t n = c->nh2;
+	struct alt__h2_conn *all[32];
+	memcpy(all, c->h2, n * sizeof *all);
+	c->nh2 = 0;
+	alt_mutex_unlock(&c->mu);
+	for (size_t i = 0; i < n; i++)
+		alt__h2_client_release(all[i]);
+	if (c->bg)
+		alt_sched_stop(c->bg); /* waits for the connections' tasks */
 	free(c);
+}
+
+/* a usable HTTP/2 connection to key (expired idle ones are dropped) */
+static struct alt__h2_conn *take_h2(alt_http_client *c, const char *key) {
+	struct alt__h2_conn *found = 0, *drop[32];
+	size_t nd = 0;
+	alt_time now = alt_now();
+	alt_mutex_lock(&c->mu);
+	for (size_t i = 0; i < c->nh2;) {
+		struct alt__h2_conn *h = c->h2[i];
+		bool idle;
+		alt_time since = alt__h2_client_idle_since(h, &idle);
+		bool usable = alt__h2_client_usable(h);
+		if (!usable || (idle && now - since > c->cfg.idle_timeout)) {
+			drop[nd++] = h;
+			c->h2[i] = c->h2[--c->nh2];
+			continue;
+		}
+		if (!found && strcmp(alt__h2_client_key(h), key) == 0)
+			found = h;
+		i++;
+	}
+	alt_mutex_unlock(&c->mu);
+	for (size_t i = 0; i < nd; i++)
+		alt__h2_client_release(drop[i]);
+	return found;
+}
+
+static void drop_h2(alt_http_client *c, struct alt__h2_conn *h) {
+	bool had = false;
+	alt_mutex_lock(&c->mu);
+	for (size_t i = 0; i < c->nh2; i++)
+		if (c->h2[i] == h) {
+			c->h2[i] = c->h2[--c->nh2];
+			had = true;
+			break;
+		}
+	alt_mutex_unlock(&c->mu);
+	if (had)
+		alt__h2_client_release(h);
+}
+
+/* a new HTTP/2 connection over a connected (and, for https, TLS) connection */
+static int start_h2(alt_http_client *c, alt_conn *nc, alt_tls_conn *tls, const char *key, struct alt__h2_conn **out) {
+	alt_mutex_lock(&c->mu);
+	int rc = 0;
+	if (!c->bg)
+		rc = alt_sched_start(&c->bg);
+	alt_mutex_unlock(&c->mu);
+	if (rc == 0)
+		rc = alt__h2_client_new(out, nc, tls, c->bg, key);
+	if (rc < 0) {
+		if (tls)
+			alt_tls_close(tls);
+		else
+			alt_conn_close(nc);
+		return rc;
+	}
+	alt_mutex_lock(&c->mu);
+	bool kept = c->nh2 < 32;
+	if (kept)
+		c->h2[c->nh2++] = *out;
+	alt_mutex_unlock(&c->mu);
+	if (!kept) {
+		/* the pool is full: this one serves the request, then goes */
+		alt__h2_client_release(*out);
+		return -ENOMEM;
+	}
+	return 0;
 }
 
 /* an idle connection that the server has not closed meanwhile */
@@ -148,8 +247,10 @@ static void put_idle(alt_http_client *c, pconn *pc) {
 		pconn_close(pc);
 }
 
-/* key: "http:host:port" or "https:host:port"; hostname for TLS */
-static int dial(alt_http_client *c, const char *key, const char *hostname, alt_ctx *ctx, pconn **out) {
+/* key: "http:host:port" or "https:host:port"; hostname for TLS; an
+   HTTP/2 connection (ALPN or h2c) comes in *h2 instead */
+static int dial(alt_http_client *c, const char *key, const char *hostname, alt_ctx *ctx, pconn **out, struct alt__h2_conn **h2) {
+	*h2 = 0;
 	pconn *pc = calloc(1, sizeof *pc);
 	if (!pc)
 		return -ENOMEM;
@@ -161,9 +262,9 @@ static int dial(alt_http_client *c, const char *key, const char *hostname, alt_c
 	if (rc == 0) {
 		rc = alt_dial(&pc->c, "tcp", addr, dctx);
 		if (rc == 0 && https) {
-			static const char *const h1[] = {"http/1.1"};
-			alt_tls_config tc = {.alpn = h1, .nalpn = 1, .server_name = hostname, .roots = c->cfg.tls_roots,
-				.insecure_skip_verify = c->cfg.tls_insecure_skip_verify};
+			static const char *const h1[] = {"http/1.1"}, *const h2s[] = {"h2", "http/1.1"};
+			alt_tls_config tc = {.alpn = c->cfg.disable_http2 ? h1 : h2s, .nalpn = c->cfg.disable_http2 ? 1 : 2,
+				.server_name = hostname, .roots = c->cfg.tls_roots, .insecure_skip_verify = c->cfg.tls_insecure_skip_verify};
 			if ((rc = alt_tls_client(&pc->tls, pc->c, &tc)) < 0)
 				alt_conn_close(pc->c);
 			else {
@@ -181,6 +282,14 @@ static int dial(alt_http_client *c, const char *key, const char *hostname, alt_c
 		alt_ctx_free(dctx);
 	}
 	if (rc < 0) {
+		free(pc);
+		return rc;
+	}
+	alt_tls_state ts;
+	if (pc->tls)
+		alt_tls_connection_state(pc->tls, &ts);
+	if ((pc->tls && strcmp(ts.alpn, "h2") == 0) || (!https && c->cfg.h2c && !c->cfg.disable_http2)) {
+		rc = start_h2(c, pc->c, pc->tls, key, h2);
 		free(pc);
 		return rc;
 	}
@@ -342,17 +451,55 @@ int alt_http_client_do(alt_http_client *c, const alt_http_client_request *req, a
 		}
 		/* a reused connection may turn out dead: then once more on a new
 		   one (only without a body, which cannot be sent again) */
+		/* the jar's cookies join the request's header (Go's Client.send) */
+		const alt_http_header *hdr = req->header;
+		alt_http_header *withc = 0;
+		if (c->cfg.jar) {
+			alt_buf cb = ALT_BUF_INIT;
+			alt_str have;
+			if (req->header && alt_http_header_get(req->header, ALT_STR("Cookie"), &have) && have.n)
+				alt_buf_append_str(&cb, have);
+			alt_cookie_jar_header(c->cfg.jar, &u, &cb, 0);
+			if (cb.n) {
+				withc = alt_arena_zalloc(&st->arena, sizeof *withc);
+				if (withc) {
+					alt_http_header_init(withc, &st->arena);
+					for (size_t i = 0; req->header && i < req->header->n; i++)
+						if (!alt_str_eq_fold(req->header->f[i].key, ALT_STR("Cookie")))
+							alt_http_header_add(withc, req->header->f[i].key, req->header->f[i].value);
+					alt_http_header_set(withc, ALT_STR("Cookie"), alt_buf_str(&cb));
+					hdr = withc;
+				}
+			}
+			alt_buf_free(&cb);
+		}
 		pconn *pc = 0;
+		struct alt__h2_stream *h2s = 0;
 		for (int attempt = 0;; attempt++) {
-			pc = take_idle(c, key);
-			bool reused = pc != 0;
-			if (!pc && (rc = dial(c, key, hn, st->ctx, &pc)) < 0)
+			struct alt__h2_conn *h2 = take_h2(c, key);
+			pc = h2 ? 0 : take_idle(c, key);
+			bool reused = pc != 0 || h2 != 0;
+			if (!pc && !h2 && (rc = dial(c, key, hn, st->ctx, &pc, &h2)) < 0)
 				goto fail;
+			if (h2) {
+				bool retry;
+				rc = alt__h2_round_trip(h2, method, &u, hdr, body, body ? length : 0, gzip, c->cfg.user_agent, &st->arena,
+					resp, st->ctx, &h2s, &retry);
+				if (rc < 0) {
+					if (retry || !alt__h2_client_usable(h2))
+						drop_h2(c, h2);
+					/* not processed by the server (GOAWAY, REFUSED_STREAM): once more, without a body to resend */
+					if (retry && attempt < 2 && !body && !alt_ctx_err(st->ctx))
+						continue;
+					goto fail;
+				}
+				break;
+			}
 			alt_conn_set_deadline(pc->c, deadline);
 			alt__conn_set_ctx(pc->c, st->ctx);
 			rc = alt_ctx_err(st->ctx);
 			if (rc == 0)
-				rc = write_request(c, pc, method, &u, req->header, body, length, gzip);
+				rc = write_request(c, pc, method, &u, hdr, body, length, gzip);
 			if (rc == 0) {
 				do
 					rc = alt_http_read_response(&pc->br, &st->arena, c->cfg.max_header_bytes, method, resp);
@@ -370,7 +517,18 @@ int alt_http_client_do(alt_http_client *c, const alt_http_client_request *req, a
 			goto fail;
 		}
 		st->pc = pc;
+		st->h2s = h2s;
 		resp->url = u;
+		if (c->cfg.jar) {
+			/* the response's cookies go to the jar */
+			alt_set_cookie sc[64];
+			size_t nsc = 0;
+			for (size_t i = 0; i < resp->header.n && nsc < 64; i++)
+				if (alt_str_eq_fold(resp->header.f[i].key, ALT_STR("Set-Cookie")) &&
+					alt_http_parse_set_cookie(&st->arena, resp->header.f[i].value, &sc[nsc], 0) == 0)
+					nsc++;
+			alt_cookie_jar_set(c->cfg.jar, &u, sc, nsc, 0);
+		}
 		alt_str loc;
 		bool follow = is_redirect(resp->status) && c->cfg.max_redirects > 0 &&
 			alt_http_header_get(&resp->header, ALT_STR("Location"), &loc) && loc.n;
@@ -397,11 +555,16 @@ int alt_http_client_do(alt_http_client *c, const alt_http_client_request *req, a
 		/* drain a small body to reuse the connection */
 		alt_limit_reader lim;
 		ssize_t k = alt_copy(alt_discard, alt_limit_reader_init(&lim, resp->body, 2 << 10));
-		alt__http_body *rb = resp->internal;
-		if (k >= 0 && rb->done && !resp->close)
-			put_idle(c, pc);
-		else
-			pconn_close(pc);
+		if (h2s) {
+			alt__h2_stream_done(h2s); /* cancels what is left */
+			st->h2s = 0;
+		} else {
+			alt__http_body *rb = resp->internal;
+			if (k >= 0 && rb->done && !resp->close)
+				put_idle(c, pc);
+			else
+				pconn_close(pc);
+		}
 		st->pc = 0;
 		alt_url next, ref;
 		if (alt_url_parse(&st->arena, loc, &ref) < 0 || alt_url_resolve(&st->arena, &u, &ref, &next) < 0) {
@@ -419,6 +582,8 @@ int alt_http_client_do(alt_http_client *c, const alt_http_client_request *req, a
 fail:
 	if (st->pc)
 		pconn_close(st->pc);
+	if (st->h2s)
+		alt__h2_stream_done(st->h2s);
 	alt_ctx_free(st->ctx);
 	alt_arena_free(&st->arena);
 	free(st);
@@ -431,6 +596,8 @@ void alt_http_response_free(alt_http_response *r) {
 	resp_state *st = r->internal;
 	if (!st)
 		return;
+	if (st->h2s)
+		alt__h2_stream_done(st->h2s);
 	if (st->pc) {
 		/* the body was read to its end: the connection can serve again */
 		const alt__http_body *b = st->raw.obj;
@@ -469,10 +636,28 @@ int alt_http_post(alt_http_client *c, const char *url, const char *content_type,
 	alt_http_header h;
 	alt_http_header_init(&h, &a);
 	alt_http_header_set_cstr(&h, "Content-Type", content_type);
-	alt_str_reader sr;
-	alt_reader rd = alt_str_reader_init(&sr, body);
-	alt_http_client_request req = {"POST", url, &h, &rd, (int64_t)body.n};
+	/* with HTTP/2 the body is read while the response comes: it lives with the response */
+	struct {
+		alt_str_reader sr;
+		alt_reader rd;
+		char data[];
+	} *pb = malloc(sizeof *pb + body.n + 1);
+	if (!pb) {
+		alt_arena_free(&a);
+		return -ENOMEM;
+	}
+	memcpy(pb->data, body.p, body.n);
+	pb->rd = alt_str_reader_init(&pb->sr, alt_str_make(pb->data, body.n));
+	alt_http_client_request req = {"POST", url, &h, &pb->rd, (int64_t)body.n};
 	int rc = alt_http_client_do(c, &req, resp, ctx);
 	alt_arena_free(&a);
+	if (rc < 0 || alt_arena_defer((*resp)->arena, free, pb) < 0) {
+		if (rc == 0) {
+			alt_http_response_free(*resp);
+			*resp = 0;
+			rc = -ENOMEM;
+		}
+		free(pb);
+	}
 	return rc;
 }

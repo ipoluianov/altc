@@ -97,8 +97,44 @@ func skipDir(name string) bool {
 	return strings.HasPrefix(name, ".") || name == "build" || name == "node_modules"
 }
 
-// SourceFiles returns the absolute paths of the .c files to compile, sorted
+// IsTestFile tells a test source (name_test.c), which "altc test" builds
+// and the ordinary build leaves out, as Go does with _test.go files
+func IsTestFile(path string) bool {
+	return strings.HasSuffix(filepath.Base(path), "_test.c")
+}
+
+// SourceFiles returns the absolute paths of the files to compile, sorted
+// (the test files left out)
 func (p *Project) SourceFiles() ([]string, error) {
+	all, err := p.allSources()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, f := range all {
+		if !IsTestFile(f) {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
+// TestFiles returns the absolute paths of the *_test.c files, sorted
+func (p *Project) TestFiles() ([]string, error) {
+	all, err := p.allSources()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, f := range all {
+		if IsTestFile(f) {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
+func (p *Project) allSources() ([]string, error) {
 	excluded := map[string]bool{}
 	for _, e := range p.Exclude {
 		excluded[p.abs(e)] = true

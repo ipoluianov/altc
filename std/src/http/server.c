@@ -15,53 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { PRE_BUFFER = 2048, MAX_POST_HANDLER_READ = 256 << 10 };
-enum { CONN_NEW, CONN_ACTIVE, CONN_IDLE, CONN_DONE };
-
-typedef struct alt__http_conn {
-	struct alt_http_server *srv;
-	alt_conn *c;
-	alt_tls_conn *tls;          /* HTTPS */
-	alt_bufreader br;
-	alt_bufwriter bw;
-	alt_arena arena;
-	_Atomic int state;
-	struct alt__http_conn *prev, *next;
-	char remote[80];
-	bool hijacked;
-	bool werr; /* writing failed: the connection is done */
-} conn;
-
-struct alt_http_server {
-	alt_http_server_config cfg;
-	alt_sched **workers;
-	int nworkers;
-	_Atomic unsigned rr;
-	alt_mutex mu;
-	alt_listener *listeners[8];
-	int nlisteners;
-	conn *conns;
-	_Atomic bool shutting_down, closed;
-	alt_waitgroup active;
-	alt_ctx *base;
-	alt_addr addr;
-	bool has_addr;
-};
-
-struct alt_http_rw {
-	conn *hc;
-	alt_http_request *req;
-	alt_http_header header;
-	int status;
-	bool wrote_header, sent, chunked, close_after, hijacked, finished;
-	bool head, body_allowed;
-	char *pre;
-	size_t npre;
-	int64_t declared;   /* Content-Length set by the handler, -1 none */
-	uint64_t written;
-	int err;
-};
-
 /* ---- dates, cached per second and thread ---- */
 
 static __thread int64_t date_sec = -1;
@@ -88,6 +41,8 @@ int alt_http_rw_status(const alt_http_rw *w) { return w->status ? w->status : 20
 static bool body_allowed_for(int code) { return !(code >= 100 && code <= 199) && code != 204 && code != 304; }
 
 static int put_raw(alt_http_rw *w, const void *p, size_t n) {
+	if (w->h2)
+		return alt__h2_send_data(w->h2, p, n, false);
 	if (w->hc->werr)
 		return -EPIPE;
 	ssize_t k = alt_bufwriter_write(&w->hc->bw, p, n);
@@ -102,6 +57,8 @@ static int put_raw(alt_http_rw *w, const void *p, size_t n) {
 static int put_body(alt_http_rw *w, const void *p, size_t n) {
 	if (n == 0 || w->head || !w->body_allowed)
 		return 0;
+	if (w->h2)
+		return alt__h2_send_data(w->h2, p, n, false);
 	if (w->chunked) {
 		char hdr[24];
 		int k = snprintf(hdr, sizeof hdr, "%zx\r\n", n);
@@ -140,6 +97,9 @@ static int send_header(alt_http_rw *w, bool finishing) {
 		alt_http_header_del(h, ALT_STR("Transfer-Encoding"));
 		if (code == 204)
 			alt_http_header_del(h, ALT_STR("Content-Length"));
+	} else if (w->h2) {
+		/* HTTP/2 frames the body itself */
+		alt_http_header_del(h, ALT_STR("Transfer-Encoding"));
 	} else if (!has_cl && !w->head) {
 		bool is11 = r->proto_major == 1 && r->proto_minor >= 1;
 		if (is11 && (!has_te || alt_http_header_has_token(h, "Transfer-Encoding", "chunked"))) {
@@ -152,6 +112,16 @@ static int send_header(alt_http_rw *w, bool finishing) {
 		long long v;
 		if (alt_str_to_int(alt_str_trim(cl.p ? cl : alt_http_header_value(h, "Content-Length"), " \t"), 10, &v) == 0 && v >= 0)
 			w->declared = v;
+	}
+	if (w->h2) {
+		/* the end of the stream comes with the header when there is nothing else */
+		bool end = finishing && (w->npre == 0 || w->head || !w->body_allowed);
+		int rc = alt__h2_send_headers(w->h2, code, h, end);
+		w->sent = true;
+		if (rc == 0 && w->npre && !w->head && w->body_allowed)
+			rc = alt__h2_send_data(w->h2, w->pre, w->npre, finishing);
+		w->npre = 0;
+		return rc;
 	}
 	if (atomic_load(&w->hc->srv->shutting_down) || r->close)
 		w->close_after = true;
@@ -186,6 +156,8 @@ int alt_http_rw_write_header(alt_http_rw *w, int status) {
 		/* an informational response goes out at once, with the header */
 		if (w->sent)
 			return -ALT_EHTTP_WRITTEN;
+		if (w->h2)
+			return alt__h2_send_headers(w->h2, status, &w->header, false);
 		alt_buf b = ALT_BUF_INIT;
 		alt_buf_printf(&b, "HTTP/1.1 %d %s\r\n", status, alt_http_status_text(status));
 		alt_http_header_write(&w->header, &b);
@@ -259,6 +231,8 @@ int alt_http_rw_flush(alt_http_rw *w) {
 		if (rc)
 			return rc;
 	}
+	if (w->h2)
+		return 0; /* the connection's writer sends what is queued */
 	int rc = alt_bufwriter_flush(&w->hc->bw);
 	if (rc)
 		w->hc->werr = true;
@@ -269,12 +243,19 @@ static ssize_t rw_write(void *obj, const void *p, size_t n) { return alt_http_rw
 alt_writer alt_http_rw_writer(alt_http_rw *w) { return (alt_writer){rw_write, w}; }
 
 /* after the handler returned */
-static void finish(alt_http_rw *w) {
+void alt__http_rw_finish(alt_http_rw *w) {
 	if (w->hijacked || w->finished)
 		return;
 	w->finished = true;
 	if (!w->wrote_header)
 		alt_http_rw_write_header(w, 200);
+	if (w->h2) {
+		if (!w->sent)
+			send_header(w, true);
+		else if (!alt__h2_stream_ended(w->h2))
+			alt__h2_send_data(w->h2, 0, 0, true);
+		return;
+	}
 	if (!w->sent)
 		send_header(w, true);
 	else if (w->chunked)
@@ -301,6 +282,8 @@ void alt_http_not_found(alt_http_rw *w, alt_http_request *r) {
 }
 
 int alt_http_rw_hijack(alt_http_rw *w, alt_conn **c, alt_bufreader **br) {
+	if (w->h2)
+		return -ALT_EHTTP_UNSUPPORTED; /* as Go: HTTP/2 connections cannot be hijacked */
 	if (w->hijacked)
 		return -ALT_EHTTP_HIJACKED;
 	if (w->sent)
@@ -511,10 +494,38 @@ static void reject(conn *hc, int code, const char *text) {
 
 static void set_state(conn *hc, int st) { atomic_store(&hc->state, st); }
 
+static alt_time header_timeout_of(const alt_http_server_config *cfg) {
+	alt_dur d = cfg->read_header_timeout ? cfg->read_header_timeout : cfg->read_timeout;
+	return d ? alt_deadline(d) : ALT_FOREVER;
+}
+
 static void serve_conn(void *arg) {
 	conn *hc = arg;
 	alt_http_server *s = hc->srv;
 	const alt_http_server_config *cfg = &s->cfg;
+	/* HTTP/2: chosen by ALPN, or (h2c) a client starting with the preface */
+	if (hc->tls) {
+		alt_conn_set_deadline(hc->c, header_timeout_of(cfg) == ALT_FOREVER ? alt_deadline(10 * ALT_SEC) : header_timeout_of(cfg));
+		int rc = alt_tls_handshake(hc->tls);
+		alt_conn_set_deadline(hc->c, ALT_FOREVER);
+		if (rc < 0) {
+			conn_log(s, "http: TLS handshake error from %s: %s", hc->remote, alt_tls_error(hc->tls));
+			return;
+		}
+		alt_tls_state st;
+		alt_tls_connection_state(hc->tls, &st);
+		if (strcmp(st.alpn, "h2") == 0) {
+			alt__h2_serve(hc);
+			return;
+		}
+	} else if (cfg->h2c) {
+		alt_str pre;
+		alt_conn_set_read_deadline(hc->c, header_timeout_of(cfg));
+		if (alt_bufreader_peek(&hc->br, 3, &pre) == 0 && memcmp(pre.p, "PRI", 3) == 0) {
+			alt__h2_serve(hc);
+			return;
+		}
+	}
 	size_t max_header = cfg->max_header_bytes ? cfg->max_header_bytes : 1 << 20;
 	alt_dur header_timeout = cfg->read_header_timeout ? cfg->read_header_timeout : cfg->read_timeout;
 	alt_dur idle = cfg->idle_timeout ? cfg->idle_timeout : cfg->read_timeout;
@@ -585,7 +596,7 @@ static void serve_conn(void *arg) {
 			} else if (!alt_str_eq_fold(expect, ALT_STR("100-continue"))) {
 				w.close_after = true;
 				alt_http_error(&w, "417 Expectation Failed", 417);
-				finish(&w);
+				alt__http_rw_finish(&w);
 				alt_ctx_free(ctx);
 				break;
 			}
@@ -603,7 +614,7 @@ static void serve_conn(void *arg) {
 			alt_ctx_free(ctx);
 			return; /* the connection is the handler's now */
 		}
-		finish(&w);
+		alt__http_rw_finish(&w);
 		alt_ctx_free(ctx);
 		if (hc->werr || w.close_after || r->close)
 			break;
@@ -721,9 +732,14 @@ int alt_http_server_serve(alt_http_server *s, alt_listener *l) {
 		alt_tls_conn *tc = 0;
 		if (hc && s->cfg.tls) {
 			alt_tls_config tcfg = *s->cfg.tls;
-			static const char *const h1[] = {"http/1.1"};
-			if (!tcfg.nalpn)
-				tcfg.alpn = h1, tcfg.nalpn = 1;
+			static const char *const h1[] = {"http/1.1"}, *const h2[] = {"h2", "http/1.1"};
+			if (!tcfg.nalpn) {
+				/* Go's default: HTTP/2 offered first */
+				if (s->cfg.disable_http2)
+					tcfg.alpn = h1, tcfg.nalpn = 1;
+				else
+					tcfg.alpn = h2, tcfg.nalpn = 2;
+			}
 			if (alt_tls_server(&tc, c, &tcfg) < 0)
 				tc = 0;
 		}

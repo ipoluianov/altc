@@ -795,6 +795,10 @@ static bool process_extensions(ctx *c, alt_x509_cert *out) {
 						wrapped = alt_der_make(tmp, b.n + 2);
 						if (!alt_der_read_int64(&wrapped, &v))
 							FAIL("x509: invalid policy constraints extension");
+						if (t == 0)
+							out->require_explicit_policy = v, out->require_explicit_policy_zero = v == 0;
+						else
+							out->inhibit_policy_mapping = v, out->inhibit_policy_mapping_zero = v == 0;
 					}
 				break;
 			}
@@ -855,6 +859,8 @@ static bool process_extensions(ctx *c, alt_x509_cert *out) {
 						alt_der_read_oid(&w, &o);
 					}
 					PUSH(c, out->policies, out->npolicies, o);
+					size_t np = out->npolicies - 1;
+					PUSH(c, out->policy_oids, np, ob);
 				}
 				break;
 			}
@@ -866,6 +872,7 @@ static bool process_extensions(ctx *c, alt_x509_cert *out) {
 					if (!alt_der_read(&val, &s, ALT_ASN1_SEQUENCE) || !alt_der_read(&s, &a, ALT_ASN1_OID) ||
 						!alt_der_read(&s, &b, ALT_ASN1_OID))
 						FAIL("x509: invalid policy mappings extension");
+					PUSH(c, out->policy_mappings, out->npolicy_mappings, ((alt_x509_policy_mapping){a, b}));
 				}
 				break;
 			}
@@ -873,6 +880,7 @@ static bool process_extensions(ctx *c, alt_x509_cert *out) {
 				int64_t v;
 				if (!alt_der_read_int64(&val, &v))
 					FAIL("x509: invalid inhibit any policy extension");
+				out->inhibit_any_policy = v, out->inhibit_any_policy_zero = v == 0;
 				break;
 			}
 			default:

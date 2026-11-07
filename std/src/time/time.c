@@ -788,7 +788,8 @@ int alt_wall_parse(alt_str v, const char *layout, alt_wall *t, alt_zone *zout) {
 		d.offset = zone_offset;
 		if (!(zone_offset == 0 && (zone_name.n == 0 || alt_str_eq_cstr(zone_name, "UTC")))) {
 			z = alt_zone_fixed("", zone_offset);
-			memcpy(z.name, zone_name.p, zone_name.n < 15 ? zone_name.n : 15);
+			if (zone_name.n) /* zone_name.p may be NULL */
+				memcpy(z.name, zone_name.p, zone_name.n < 15 ? zone_name.n : 15);
 			z.name[zone_name.n < 15 ? zone_name.n : 15] = 0;
 		}
 	} else if (zone_name.n) {

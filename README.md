@@ -14,7 +14,26 @@ go build -o altc .
 ./altc init hello        # altc.json + main.c
 ./altc run hello         # build and run
 ./altc build myproject   # build a folder into myproject/build/<name>
+./altc test myproject    # run the tests of its *_test.c files
 ./altc                   # open the IDE (or: altc ide <folder>)
+```
+
+`altc test` is `go test` for C. Files named `*_test.c` hold functions
+`void TestXxx(alt_test *t)` and `void BenchmarkXxx(alt_bench *b)`
+(`<alt/testing.h>`); they are built with the project's other sources
+(whose `main` gives way to the test runner) and left out of ordinary
+builds. The flags (`-v`, `-run`, `-skip`, `-bench`, `-benchtime`,
+`-count`, `-short`, `-failfast`, `-timeout`, `-parallel`, `-list`, `-c`,
+`-o`), subtests, parallel tests, cleanups, `TestMain` and the output are
+Go's:
+
+```c
+#include <alt/testing.h>
+
+void TestAdd(alt_test *t) {
+    if (add(2, 2) != 4)
+        alt_test_errorf(t, "add(2, 2) = %d, want 4", add(2, 2));
+}
 ```
 
 gcc-style use works too:
@@ -93,35 +112,64 @@ int main(void) {
   `<alt/unicode/utf8.h>`, `<alt/errors.h>` (negative error codes).
 - `<alt/net.h>`: TCP, UDP and Unix sockets with deadlines, IP addresses,
   an own DNS resolver (hosts, resolv.conf, UDP and TCP); `<alt/net/url.h>`;
-  `<alt/net/http.h>`: an HTTP/1.1 server (keep-alive, chunked bodies,
-  timeouts, graceful shutdown, Go 1.22 patterns in the multiplexer, a file
-  server with ranges) and client (connection pool, redirects, transparent
-  gzip); `<alt/mime.h>`.
+  `<alt/net/http.h>`: an HTTP/1.1 and HTTP/2 server (keep-alive, chunked
+  bodies, timeouts, graceful shutdown, Go 1.22 patterns in the
+  multiplexer, a file server with ranges; HTTP/2 by ALPN or h2c) and
+  client (connection pool, HTTP/2 multiplexing, redirects, transparent
+  gzip, cookie jar `<alt/net/cookiejar.h>`); `<alt/net/hpack.h>` (HPACK,
+  byte for byte as Go's); `<alt/mime.h>` (media types, quoted-printable),
+  `<alt/mime/multipart.h>` (multipart bodies and forms).
 - `<alt/strconv.h>`, `<alt/unicode.h>` (classes and case mapping with Go's
   tables), `<alt/log.h>` (structured logging as log/slog, text and JSON),
   `<alt/flag.h>` (command-line flags as Go's flag).
-- `<alt/encoding/{hex,base64,json,pem,asn1}.h>`; `<alt/hash/{crc32,crc64,adler32,fnv}.h>`;
-  `<alt/compress/{flate,gzip,zlib}.h>`.
+- `<alt/math/big.h>`: arbitrary-precision integers as Go's big.Int
+  (Karatsuba, Montgomery exponentiation, GCD, primality).
+- `<alt/regexp.h>`: regular expressions with Go's (RE2) syntax, error
+  texts and matches, in time linear in the input (a Pike VM).
+- `<alt/net/textproto.h>` (text protocols: headers, dot encoding,
+  replies), `<alt/net/mail.h>` (addresses, dates, messages as Go's
+  net/mail), `<alt/net/smtp.h>` (SMTP client with STARTTLS, PLAIN and
+  CRAM-MD5), RFC 2047 encoded words in `<alt/mime.h>`.
+- `<alt/text/template.h>`, `<alt/html/template.h>`: Go's templates on
+  JSON data (`alt_json`), html/template with contextual autoescaping.
+- `<alt/testing.h>`: tests and benchmarks for `altc test` as Go's
+  testing (subtests, parallel tests, cleanups, temporary directories,
+  b.Loop), with go test's flags and output.
+- `<alt/path.h>`: slash-separated paths as Go's path (Clean, Join, Split,
+  Base, Dir, Ext, Match); `<alt/os/exec.h>`: child processes as Go's
+  os/exec (PATH lookup, pipes, environment, directory, context
+  cancellation, Go's error texts).
+- `<alt/sort.h>`, `<alt/vec.h>`, `<alt/map.h>`, `<alt/container/{heap,list}.h>`:
+  sorting (introsort, Go's stable sort), growable arrays, hash maps,
+  heaps and lists, with typed wrappers by macros.
+- `<alt/encoding/{hex,base64,base32,binary,csv,json,pem,asn1}.h>`; `<alt/hash/{crc32,crc64,adler32,fnv}.h>`;
+  `<alt/compress/{flate,gzip,zlib}.h>`; `<alt/archive/{tar,zip}.h>` (tar with
+  USTAR, PAX, GNU and sparse files, written byte for byte as Go's; zip
+  with zip64, stored and deflate).
 - `<alt/crypto/...>`: `hash.h` (MD5, SHA-1, SHA-2, HMAC, random bytes),
   `kdf.h` (HKDF, PBKDF2), `aes.h` (AES-NI, CTR, CBC, GCM),
   `chacha20poly1305.h`, `ed25519.h` (Ed25519, X25519), `ecdsa.h` (P-256,
-  P-384, P-521: ECDSA, ECDH), `rsa.h` (PKCS #1 v1.5, PSS), `x509.h`
-  (certificates, chains, system roots, private keys), `tls.h` (TLS 1.3
-  client and server). `alt_http_listen_and_serve_tls` and `https://` URLs
+  P-384, P-521: ECDSA, ECDH), `rsa.h` (PKCS #1 v1.5 and PSS signatures,
+  OAEP and PKCS #1 v1.5 encryption, key generation), `x509.h`
+  (certificates, chains with policy validation, system roots, private keys), `tls.h` (TLS 1.3
+  and 1.2 clients and servers, session resumption by tickets). `alt_http_listen_and_serve_tls` and `https://` URLs
   in the client use it.
 
 Its tests (`TestStd*`, `TestDiff*`, `TestHTTP*`, `TestMuxAgainstGo`,
 `TestCompress*`, `TestX509*`, `TestTLS*`, `TestHTTPS`, `TestResolver`)
 check it against Go's packages as references (and `tests/goref`, a
-separate module with golang.org/x/crypto from the module cache, for what
+separate module with golang.org/x/crypto and golang.org/x/net from the module cache, for what
 Go's standard library lacks; those tests are skipped without it): the same inputs to Go and to AltC, the outputs compared (time
 layouts, URLs, IP addresses, numbers, JSON, all Unicode code points, log
 records, flag parsing and usage texts, hashes, decompression of valid and
 damaged streams with the same errors at the same offsets, HTTP request
 parsing at the server, the client against Go's client, multiplexer
 decisions, ciphers and signatures, certificate parsing and chain
-verification); data compressed by AltC is decompressed by Go, signatures
-made by AltC are verified by Go, the TLS client and server talk to Go's;
+verification, HPACK encoding and decoding, big integer arithmetic,
+RSA keys and encryption, base32, varints, CSV, media types, multipart,
+cookies, sorting and containers, regular expressions); data compressed by AltC is decompressed by Go, signatures
+made by AltC are verified by Go, the TLS (1.2 and 1.3) and HTTP/2 clients and servers talk to Go's, and
+raw-frame tests check the HTTP/2 server's protocol errors;
 the C tests also run under AddressSanitizer, UndefinedBehaviorSanitizer
 and ThreadSanitizer (with gcc), and gcc -Wall -Wextra checks the sources.
 

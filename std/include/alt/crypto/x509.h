@@ -112,6 +112,10 @@ typedef struct {
 	size_t n;
 } alt_x509_strs;
 
+typedef struct {
+	alt_der issuer, subject;  /* the OIDs' contents */
+} alt_x509_policy_mapping;
+
 typedef struct alt_x509_cert {
 	alt_der raw, raw_tbs, raw_sig_alg, raw_issuer, raw_subject, raw_spki;
 	int version;           /* 1, 2 or 3 */
@@ -144,6 +148,15 @@ typedef struct alt_x509_cert {
 	size_t neku;
 	alt_oid *unknown_eku, *policies, *unhandled_critical;
 	size_t nunknown_eku, npolicies, nunhandled_critical;
+	/* the policies' OIDs as their DER contents (all of them, as Go's
+	   Policies; policies above has n 0 for those that do not fit) */
+	alt_der *policy_oids;
+	alt_x509_policy_mapping *policy_mappings;
+	size_t npolicy_mappings;
+	/* policy constraints and inhibitAnyPolicy, as Go's fields: a value
+	   counts when it is > 0 or its _zero flag is set */
+	int64_t require_explicit_policy, inhibit_policy_mapping, inhibit_any_policy;
+	bool require_explicit_policy_zero, inhibit_policy_mapping_zero, inhibit_any_policy_zero;
 	/* name constraints */
 	bool permitted_dns_critical;
 	alt_x509_strs permitted_dns, excluded_dns, permitted_emails, excluded_emails, permitted_uris, excluded_uris;
@@ -205,6 +218,10 @@ typedef struct {
 	int64_t now;                       /* Unix seconds, 0: the current time */
 	const int *key_usages;             /* ALT_X509_EKU_*, NULL: server auth */
 	size_t nkey_usages;
+	/* the acceptable policies (Go's CertificatePolicies) as OID
+	   contents; none: any policy */
+	const alt_der *certificate_policies;
+	size_t ncertificate_policies;
 } alt_x509_verify_opts;
 
 typedef struct {
@@ -213,8 +230,8 @@ typedef struct {
 } alt_x509_chain;
 
 /* Go's Certificate.Verify: 0 and the valid chains (in a), or
-   -ALT_EX509_VERIFY with Go's message in *why. Policy constraints are
-   not evaluated (chains with them are taken as valid). */
+   -ALT_EX509_VERIFY with Go's message in *why. Certificate policies are
+   validated as Go does (RFC 5280 6.1 with RFC 9618's policy graph). */
 int alt_x509_verify(const alt_x509_cert *leaf, const alt_x509_verify_opts *opts, alt_arena *a, alt_x509_chain **chains,
 	size_t *nchains, const char **why);
 /* Go's VerifyHostname */

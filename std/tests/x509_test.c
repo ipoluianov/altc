@@ -108,14 +108,14 @@ static void parse_and_verify(void) {
 	CHECK_INT(alt_x509_pool_add_pem(inters, inter_pem, strlen(inter_pem)), 1);
 	const char *hosts[] = {"example.com", "www.example.com", "127.0.0.1", "EXAMPLE.COM."};
 	for (int i = 0; i < 4; i++) {
-		alt_x509_verify_opts o = {hosts[i], roots, inters, 1800000000, 0, 0};
+		alt_x509_verify_opts o = {.dns_name = hosts[i], .roots = roots, .intermediates = inters, .now = 1800000000};
 		alt_x509_chain *chains;
 		size_t n;
 		CHECK_OK(alt_x509_verify(leaf, &o, &a, &chains, &n, &why));
 		CHECK_INT(n, 1);
 		CHECK(n == 1 && chains[0].n == 3);
 	}
-	alt_x509_verify_opts o = {"a.b.example.com", roots, inters, 1800000000, 0, 0};
+	alt_x509_verify_opts o = {.dns_name = "a.b.example.com", .roots = roots, .intermediates = inters, .now = 1800000000};
 	alt_x509_chain *chains;
 	size_t n;
 	CHECK_INT(alt_x509_verify(leaf, &o, &a, &chains, &n, &why), -ALT_EX509_VERIFY);

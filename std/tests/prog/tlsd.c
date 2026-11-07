@@ -1,9 +1,11 @@
 /* A TLS echo server of the library for tests/stdtls_test.go:
 	tlsd cert.pem key.pem [cert2.pem key2.pem] [-alpn a,b] [-auth N -ca ca.pem]
+	     [-min 303] [-max 303] [-suites c02b,1301] [-notickets]
    prints "listening <addr>"; every connection answers each line with
 	<line> | <suite> <group> <alpn> <sni> <client cert CN>
-   ("big N" sends N bytes back; "keyupdate" updates the keys first);
-   stops when stdin closes. */
+   ("big N" sends N bytes back; "keyupdate" updates the keys first;
+   "state" answers "state | <version> <resumed>"); stops when stdin
+   closes. */
 #include <alt/crypto/tls.h>
 #include <alt/task.h>
 #include <stdio.h>
@@ -42,7 +44,9 @@ static void serve(void *arg) {
 			for (long i = 0; i < n; i++)
 				alt_buf_append_byte(&out, 'a' + (int)(i % 26));
 			alt_buf_append_byte(&out, '\n');
-		} else {
+		} else if (strcmp(l, "state") == 0)
+			alt_buf_printf(&out, "state | %04x %d\n", st.version, st.did_resume);
+		else {
 			if (strcmp(l, "keyupdate") == 0)
 				alt_tls_key_update(t);
 			alt_str cn = st.npeer_certs ? alt_x509_name_get(&st.peer_certs[0]->subject, &ALT_OID(2, 5, 4, 3)) : ALT_STR("-");
@@ -94,6 +98,17 @@ int main(int argc, char **argv) {
 		if (!strcmp(argv[i], "-alpn") && i + 1 < argc) {
 			for (char *save = 0, *t = strtok_r(argv[++i], ",", &save); t && nalpn < 8; t = strtok_r(0, ",", &save))
 				alpn[nalpn++] = t;
+		} else if (!strcmp(argv[i], "-min") && i + 1 < argc)
+			cfg.min_version = (uint16_t)strtol(argv[++i], 0, 16);
+		else if (!strcmp(argv[i], "-max") && i + 1 < argc)
+			cfg.max_version = (uint16_t)strtol(argv[++i], 0, 16);
+		else if (!strcmp(argv[i], "-notickets"))
+			cfg.session_tickets_disabled = true;
+		else if (!strcmp(argv[i], "-suites") && i + 1 < argc) {
+			static uint16_t suites[16];
+			for (char *save = 0, *t = strtok_r(argv[++i], ",", &save); t && cfg.nsuites < 16; t = strtok_r(0, ",", &save))
+				suites[cfg.nsuites++] = (uint16_t)strtol(t, 0, 16);
+			cfg.cipher_suites = suites;
 		} else if (!strcmp(argv[i], "-auth") && i + 1 < argc)
 			cfg.client_auth = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-ca") && i + 1 < argc) {

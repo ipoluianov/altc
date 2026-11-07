@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ipoluianov/altc/app"
 	"github.com/ipoluianov/altc/driver"
@@ -24,6 +25,11 @@ Usage:
   altc build [dir] [-o file] [-j N]   build the project in dir (default: current dir)
   altc run [dir] [-- args...]         build and run the project
   altc init [dir]                     create altc.json and main.c
+  altc test [dir...] [flags] [-args ...]
+                                      run the tests of *_test.c (as go test:
+                                      -v -run -skip -bench -benchtime -count
+                                      -short -failfast -timeout -parallel
+                                      -list; -c builds the binary only, -o)
   altc [options] files...             compile like gcc
   altc ide [dir]                      open the IDE (also: altc without arguments)
   altc version
@@ -57,6 +63,8 @@ func Main(args []string) int {
 		return cmdBuild(args[1:], true)
 	case "init":
 		return cmdInit(args[1:])
+	case "test":
+		return cmdTest(args[1:])
 	case "version", "--version":
 		fmt.Printf("%s %s\n", app.DisplayName, app.Version)
 		return 0
@@ -150,6 +158,192 @@ func runProgram(path string, args []string, dir string) int {
 		return 1
 	}
 	return 0
+}
+
+// testFlags are passed to the test binary as -test.<name>; the bool
+// ones take no value
+var testFlags = map[string]bool{"v": true, "short": true, "failfast": true, "run": false, "skip": false,
+	"bench": false, "benchtime": false, "count": false, "timeout": false, "parallel": false, "list": false}
+
+func cmdTest(args []string) int {
+	var dirs, binArgs, extra []string
+	out, jobs, compileOnly, verbose, timeout := "", 0, false, false, "10m0s"
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-args" {
+			extra = args[i+1:]
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			dirs = append(dirs, a)
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		name = strings.TrimPrefix(name, "test.")
+		val, hasVal := "", false
+		if k := strings.IndexByte(name, '='); k >= 0 {
+			name, val, hasVal = name[:k], name[k+1:], true
+		}
+		switch name {
+		case "c":
+			compileOnly = true
+			continue
+		case "o", "j":
+			if !hasVal {
+				if i+1 >= len(args) {
+					fmt.Fprintf(os.Stderr, "altc test: flag needs an argument: %s\n", a)
+					return 2
+				}
+				i++
+				val = args[i]
+			}
+			if name == "o" {
+				out = val
+			} else {
+				jobs, _ = strconv.Atoi(val)
+			}
+			continue
+		}
+		isBool, ok := testFlags[name]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "altc test: flag provided but not defined: %s\n", a)
+			return 2
+		}
+		if !isBool && !hasVal {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "altc test: flag needs an argument: %s\n", a)
+				return 2
+			}
+			i++
+			val, hasVal = args[i], true
+		}
+		if name == "v" {
+			verbose = !hasVal || val == "true" || val == "1"
+		}
+		if name == "timeout" {
+			timeout = val
+			continue
+		}
+		if hasVal {
+			binArgs = append(binArgs, "-test."+name+"="+val)
+		} else {
+			binArgs = append(binArgs, "-test."+name)
+		}
+	}
+	binArgs = append(binArgs, "-test.timeout="+timeout)
+	binArgs = append(binArgs, extra...)
+	if len(dirs) == 0 {
+		dirs = []string{"."}
+	}
+	if len(dirs) > 1 && compileOnly && out != "" {
+		fmt.Fprintln(os.Stderr, "altc test: cannot use -o flag with multiple directories")
+		return 2
+	}
+	code := 0
+	for _, dir := range dirs {
+		if c := testDir(dir, binArgs, out, jobs, compileOnly, verbose); c != 0 {
+			code = c
+		}
+	}
+	return code
+}
+
+// testDir builds and runs the tests of one project, printing go test's
+// summary line ("ok  \tname\t0.012s")
+func testDir(dir string, binArgs []string, out string, jobs int, compileOnly, verbose bool) int {
+	p, err := driver.LoadProject(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "altc:", err)
+		return 1
+	}
+	name := p.ExeName()
+	exe := out
+	if exe == "" {
+		if compileOnly {
+			exe = name + ".test"
+		} else {
+			tmp, err := os.MkdirTemp("", "altc-test-")
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "altc:", err)
+				return 1
+			}
+			defer os.RemoveAll(tmp)
+			exe = filepath.Join(tmp, name+".test")
+		}
+	}
+	exe, _ = filepath.Abs(exe)
+	res, _ := p.BuildTest(context.Background(), driver.BuildOptions{Jobs: jobs}, exe)
+	if !res.OK {
+		for _, d := range res.Diagnostics {
+			if d.Message == driver.ErrNoTestFiles.Error() && d.File == "" {
+				fmt.Printf("?   \t%s\t[no test files]\n", name)
+				return 0
+			}
+		}
+		printDiags(res.Diagnostics)
+		fmt.Printf("FAIL\t%s [build failed]\n", name)
+		return 1
+	}
+	printDiags(res.Diagnostics)
+	if compileOnly {
+		return 0
+	}
+	cmd := exec.Command(exe, binArgs...)
+	cmd.Dir = p.Dir
+	cmd.Stdin = nil
+	// -v and benchmarks stream; otherwise the output shows only when
+	// it says more than PASS (as go test with packages)
+	stream := verbose
+	for _, a := range binArgs {
+		if strings.HasPrefix(a, "-test.bench=") || strings.HasPrefix(a, "-test.list=") {
+			stream = true
+		}
+	}
+	var buf strings.Builder
+	if stream {
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	} else {
+		cmd.Stdout, cmd.Stderr = &buf, &buf
+	}
+	start := time.Now()
+	err = cmd.Run()
+	elapsed := time.Since(start)
+	text := buf.String()
+	ok := err == nil
+	if !stream {
+		switch text {
+		case "PASS\n":
+			text = ""
+		case "testing: warning: no tests to run\nPASS\n":
+			text = ""
+			if ok {
+				fmt.Printf("ok  \t%s\t%.3fs [no tests to run]\n", name, elapsed.Seconds())
+				return 0
+			}
+		}
+		fmt.Print(text)
+	}
+	if ok {
+		fmt.Printf("ok  \t%s\t%.3fs\n", name, elapsed.Seconds())
+		return 0
+	}
+	if ee, isExit := err.(*exec.ExitError); isExit {
+		if ee.ExitCode() != 1 || (!stream && !strings.HasSuffix(text, "FAIL\n")) {
+			fmt.Println(exitText(ee))
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "altc:", err)
+	}
+	fmt.Printf("FAIL\t%s\t%.3fs\n", name, elapsed.Seconds())
+	return 1
+}
+
+// exitText is how go test reports the end of a failed binary
+func exitText(ee *exec.ExitError) string {
+	if ee.ExitCode() >= 0 {
+		return fmt.Sprintf("exit status %d", ee.ExitCode())
+	}
+	return ee.String()
 }
 
 func cmdInit(args []string) int {

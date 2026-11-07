@@ -201,6 +201,8 @@ static void block(alt_hash *h, const uint8_t *p) {
 }
 
 void alt_hash_write(alt_hash *h, const void *data, size_t n) {
+	if (n == 0)
+		return;
 	const uint8_t *p = data;
 	size_t bs = alt_hash_block_size(h->kind);
 	h->len += n;

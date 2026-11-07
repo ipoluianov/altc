@@ -1,4 +1,5 @@
-/* AltC standard library: HTTP/1.1 servers and clients (Go's net/http).
+/* AltC standard library: HTTP/1.1 and HTTP/2 servers and clients (Go's
+   net/http).
 
    A server reads requests on its connections and calls a handler for
    each: void handler(alt_http_rw *w, alt_http_request *r, void *arg).
@@ -18,8 +19,12 @@
    end of the path); the most specific pattern wins, and registering
    patterns that conflict fails.
 
+   HTTPS servers and clients speak HTTP/2 when both sides offer it by
+   ALPN, as Go's: the handlers and responses are the same; requests come
+   as "HTTP/2.0".
+
    The client keeps idle connections for reuse, follows redirects and
-   works with "http" URLs (TLS comes with the crypto packages). */
+   works with "http" and "https" URLs. */
 #ifndef ALT_NET_HTTP_H
 #define ALT_NET_HTTP_H
 
@@ -254,9 +259,12 @@ typedef struct {
 	/* errors of connections (malformed requests are answered, not logged) */
 	void (*log)(void *arg, const char *msg);
 	void *log_arg;
-	/* HTTPS: connections are TLS with this configuration ("http/1.1" is
-	   offered by ALPN when it names no protocols) */
+	/* HTTPS: connections are TLS with this configuration ("h2" and
+	   "http/1.1" are offered by ALPN when it names no protocols) */
 	const struct alt_tls_config_s *tls;
+	bool disable_http2;            /* HTTPS without HTTP/2 */
+	bool h2c;                      /* plain connections may speak HTTP/2 with prior knowledge */
+	uint32_t http2_max_concurrent_streams; /* 0: 250 */
 } alt_http_server_config;
 
 typedef struct alt_http_server alt_http_server;
@@ -296,6 +304,12 @@ typedef struct {
 	/* HTTPS: the roots (NULL: the system's), no verification (tests only) */
 	const struct alt_x509_pool *tls_roots;
 	bool tls_insecure_skip_verify;
+	/* HTTP/2 is used when the server agrees (ALPN "h2"); one connection
+	   per host then carries concurrent requests */
+	bool disable_http2;
+	bool h2c;                     /* "http" URLs with HTTP/2 prior knowledge */
+	/* cookies sent and kept (Go's Client.Jar; <alt/net/cookiejar.h>) */
+	struct alt_cookie_jar *jar;
 } alt_http_client_config;
 
 typedef struct alt_http_client alt_http_client;
@@ -317,7 +331,9 @@ typedef struct alt_http_response {
 } alt_http_response;
 
 /* a request to send: method NULL is GET; body may be NULL; content_length
-   -1 sends the body chunked */
+   -1 sends the body chunked (or, with HTTP/2, until it ends). With HTTP/2
+   the body is sent while the response comes, as Go's transport does: it
+   must stay readable until the response is freed */
 typedef struct {
 	const char *method;
 	const char *url;

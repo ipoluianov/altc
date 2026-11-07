@@ -2,6 +2,8 @@
    encodings): Montgomery arithmetic over up to 128 limbs, constant-time
    exponentiation with a fixed 4-bit window, CRT for the private key,
    reductions by shifting in one bit at a time (as Go's bigmod). */
+#include <alt/encoding/asn1.h>
+#include <alt/math/big.h>
 #include <alt/crypto/rsa.h>
 #include <stdbool.h>
 #include <string.h>
@@ -415,4 +417,252 @@ int alt_rsa_sign_pss(const alt_rsa_private *k, alt_hash_kind h, const void *hash
 	memcpy(e + dbn, H, hl);
 	e[em_len - 1] = 0xbc;
 	return private_op(k, em, sig);
+}
+
+/* ---- encryption ---- */
+
+/* x^e mod n of a k-byte big-endian block below n */
+static int public_op(const alt_rsa_public *k, const uint8_t *in, uint8_t *out) {
+	mod m;
+	int rc = check_public(k, &m);
+	if (rc < 0)
+		return rc;
+	if (memcmp(in, k->n, k->nlen) >= 0)
+		return -EINVAL;
+	return encrypt(k, &m, in, out) ? 0 : -ALT_EKEY;
+}
+
+int alt_rsa_encrypt_oaep(const alt_rsa_public *k, alt_hash_kind h, const void *msg, size_t n, const void *label, size_t nlabel,
+	uint8_t *ct) {
+	size_t kn = k->nlen, hl = alt_hash_size(h);
+	if (kn > ALT_RSA_MAX_BYTES)
+		return -ALT_EKEY;
+	if (kn < 2 * hl + 2 || n > kn - 2 * hl - 2)
+		return -EMSGSIZE;
+	uint8_t em[ALT_RSA_MAX_BYTES];
+	/* EM = 0 || seed || DB; DB = lHash || PS || 1 || M */
+	em[0] = 0;
+	uint8_t *seed = em + 1, *db = em + 1 + hl;
+	size_t dbn = kn - hl - 1;
+	alt_hash_data(h, label, nlabel, db);
+	memset(db + hl, 0, dbn - hl - n - 1);
+	db[dbn - n - 1] = 1;
+	memcpy(db + dbn - n, msg, n);
+	int rc = alt_crypto_rand(seed, hl);
+	if (rc < 0)
+		return rc;
+	mgf1_xor(db, dbn, h, seed, hl);
+	mgf1_xor(seed, hl, h, db, dbn);
+	rc = public_op(k, em, ct);
+	memset(em, 0, sizeof em);
+	return rc;
+}
+
+int alt_rsa_encrypt_pkcs1v15(const alt_rsa_public *k, const void *msg, size_t n, uint8_t *ct) {
+	size_t kn = k->nlen;
+	if (kn > ALT_RSA_MAX_BYTES)
+		return -ALT_EKEY;
+	if (kn < 11 || n > kn - 11)
+		return -EMSGSIZE;
+	/* EM = 0 || 2 || PS (nonzero random) || 0 || M */
+	uint8_t em[ALT_RSA_MAX_BYTES];
+	em[0] = 0, em[1] = 2;
+	size_t ps = kn - n - 3;
+	int rc = alt_crypto_rand(em + 2, ps);
+	for (size_t i = 0; rc == 0 && i < ps; i++)
+		while (em[2 + i] == 0 && (rc = alt_crypto_rand(em + 2 + i, 1)) == 0) {
+		}
+	if (rc < 0)
+		return rc;
+	em[2 + ps] = 0;
+	memcpy(em + 3 + ps, msg, n);
+	rc = public_op(k, em, ct);
+	memset(em, 0, sizeof em);
+	return rc;
+}
+
+/* constant-time helpers: all ones when the condition holds */
+static uint64_t ct_is_zero(uint64_t x) { return ((~x & (x - 1)) >> 63) * UINT64_MAX; }
+static uint64_t ct_eq(uint64_t a, uint64_t b) { return ct_is_zero(a ^ b); }
+
+int alt_rsa_decrypt_oaep(const alt_rsa_private *k, alt_hash_kind h, const uint8_t *ct, size_t nct, const void *label, size_t nlabel,
+	uint8_t *out, size_t *nout) {
+	size_t kn = k->pub.nlen, hl = alt_hash_size(h);
+	if (kn > ALT_RSA_MAX_BYTES || nct > kn || kn < 2 * hl + 2)
+		return -ALT_EAUTH;
+	uint8_t c[ALT_RSA_MAX_BYTES] = {0}, em[ALT_RSA_MAX_BYTES];
+	memcpy(c + kn - nct, ct, nct);
+	if (private_op(k, c, em) < 0)
+		return -ALT_EAUTH;
+	uint8_t lhash[ALT_HASH_MAX_SIZE];
+	alt_hash_data(h, label, nlabel, lhash);
+	uint8_t *seed = em + 1, *db = em + 1 + hl;
+	size_t dbn = kn - hl - 1;
+	mgf1_xor(seed, hl, h, db, dbn);
+	mgf1_xor(db, dbn, h, seed, hl);
+	/* everything checked without branches on the secret (Go's decryptOAEP) */
+	uint64_t good = ct_is_zero(em[0]) & (alt_ct_eq(db, lhash, hl) ? UINT64_MAX : 0);
+	uint64_t looking = UINT64_MAX, index = 0, invalid = 0;
+	for (size_t i = hl; i < dbn; i++) {
+		uint64_t eq0 = ct_is_zero(db[i]), eq1 = ct_eq(db[i], 1);
+		index = (looking & eq1 & i) | (~(looking & eq1) & index);
+		looking &= ~eq1;
+		invalid |= looking & ~eq0;
+	}
+	good &= ~invalid & ~looking;
+	if (!good) {
+		memset(em, 0, sizeof em);
+		return -ALT_EAUTH;
+	}
+	size_t mlen = dbn - (size_t)index - 1;
+	memcpy(out, db + index + 1, mlen);
+	*nout = mlen;
+	memset(em, 0, sizeof em);
+	return 0;
+}
+
+int alt_rsa_decrypt_pkcs1v15(const alt_rsa_private *k, const uint8_t *ct, size_t nct, uint8_t *out, size_t *nout) {
+	size_t kn = k->pub.nlen;
+	if (kn > ALT_RSA_MAX_BYTES || nct > kn || kn < 11)
+		return -ALT_EAUTH;
+	uint8_t c[ALT_RSA_MAX_BYTES] = {0}, em[ALT_RSA_MAX_BYTES];
+	memcpy(c + kn - nct, ct, nct);
+	if (private_op(k, c, em) < 0)
+		return -ALT_EAUTH;
+	uint64_t good = ct_is_zero(em[0]) & ct_eq(em[1], 2), looking = UINT64_MAX, index = 0;
+	for (size_t i = 2; i < kn; i++) {
+		uint64_t eq0 = ct_is_zero(em[i]);
+		index = (looking & eq0 & i) | (~(looking & eq0) & index);
+		looking &= ~eq0;
+	}
+	/* at least 8 bytes of padding (Go's decryptPKCS1v15) */
+	good &= ~looking & ((((index - 10) >> 63) ^ 1) * UINT64_MAX);
+	if (!good) {
+		memset(em, 0, sizeof em);
+		return -ALT_EAUTH;
+	}
+	size_t mlen = kn - (size_t)index - 1;
+	memcpy(out, em + index + 1, mlen);
+	*nout = mlen;
+	memset(em, 0, sizeof em);
+	return 0;
+}
+
+/* ---- key generation ---- */
+
+static int to_be(const alt_big *x, uint8_t *out, size_t cap, size_t *n) {
+	*n = alt_big_bytes_len(x);
+	if (*n > cap)
+		return -ERANGE;
+	alt_big_bytes(x, out);
+	return 0;
+}
+
+int alt_rsa_generate(alt_rsa_key *out, int bits) {
+	if (bits < 1024 || bits > 8 * ALT_RSA_MAX_BYTES)
+		return -EINVAL;
+	alt_big p = ALT_BIG_INIT, q = ALT_BIG_INIT, n = ALT_BIG_INIT, e = ALT_BIG_INIT, d = ALT_BIG_INIT, p1 = ALT_BIG_INIT,
+		q1 = ALT_BIG_INIT, g = ALT_BIG_INIT, l = ALT_BIG_INIT, t = ALT_BIG_INIT, dp = ALT_BIG_INIT, dq = ALT_BIG_INIT,
+		qi = ALT_BIG_INIT, one = ALT_BIG_INIT;
+	int rc = alt_big_set_int64(&e, 65537);
+	if (rc == 0)
+		rc = alt_big_set_int64(&one, 1);
+	while (rc == 0) {
+		if ((rc = alt_big_random_prime(&p, (size_t)(bits + 1) / 2)) < 0 || (rc = alt_big_random_prime(&q, (size_t)bits / 2)) < 0)
+			break;
+		if ((rc = alt_big_mul(&n, &p, &q)) < 0)
+			break;
+		if (alt_big_bit_len(&n) != (size_t)bits)
+			continue;
+		/* |p - q| > 2^(bits/2 - 100) (FIPS 186-5 A.1.3) */
+		if ((rc = alt_big_sub(&t, &p, &q)) < 0)
+			break;
+		if (alt_big_bit_len(&t) <= (size_t)(bits / 2 - 100))
+			continue;
+		/* d = e^-1 mod lcm(p-1, q-1) */
+		alt_big_sub(&p1, &p, &one);
+		alt_big_sub(&q1, &q, &one);
+		if ((rc = alt_big_gcd(&g, 0, 0, &p1, &q1)) < 0 || (rc = alt_big_mul(&l, &p1, &q1)) < 0 || (rc = alt_big_quo(&l, &l, &g)) < 0)
+			break;
+		rc = alt_big_mod_inverse(&d, &e, &l);
+		if (rc == -EDOM) {
+			rc = 0;
+			continue; /* e divides p-1 or q-1 */
+		}
+		if (rc < 0)
+			break;
+		/* d > 2^(bits/2) */
+		if (alt_big_bit_len(&d) <= (size_t)(bits / 2))
+			continue;
+		if ((rc = alt_big_mod(&dp, &d, &p1)) < 0 || (rc = alt_big_mod(&dq, &d, &q1)) < 0 || (rc = alt_big_mod_inverse(&qi, &q, &p)) < 0)
+			break;
+		memset(out, 0, sizeof *out);
+		alt_rsa_private *k = &out->k;
+		size_t ln;
+		if ((rc = to_be(&n, out->n, sizeof out->n, &k->pub.nlen)) < 0 || (rc = to_be(&d, out->d, sizeof out->d, &k->dlen)) < 0 ||
+			(rc = to_be(&p, out->p, sizeof out->p, &k->plen)) < 0 || (rc = to_be(&q, out->q, sizeof out->q, &k->qlen)) < 0 ||
+			(rc = to_be(&dp, out->dp, sizeof out->dp, &k->dplen)) < 0 || (rc = to_be(&dq, out->dq, sizeof out->dq, &k->dqlen)) < 0 ||
+			(rc = to_be(&qi, out->qinv, sizeof out->qinv, &ln)) < 0)
+			break;
+		k->qinvlen = ln;
+		k->pub.n = out->n, k->pub.e = 65537;
+		k->d = out->d, k->p = out->p, k->q = out->q, k->dp = out->dp, k->dq = out->dq, k->qinv = out->qinv;
+		break;
+	}
+	alt_big *all[] = {&p, &q, &n, &e, &d, &p1, &q1, &g, &l, &t, &dp, &dq, &qi, &one};
+	for (size_t i = 0; i < sizeof all / sizeof *all; i++) {
+		if (all[i]->w)
+			memset(all[i]->w, 0, all[i]->cap * sizeof(uint64_t));
+		alt_big_free(all[i]);
+	}
+	return rc;
+}
+
+int alt_rsa_marshal_public_pkcs1(const alt_rsa_public *k, alt_buf *b) {
+	alt_der_builder d;
+	alt_der_builder_init(&d, b);
+	alt_der_begin(&d, ALT_ASN1_SEQUENCE);
+	alt_der_add_uint_bytes(&d, k->n, k->nlen);
+	alt_der_add_int64(&d, k->e);
+	alt_der_end(&d);
+	return alt_der_builder_err(&d);
+}
+
+int alt_rsa_marshal_pkcs1(const alt_rsa_private *k, alt_buf *b) {
+	alt_der_builder d;
+	alt_der_builder_init(&d, b);
+	alt_der_begin(&d, ALT_ASN1_SEQUENCE);
+	alt_der_add_int64(&d, 0);
+	alt_der_add_uint_bytes(&d, k->pub.n, k->pub.nlen);
+	alt_der_add_int64(&d, k->pub.e);
+	alt_der_add_uint_bytes(&d, k->d, k->dlen);
+	alt_der_add_uint_bytes(&d, k->p, k->plen);
+	alt_der_add_uint_bytes(&d, k->q, k->qlen);
+	alt_der_add_uint_bytes(&d, k->dp, k->dplen);
+	alt_der_add_uint_bytes(&d, k->dq, k->dqlen);
+	alt_der_add_uint_bytes(&d, k->qinv, k->qinvlen);
+	alt_der_end(&d);
+	return alt_der_builder_err(&d);
+}
+
+int alt_rsa_marshal_pkcs8(const alt_rsa_private *k, alt_buf *b) {
+	alt_buf inner = ALT_BUF_INIT;
+	int rc = alt_rsa_marshal_pkcs1(k, &inner);
+	if (rc == 0) {
+		alt_der_builder d;
+		alt_der_builder_init(&d, b);
+		alt_der_begin(&d, ALT_ASN1_SEQUENCE);
+		alt_der_add_int64(&d, 0);
+		alt_der_begin(&d, ALT_ASN1_SEQUENCE);
+		alt_der_add_oid(&d, &ALT_OID(1, 2, 840, 113549, 1, 1, 1));
+		alt_der_add_null(&d);
+		alt_der_end(&d);
+		alt_der_add(&d, ALT_ASN1_OCTET_STRING, inner.p, inner.n);
+		alt_der_end(&d);
+		rc = alt_der_builder_err(&d);
+	}
+	if (inner.p)
+		memset(inner.p, 0, inner.n);
+	alt_buf_free(&inner);
+	return rc;
 }

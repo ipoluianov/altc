@@ -1014,6 +1014,343 @@ static const char *unknown_authority(vctx *v, const char *hint, const alt_x509_c
 		q(a, alt_str_cstr(hint)), q(a, name));
 }
 
+/* ---- certificate policies (Go's policiesValid: RFC 5280 6.1 as
+   updated by RFC 9618, a graph of policy nodes per depth) ---- */
+
+typedef struct pnode pnode;
+typedef struct {
+	pnode **p;
+	size_t n, cap;
+} pset;
+
+struct pnode {
+	alt_der valid;
+	const alt_der *expected;
+	size_t nexpected;
+	pset parents, children;
+};
+
+typedef struct {
+	alt_arena *a;
+	pset *strata; /* strata[d]: the nodes at depth d */
+	int depth;
+	struct {
+		alt_der e;
+		pnode *n;
+	} * index; /* the parent index: expected policy -> parents */
+	size_t nindex;
+	bool oom;
+} pgraph;
+
+static const uint8_t any_policy_der[] = {0x55, 0x1d, 0x20, 0x00}; /* 2.5.29.32.0 */
+static const alt_der any_policy = {any_policy_der, sizeof any_policy_der};
+
+static bool der_eq(alt_der x, alt_der y) { return x.n == y.n && (x.n == 0 || memcmp(x.p, y.p, x.n) == 0); }
+
+static void pset_add(pgraph *g, pset *s, pnode *n) {
+	for (size_t i = 0; i < s->n; i++)
+		if (s->p[i] == n)
+			return;
+	if (s->n == s->cap) {
+		size_t nc = s->cap ? 2 * s->cap : 4;
+		pnode **np = alt_arena_realloc(g->a, s->p, s->cap * sizeof *s->p, nc * sizeof *s->p);
+		if (!np) {
+			g->oom = true;
+			return;
+		}
+		s->p = np, s->cap = nc;
+	}
+	s->p[s->n++] = n;
+}
+
+static void pset_del(pset *s, pnode *n) {
+	for (size_t i = 0; i < s->n; i++)
+		if (s->p[i] == n) {
+			s->p[i] = s->p[--s->n];
+			return;
+		}
+}
+
+static pnode *stratum_get(pset *s, alt_der policy) {
+	for (size_t i = 0; i < s->n; i++)
+		if (der_eq(s->p[i]->valid, policy))
+			return s->p[i];
+	return 0;
+}
+
+static pnode *pnode_new(pgraph *g, alt_der valid, pnode **parents, size_t np) {
+	pnode *n = alt_arena_alloc(g->a, sizeof *n);
+	alt_der *e = alt_arena_alloc(g->a, sizeof *e);
+	if (!n || !e) {
+		g->oom = true;
+		return 0;
+	}
+	memset(n, 0, sizeof *n);
+	n->valid = valid;
+	*e = valid;
+	n->expected = e, n->nexpected = 1;
+	for (size_t i = 0; i < np; i++) {
+		pset_add(g, &parents[i]->children, n);
+		pset_add(g, &n->parents, parents[i]);
+	}
+	return n;
+}
+
+/* insert replaces the node of that policy at the current depth (a map in Go) */
+static void pg_insert(pgraph *g, pnode *n) {
+	pset *s = &g->strata[g->depth];
+	for (size_t i = 0; i < s->n; i++)
+		if (der_eq(s->p[i]->valid, n->valid)) {
+			s->p[i] = n;
+			return;
+		}
+	pset_add(g, s, n);
+}
+
+static void pg_delete_leaf(pgraph *g, alt_der policy) {
+	pset *s = &g->strata[g->depth];
+	pnode *n = stratum_get(s, policy);
+	if (!n)
+		return;
+	for (size_t i = 0; i < n->parents.n; i++)
+		pset_del(&n->parents.p[i]->children, n);
+	for (size_t i = 0; i < n->children.n; i++)
+		pset_del(&n->children.p[i]->parents, n);
+	pset_del(s, n);
+}
+
+static void pg_prune(pgraph *g) {
+	for (int d = g->depth - 1; d > 0; d--) {
+		pset *s = &g->strata[d];
+		for (size_t i = 0; i < s->n;) {
+			pnode *n = s->p[i];
+			if (n->children.n == 0) {
+				for (size_t k = 0; k < n->parents.n; k++)
+					pset_del(&n->parents.p[k]->children, n);
+				s->p[i] = s->p[--s->n];
+			} else
+				i++;
+		}
+	}
+}
+
+static void pg_incr_depth(pgraph *g) {
+	g->nindex = 0;
+	pset *s = &g->strata[g->depth];
+	size_t total = 0;
+	for (size_t i = 0; i < s->n; i++)
+		total += s->p[i]->nexpected;
+	g->index = alt_arena_alloc(g->a, (total ? total : 1) * sizeof *g->index);
+	if (!g->index) {
+		g->oom = true;
+		return;
+	}
+	for (size_t i = 0; i < s->n; i++)
+		for (size_t k = 0; k < s->p[i]->nexpected; k++) {
+			g->index[g->nindex].e = s->p[i]->expected[k];
+			g->index[g->nindex++].n = s->p[i];
+		}
+	g->depth++;
+}
+
+static bool self_issued(const alt_x509_cert *c) { return der_eq(c->raw_issuer, c->raw_subject); }
+
+static bool policies_valid(alt_arena *a, const alt_x509_cert *const *chain, size_t len, const alt_x509_verify_opts *o) {
+	if (len == 1)
+		return true;
+	int n = (int)len - 1;
+	pgraph g = {.a = a};
+	g.strata = alt_arena_alloc(a, (size_t)(n + 2) * sizeof *g.strata);
+	if (!g.strata)
+		return false;
+	memset(g.strata, 0, (size_t)(n + 2) * sizeof *g.strata);
+	pnode *root = pnode_new(&g, any_policy, 0, 0);
+	if (!root)
+		return false;
+	pset_add(&g, &g.strata[0], root);
+	bool have_graph = true;
+	int64_t inhibit_any = n + 1, explicit_policy = n + 1, policy_mapping = n + 1;
+	for (int i = n - 1; i >= 0; i--) {
+		const alt_x509_cert *cert = chain[i];
+		bool self = self_issued(cert);
+		if (cert->npolicies == 0)
+			have_graph = false;
+		if (explicit_policy == 0 && !have_graph)
+			return false;
+		if (have_graph) {
+			pg_incr_depth(&g);
+			bool has_any = false;
+			for (size_t k = 0; k < cert->npolicies; k++) {
+				alt_der pol = cert->policy_oids[k];
+				if (der_eq(pol, any_policy)) {
+					has_any = true;
+					continue;
+				}
+				/* the parents expecting it, else the anyPolicy parent */
+				pset parents = {0};
+				for (size_t x = 0; x < g.nindex; x++)
+					if (der_eq(g.index[x].e, pol))
+						pset_add(&g, &parents, g.index[x].n);
+				if (parents.n == 0) {
+					pnode *ap = stratum_get(&g.strata[g.depth - 1], any_policy);
+					if (ap)
+						pset_add(&g, &parents, ap);
+				}
+				if (parents.n > 0) {
+					pnode *nn = pnode_new(&g, pol, parents.p, parents.n);
+					if (nn)
+						pg_insert(&g, nn);
+				}
+			}
+			if (has_any && (inhibit_any > 0 || (n - i < n && self))) {
+				/* each expected policy of a parent without a leaf gets one */
+				pset *prev = &g.strata[g.depth - 1], *leaves = &g.strata[g.depth];
+				size_t nmiss = 0;
+				struct {
+					alt_der pol;
+					pset parents;
+				} *miss = 0;
+				size_t capmiss = 0;
+				size_t nleaves = leaves->n; /* the leaves before these insertions */
+				for (size_t pi = 0; pi < prev->n; pi++) {
+					pnode *p = prev->p[pi];
+					for (size_t k = 0; k < p->nexpected; k++) {
+						alt_der e = p->expected[k];
+						bool leaf = false;
+						for (size_t l = 0; l < nleaves && !leaf; l++)
+							leaf = der_eq(leaves->p[l]->valid, e);
+						if (leaf)
+							continue;
+						size_t m = 0;
+						while (m < nmiss && !der_eq(miss[m].pol, e))
+							m++;
+						if (m == nmiss) {
+							if (nmiss == capmiss) {
+								size_t nc = capmiss ? 2 * capmiss : 4;
+								void *np = alt_arena_realloc(a, miss, capmiss * sizeof *miss, nc * sizeof *miss);
+								if (!np)
+									return false;
+								miss = np, capmiss = nc;
+							}
+							miss[nmiss].pol = e;
+							miss[nmiss++].parents = (pset){0};
+						}
+						pset_add(&g, &miss[m].parents, p);
+					}
+				}
+				for (size_t m = 0; m < nmiss; m++) {
+					pnode *nn = pnode_new(&g, miss[m].pol, miss[m].parents.p, miss[m].parents.n);
+					if (nn)
+						pg_insert(&g, nn);
+				}
+			}
+			pg_prune(&g);
+			if (i != 0 && cert->npolicy_mappings > 0) {
+				struct {
+					alt_der issuer;
+					alt_der *subjects;
+					size_t n;
+				} *maps = alt_arena_alloc(a, cert->npolicy_mappings * sizeof *maps);
+				size_t nmaps = 0;
+				if (!maps)
+					return false;
+				for (size_t k = 0; k < cert->npolicy_mappings; k++) {
+					alt_der is = cert->policy_mappings[k].issuer, su = cert->policy_mappings[k].subject;
+					if (policy_mapping > 0) {
+						if (der_eq(is, any_policy) || der_eq(su, any_policy))
+							return false;
+						size_t m = 0;
+						while (m < nmaps && !der_eq(maps[m].issuer, is))
+							m++;
+						if (m == nmaps) {
+							maps[nmaps].issuer = is;
+							maps[nmaps].subjects = alt_arena_alloc(a, cert->npolicy_mappings * sizeof(alt_der));
+							if (!maps[nmaps].subjects)
+								return false;
+							maps[nmaps++].n = 0;
+						}
+						maps[m].subjects[maps[m].n++] = su;
+					} else
+						pg_delete_leaf(&g, is);
+				}
+				pg_prune(&g);
+				for (size_t m = 0; m < nmaps; m++) {
+					pnode *match = stratum_get(&g.strata[g.depth], maps[m].issuer);
+					if (match) {
+						match->expected = maps[m].subjects, match->nexpected = maps[m].n;
+					} else if ((match = stratum_get(&g.strata[g.depth], any_policy))) {
+						pnode *nn = pnode_new(&g, maps[m].issuer, &match, 1);
+						if (nn) {
+							nn->expected = maps[m].subjects, nn->nexpected = maps[m].n;
+							pg_insert(&g, nn);
+						}
+					}
+				}
+			}
+			if (g.oom)
+				return false;
+		}
+		if (i != 0) {
+			if (!self) {
+				if (explicit_policy > 0)
+					explicit_policy--;
+				if (policy_mapping > 0)
+					policy_mapping--;
+				if (inhibit_any > 0)
+					inhibit_any--;
+			}
+			if ((cert->require_explicit_policy > 0 || cert->require_explicit_policy_zero) &&
+				cert->require_explicit_policy < explicit_policy)
+				explicit_policy = cert->require_explicit_policy;
+			if ((cert->inhibit_policy_mapping > 0 || cert->inhibit_policy_mapping_zero) &&
+				cert->inhibit_policy_mapping < policy_mapping)
+				policy_mapping = cert->inhibit_policy_mapping;
+			if ((cert->inhibit_any_policy > 0 || cert->inhibit_any_policy_zero) && cert->inhibit_any_policy < inhibit_any)
+				inhibit_any = cert->inhibit_any_policy;
+		}
+	}
+	if (explicit_policy > 0)
+		explicit_policy--;
+	if (chain[0]->require_explicit_policy_zero)
+		explicit_policy = 0;
+	if (explicit_policy != 0)
+		return true; /* the user-constrained set only matters when explicit */
+	/* the valid policy node set: nodes (not anyPolicy) whose only parent
+	   is anyPolicy, plus the anyPolicy leaf */
+	pset valid = {0};
+	if (have_graph) {
+		for (int d = g.depth; d >= 0; d--)
+			for (size_t i = 0; i < g.strata[d].n; i++) {
+				pnode *x = g.strata[d].p[i];
+				if (der_eq(x->valid, any_policy))
+					continue;
+				if (x->parents.n == 1 && der_eq(x->parents.p[0]->valid, any_policy))
+					pset_add(&g, &valid, x);
+			}
+		pnode *cur_any = stratum_get(&g.strata[g.depth], any_policy);
+		if (cur_any)
+			pset_add(&g, &valid, cur_any);
+	}
+	/* the user's set is {anyPolicy} when empty or only anyPolicy */
+	bool user_any = true;
+	for (size_t k = 0; k < o->ncertificate_policies; k++)
+		if (!der_eq(o->certificate_policies[k], any_policy))
+			user_any = false;
+	if (user_any)
+		return valid.n > 0;
+	/* the authority-constrained set intersected with the user's, or the
+	   user's when the authority's has anyPolicy */
+	bool authority_any = false;
+	for (size_t i = 0; i < valid.n; i++) {
+		if (der_eq(valid.p[i]->valid, any_policy))
+			authority_any = true;
+		for (size_t k = 0; k < o->ncertificate_policies; k++)
+			if (der_eq(valid.p[i]->valid, o->certificate_policies[k]))
+				return true;
+	}
+	return authority_any;
+}
+
 int alt_x509_verify(const alt_x509_cert *leaf, const alt_x509_verify_opts *opts, alt_arena *a, alt_x509_chain **chains,
 	size_t *nchains, const char **why) {
 	alt_x509_verify_opts o = *opts;
@@ -1041,9 +1378,13 @@ int alt_x509_verify(const alt_x509_cert *leaf, const alt_x509_verify_opts *opts,
 	static const int server_auth[1] = {ALT_X509_EKU_SERVER_AUTH};
 	const int *usages = o.nkey_usages ? o.key_usages : server_auth;
 	size_t nusages = o.nkey_usages ? o.nkey_usages : 1;
-	size_t kept = 0, bad_usage = 0;
+	size_t kept = 0, bad_usage = 0, bad_policies = 0;
 	const char *constraint_err = 0;
 	for (size_t i = 0; i < v.n; i++) {
+		if (!policies_valid(a, v.chains[i].certs, v.chains[i].n, &o)) {
+			bad_policies++;
+			continue;
+		}
 		if (!any_usage && !chain_key_usage(&v.chains[i], usages, nusages)) {
 			bad_usage++;
 			continue;
@@ -1059,8 +1400,13 @@ int alt_x509_verify(const alt_x509_cert *leaf, const alt_x509_verify_opts *opts,
 	if (kept == 0) {
 		if (constraint_err)
 			w = alt_arena_printf(a, "x509: a root or intermediate certificate is not authorized to sign for this name: %s", constraint_err);
-		else if (bad_usage)
+		else if (bad_usage && !bad_policies)
 			w = "x509: certificate specifies an incompatible key usage";
+		else if (bad_usage)
+			w = alt_arena_printf(a, "x509: no valid chains built: %zu candidate chains with incompatible key usage, %zu candidate chains with invalid policies",
+				bad_usage, bad_policies);
+		else if (bad_policies)
+			w = alt_arena_printf(a, "x509: no valid chains built: %zu candidate chains with invalid policies", bad_policies);
 		else
 			w = "x509: no valid chains built";
 		goto fail;

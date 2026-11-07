@@ -1,4 +1,4 @@
-/* now dns eku roots(hex,hex..) inters(hex,..) leafhex -> the chains
+/* now dns eku roots(hex,hex..) inters(hex,..) leafhex [policies(hex,..)] -> the chains
    ("chain:CN>CN>CN;...") or "error <message>" */
 #include "common.h"
 #include <alt/crypto/x509.h>
@@ -36,7 +36,17 @@ int main(void) {
 		for (char *save = 0, *t = strtok_r(f[2], ",", &save); t; t = strtok_r(0, ",", &save))
 			if (neku < 4)
 				ekus[neku++] = atoi(t);
-		alt_x509_verify_opts o = {f[1], roots, inters, strtoll(f[0], 0, 10), ekus, neku};
+		alt_x509_verify_opts o = {.dns_name = f[1], .roots = roots, .intermediates = inters, .now = strtoll(f[0], 0, 10), .key_usages = ekus, .nkey_usages = neku};
+		alt_der pols[16];
+		size_t npols = 0;
+		if (n > 6)
+			for (char *save = 0, *t = strtok_r(f[6], ",", &save); t; t = strtok_r(0, ",", &save))
+				if (npols < 16) {
+					size_t k = diff_unhex(t);
+					pols[npols++] = alt_der_make(t, k);
+				}
+		o.certificate_policies = pols;
+		o.ncertificate_policies = npols;
 		if (!f[1][0])
 			o.dns_name = 0;
 		alt_x509_chain *chains;

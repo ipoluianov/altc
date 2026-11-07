@@ -220,6 +220,8 @@ func gccMode(args []string) int {
 			verbose = true
 		case a == "-w":
 			cfg.NoWarnings = true
+		case a == "-fpermissive":
+			cfg.Permissive = true
 		case a == "-nostdinc":
 			cfg.NoStdInc = true
 		case strings.HasPrefix(a, "-std="):

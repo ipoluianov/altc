@@ -286,6 +286,22 @@ func (t *Type) withQuals(c, v, r, a bool) *Type {
 	return n
 }
 
+// qualified adds qualifiers to an object's type; for arrays they belong to
+// the element type (C11 6.7.3p9), so a member array of a const structure
+// has const elements
+func (t *Type) qualified(c, v bool) *Type {
+	if (t.Kind == TyArray || t.Kind == TyVLA) && t.Base != nil {
+		b := t.Base.qualified(c, v)
+		if b == t.Base {
+			return t
+		}
+		n := t.clone()
+		n.Base = b
+		return n
+	}
+	return t.withQuals(c, v, false, false)
+}
+
 func pointerTo(base *Type) *Type {
 	return &Type{Kind: TyPtr, size: 8, align: 8, Base: base, Unsigned: true}
 }

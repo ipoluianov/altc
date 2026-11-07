@@ -47,6 +47,8 @@ func (p *Project) Config() (*Config, []string, []string, error) {
 			cfg.Std = f[5:]
 		case f == "-w":
 			cfg.NoWarnings = true
+		case f == "-fpermissive":
+			cfg.Permissive = true
 		case f == "-g" || f == "-ggdb" || strings.HasPrefix(f, "-gdwarf"):
 			cfg.Debug = true
 		case f == "-g0":

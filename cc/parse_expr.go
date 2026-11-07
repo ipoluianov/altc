@@ -58,9 +58,9 @@ func (p *parser) checkAssign(to *Type, e *Node, tok *Token, ctx string) {
 	case from.Kind == TyVoid && to.Kind != TyVoid:
 		p.errorAt(tok, "void value not ignored as it ought to be")
 	case to.Kind == TyPtr && from.IsInteger() && !isNullPtrConst(e):
-		p.warnAt(tok, "%s makes pointer from integer without a cast", ctx)
+		p.permError(tok, "%s makes pointer from integer without a cast", ctx)
 	case to.IsInteger() && to.Kind != TyBool && decayType(from).Kind == TyPtr:
-		p.warnAt(tok, "%s makes integer from pointer without a cast", ctx)
+		p.permError(tok, "%s makes integer from pointer without a cast", ctx)
 	case to.IsVector() || from.IsVector():
 		if !to.IsVector() || !from.IsVector() || to.Size() != from.Size() {
 			p.errorAt(tok, "incompatible types in %s ('%s' from '%s')", ctx, to, from)
@@ -75,8 +75,12 @@ func (p *parser) checkAssign(to *Type, e *Node, tok *Token, ctx string) {
 		fb := decayType(from).Base
 		tb := to.Base
 		if tb.Kind != TyVoid && fb.Kind != TyVoid && !compatible(tb.Unqual(), fb.Unqual()) {
-			// char* vs unsigned char* etc. are common; keep it a warning
-			p.warnAt(tok, "incompatible pointer types in %s ('%s' from '%s')", ctx, to, decayType(from))
+			if tb.IsInteger() && fb.IsInteger() && tb.Size() == fb.Size() && tb.Kind != TyBool && fb.Kind != TyBool {
+				// char * and unsigned char *: gcc's -Wpointer-sign
+				p.warnAt(tok, "pointer targets in %s differ in signedness", ctx)
+			} else {
+				p.permError(tok, "incompatible pointer types in %s ('%s' from '%s')", ctx, to, decayType(from))
+			}
 		}
 	}
 }
@@ -788,7 +792,7 @@ func (p *parser) structRef(n *Node, name *Token) *Node {
 	for _, m := range path {
 		mt := m.Ty
 		if ty.Const || ty.Volatile {
-			mt = mt.withQuals(ty.Const, ty.Volatile, false, false)
+			mt = mt.qualified(ty.Const, ty.Volatile)
 		}
 		n = &Node{Kind: NMember, LHS: n, Member: m, Tok: name, Ty: mt}
 		ty = mt
@@ -1225,7 +1229,7 @@ func (p *parser) identExpr() *Node {
 	if p.is("(") {
 		// implicit function declaration (C89)
 		if p.opt.Std >= 1999 {
-			p.warnAt(t, "implicit declaration of function '%s'", t.Text)
+			p.permError(t, "implicit declaration of function '%s'", t.Text)
 		}
 		ft := funcType(tyInt)
 		ft.OldStyle = true

@@ -60,6 +60,71 @@ accepted and changes nothing.
   wide characters, time, regex, iconv, malloc, threads, signals and
   `setjmp` print exactly the same with both.
 
+## The standard library
+
+Besides the C library, AltC carries a standard library in the spirit of
+Go's (`std/`, headers `<alt/...>`), written for AltC in C with a classic
+C API and built into the cache like the C library. A web server:
+
+```c
+#include <alt/net/http.h>
+
+static void hello(alt_http_rw *w, alt_http_request *r, void *arg) {
+	alt_http_rw_printf(w, "hello, %.*s\n", (int)r->url.path.n, r->url.path.p);
+}
+
+int main(void) {
+	alt_http_mux *m;
+	alt_http_mux_new(&m);
+	alt_http_mux_handle_func(m, "GET /{name}", hello, 0);
+	return alt_http_listen_and_serve(":8080", alt_http_mux_handler(m)) < 0;
+}
+```
+
+- `<alt/task.h>`: tasks (coroutines with their own stacks) on schedulers,
+  one per thread; any thread can run one (a UI thread too). Blocking calls
+  of the library let the other tasks run.
+- `<alt/chan.h>`: channels and `select` between tasks and threads;
+  `<alt/sync.h>`: mutex, rwmutex, condition variables, once, wait groups,
+  semaphores, the thread pool; `<alt/context.h>`: cancellation and
+  deadlines; `<alt/timer.h>`: timers and tickers; `<alt/time.h>`:
+  monotonic and calendar time, Go layouts, durations.
+- `<alt/str.h>`, `<alt/arena.h>`, `<alt/io.h>` (readers, writers, bufio),
+  `<alt/unicode/utf8.h>`, `<alt/errors.h>` (negative error codes).
+- `<alt/net.h>`: TCP, UDP and Unix sockets with deadlines, IP addresses,
+  an own DNS resolver (hosts, resolv.conf, UDP and TCP); `<alt/net/url.h>`;
+  `<alt/net/http.h>`: an HTTP/1.1 server (keep-alive, chunked bodies,
+  timeouts, graceful shutdown, Go 1.22 patterns in the multiplexer, a file
+  server with ranges) and client (connection pool, redirects, transparent
+  gzip); `<alt/mime.h>`.
+- `<alt/strconv.h>`, `<alt/unicode.h>` (classes and case mapping with Go's
+  tables), `<alt/log.h>` (structured logging as log/slog, text and JSON),
+  `<alt/flag.h>` (command-line flags as Go's flag).
+- `<alt/encoding/{hex,base64,json,pem,asn1}.h>`; `<alt/hash/{crc32,crc64,adler32,fnv}.h>`;
+  `<alt/compress/{flate,gzip,zlib}.h>`.
+- `<alt/crypto/...>`: `hash.h` (MD5, SHA-1, SHA-2, HMAC, random bytes),
+  `kdf.h` (HKDF, PBKDF2), `aes.h` (AES-NI, CTR, CBC, GCM),
+  `chacha20poly1305.h`, `ed25519.h` (Ed25519, X25519), `ecdsa.h` (P-256,
+  P-384, P-521: ECDSA, ECDH), `rsa.h` (PKCS #1 v1.5, PSS), `x509.h`
+  (certificates, chains, system roots, private keys), `tls.h` (TLS 1.3
+  client and server). `alt_http_listen_and_serve_tls` and `https://` URLs
+  in the client use it.
+
+Its tests (`TestStd*`, `TestDiff*`, `TestHTTP*`, `TestMuxAgainstGo`,
+`TestCompress*`, `TestX509*`, `TestTLS*`, `TestHTTPS`, `TestResolver`)
+check it against Go's packages as references (and `tests/goref`, a
+separate module with golang.org/x/crypto from the module cache, for what
+Go's standard library lacks; those tests are skipped without it): the same inputs to Go and to AltC, the outputs compared (time
+layouts, URLs, IP addresses, numbers, JSON, all Unicode code points, log
+records, flag parsing and usage texts, hashes, decompression of valid and
+damaged streams with the same errors at the same offsets, HTTP request
+parsing at the server, the client against Go's client, multiplexer
+decisions, ciphers and signatures, certificate parsing and chain
+verification); data compressed by AltC is decompressed by Go, signatures
+made by AltC are verified by Go, the TLS client and server talk to Go's;
+the C tests also run under AddressSanitizer, UndefinedBehaviorSanitizer
+and ThreadSanitizer (with gcc), and gcc -Wall -Wextra checks the sources.
+
 ## Processor extensions and SIMD
 
 Like gcc, AltC generates code for the x86-64 baseline (SSE2) unless asked

@@ -13,6 +13,7 @@ import (
 	"github.com/ipoluianov/altc/elf"
 	"github.com/ipoluianov/altc/include"
 	"github.com/ipoluianov/altc/libc"
+	"github.com/ipoluianov/altc/std"
 	"github.com/ipoluianov/altc/x64"
 )
 
@@ -31,6 +32,7 @@ type Config struct {
 	ISA         x64.ISA  // instruction set extensions (-march, -m<feature>)
 	FastMath    bool     // -ffast-math: floating-point operations may be reassociated
 	Debug       bool     // -g: DWARF debug information
+	Permissive  bool     // -fpermissive: gcc 14's permerrors are warnings
 
 	// ReadFile reads source files and headers (os.ReadFile when nil)
 	ReadFile func(path string) ([]byte, error)
@@ -128,6 +130,7 @@ func (c *Config) ppConfig() (cc.PPConfig, error) {
 		// the compiler's headers, then the C library's: nothing from the
 		// system
 		pc.Dirs = append(pc.Dirs, cc.IncludeDir{Path: include.Root, Embedded: include.FS, System: true},
+			cc.IncludeDir{Path: std.Include, Embedded: std.FS, System: true},
 			cc.IncludeDir{Path: libc.Include, Embedded: libc.FS, System: true})
 	}
 	return pc, nil
@@ -300,7 +303,7 @@ func CompileSource(path string, data []byte, cfg *Config) (u *Unit) {
 	if hasError(u.Diagnostics) {
 		return u
 	}
-	prog, perrs := cc.Parse(toks, cc.Options{Std: pc.Std, GNU: pc.GNU, VecAlign: cfg.vecAlign()})
+	prog, perrs := cc.Parse(toks, cc.Options{Std: pc.Std, GNU: pc.GNU, VecAlign: cfg.vecAlign(), Permissive: cfg.Permissive})
 	u.Diagnostics = append(u.Diagnostics, toDiags(perrs, cfg.NoWarnings)...)
 	if hasError(u.Diagnostics) {
 		return u
@@ -822,9 +825,17 @@ func Link(in *LinkInput) ([]byte, []Diagnostic) {
 	if err != nil {
 		return fail(err)
 	}
+	stdData, err := getStd(nil)
+	if err != nil {
+		return fail(err)
+	}
+	stdAr, err := elf.ReadArchive("libalt.a", stdData)
+	if err != nil {
+		return fail(err)
+	}
 	ln := &elf.Linker{
 		Objects:   append([]*elf.Object{lib.crt1.Clone(), lib.crti.Clone(), lib.start.Clone()}, in.Objects...),
-		Archives:  append(append([]*elf.Archive(nil), in.Archives...), ar),
+		Archives:  append(append([]*elf.Archive(nil), in.Archives...), stdAr, ar),
 		Tail:      []*elf.Object{lib.crtn.Clone()},
 		Lazy:      rt,
 		StripSyms: in.Strip,

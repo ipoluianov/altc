@@ -17,6 +17,7 @@ import (
 
 	"github.com/ipoluianov/altc/elf"
 	"github.com/ipoluianov/altc/libc"
+	"github.com/ipoluianov/altc/std"
 )
 
 // The C library (musl, package libc) is compiled by the compiler itself on
@@ -33,6 +34,9 @@ func libcReadFile(p string) ([]byte, error) {
 	s := filepath.ToSlash(p)
 	if rest, ok := strings.CutPrefix(s, libcVirtual+"/"); ok {
 		return libc.FS.ReadFile(path.Clean(rest))
+	}
+	if rest, ok := strings.CutPrefix(s, stdVirtual+"/"); ok {
+		return std.FS.ReadFile(path.Clean(rest))
 	}
 	return os.ReadFile(p)
 }
@@ -99,11 +103,15 @@ var (
 	libcErr  error
 )
 
-// PrepareLibc makes the C library ready, building it into the cache when
-// it is not there yet (a few seconds, once for every build of the
-// compiler); log, when not nil, is told before building
+// PrepareLibc makes the C library and AltC's standard library ready,
+// building them into the cache when they are not there yet (seconds, once
+// for every build of the compiler); log, when not nil, is told before
+// building
 func PrepareLibc(log func(string)) error {
-	_, err := getLibc(log)
+	if _, err := getLibc(log); err != nil {
+		return err
+	}
+	_, err := getStd(log)
 	return err
 }
 

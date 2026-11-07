@@ -296,6 +296,24 @@ Each stage ends with something usable and tested.
     path/filepath, websocket-level helpers, profiling (pprof-like
     sampling).
 
+Progress (2026-11-07): stages 1, 2 and 4 are done; 3 partly (io, bufio,
+strings, strconv with Go's ParseInt/ParseUint/Quote, unicode with Go's
+tables; containers and sort to come); 5 nearly (server and client over
+HTTP and HTTPS, transparent gzip as Go's Transport, mux, files, url,
+mime; multipart, byte ranges and client-side cookies to come); 6 partly
+(hex, base64, json, pem, asn1/DER, log/slog-style logging, flag; base32,
+binary, csv to come); 7 partly (crc32, crc64, adler32, fnv, flate, gzip,
+zlib; archive to come); 8 done for what TLS needs (md5, sha1, sha2, hmac,
+hkdf, pbkdf2, rand, AES with AES-NI, CTR, CBC, GCM, ChaCha20-Poly1305,
+XChaCha20, X25519, Ed25519, ECDSA and ECDH on P-256/P-384/P-521, RSA
+PKCS #1 v1.5 and PSS; RSA key generation and OAEP to come); 9 mostly
+(X.509 parsing as Go's ParseCertificate, chain verification as Go's
+Verify without policy validation, system roots, PEM, PKCS #8/#1/SEC 1
+keys, TLS 1.3 client and server with HRR, ALPN, SNI, client
+certificates, KeyUpdate; TLS 1.2, session resumption and HTTP/2 to
+come). Each is checked against Go's package by differential tests; TLS
+against Go's crypto/tls both ways and against public servers.
+
 Toolchain counterparts of the Go commands come alongside: `altc test`
 (test functions in `*_test.c`, like `go test`), later formatting and
 static checks.

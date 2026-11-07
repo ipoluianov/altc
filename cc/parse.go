@@ -45,6 +45,10 @@ type Options struct {
 	Std      int   // 1989, 1999, 2011, 2017, 2023
 	GNU      bool  // GNU dialect
 	VecAlign int64 // largest alignment of vector types (16; 32 with AVX)
+	// Permissive makes the errors that gcc 14 lets -fpermissive downgrade
+	// (implicit declarations and int, int/pointer conversions,
+	// incompatible pointers) warnings again
+	Permissive bool
 }
 
 type parser struct {
@@ -88,6 +92,16 @@ func (p *parser) errorAt(t *Token, format string, args ...any) {
 
 func (p *parser) warnAt(t *Token, format string, args ...any) {
 	p.errs = append(p.errs, errAt(t, true, format, args...))
+}
+
+// permError is an error that -fpermissive makes a warning (gcc 14's
+// permerrors)
+func (p *parser) permError(t *Token, format string, args ...any) {
+	if p.opt.Permissive {
+		p.warnAt(t, format, args...)
+	} else {
+		p.softError(t, format, args...)
+	}
 }
 
 // softError records an error but continues parsing
@@ -838,11 +852,13 @@ func (p *parser) declspec(attr *declAttr) *Type {
 	if counter == 0 && attr != nil && attr.isAuto {
 		ty = tyInt // C89 implicit int: auto x = 1;
 	}
-	if counter == 0 && p.opt.Std >= 1999 && !(attr != nil && (attr.isTypedef || attr.isStatic || attr.isExtern || attr.isRegister || attr.isConstexpr || attr.isInline || attr.isAuto)) && !isConst && !isVolatile {
-		if start.Kind == TIdent && !start.kw() {
+	if counter == 0 && p.opt.Std >= 1999 && !(attr != nil && (attr.isConstexpr || attr.isAuto)) {
+		plain := !(attr != nil && (attr.isTypedef || attr.isStatic || attr.isExtern || attr.isRegister || attr.isInline)) && !isConst && !isVolatile
+		if plain && start.Kind == TIdent && !start.kw() {
 			p.errorAt(start, "unknown type name '%s'", start.Text)
 		}
-		p.warnAt(start, "type defaults to 'int' in declaration")
+		/* static x; const y = 1; (gcc 14: an error from C99 on) */
+		p.permError(start, "type defaults to 'int' in declaration")
 	}
 	if attr != nil && attr.mode != "" {
 		ty = modeType(ty, attr.mode)

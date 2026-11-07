@@ -26,6 +26,16 @@ func unhex(s string) []byte {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "ws-server":
+			wsServer(os.Args[2:])
+			return
+		case "ws-client":
+			wsClient(os.Args[2:])
+			return
+		}
+	}
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 1<<20), 64<<20)
 	out := bufio.NewWriter(os.Stdout)

@@ -293,7 +293,7 @@ Each stage ends with something usable and tested.
    8446), then TLS 1.2 for older servers; HTTPS and HTTP/2 after that.
 10. The rest of Go's set: regexp (RE2's linear-time algorithm), math/big,
     text/template and html/template (contextual escaping), os/exec,
-    path/filepath, websocket-level helpers, profiling (pprof-like
+    path/filepath, WebSocket, profiling (pprof-like
     sampling).
 
 Progress (2026-11-07): stages 1, 2 and 4 are done; 3 partly (io, bufio,
@@ -301,7 +301,7 @@ strings, strconv with Go's ParseInt/ParseUint/Quote, unicode with Go's
 tables; sort, vectors, maps, heaps, lists); 5 done (server and client
 over HTTP, HTTPS and HTTP/2, transparent gzip as Go's Transport, mux,
 files with ranges, url, mime media types, quoted-printable, multipart
-forms, the client's cookie jar, textproto, net/mail, an SMTP client, RFC 2047 encoded words); 6 done (hex, base64, base32, binary
+forms, the client's cookie jar, textproto, net/mail, an SMTP client, RFC 2047 encoded words, WebSocket with permessage-deflate); 6 done (hex, base64, base32, binary
 varints, csv, json, pem, asn1/DER, log/slog-style logging, flag); 7 done (crc32, crc64, adler32, fnv, flate, gzip,
 zlib, archive/tar and archive/zip); 8 done for what TLS needs (md5, sha1, sha2, hmac,
 hkdf, pbkdf2, rand, AES with AES-NI, CTR, CBC, GCM, ChaCha20-Poly1305,

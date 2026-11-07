@@ -126,6 +126,10 @@ int main(void) {
   (Karatsuba, Montgomery exponentiation, GCD, primality).
 - `<alt/regexp.h>`: regular expressions with Go's (RE2) syntax, error
   texts and matches, in time linear in the input (a Pike VM).
+- `<alt/net/websocket.h>`: WebSocket (RFC 6455) client for ws:// and
+  wss:// and server (upgrade inside an HTTP handler), permessage-deflate
+  (RFC 7692), strict framing and UTF-8 checks with the RFC close codes;
+  tested against gorilla/websocket and x/net/websocket.
 - `<alt/net/textproto.h>` (text protocols: headers, dot encoding,
   replies), `<alt/net/mail.h>` (addresses, dates, messages as Go's
   net/mail), `<alt/net/smtp.h>` (SMTP client with STARTTLS, PLAIN and
